@@ -69,19 +69,25 @@ u64 pointer_answer() {
     return g_pointers[(r >> 2) % g_pointers.size()];
 }
 
-// The smooth steps' split: the container stub records the step and the node's times each call saw, and
-// neither records a call nor draws, so the counted parts' calls and answers stay a whole step's.
+// The smooth steps' split: the container stub records the step and the node's times each call saw, the
+// container call published for its modules (sfx_node::smooth_call), and neither records a call nor draws, so
+// the counted parts' calls and answers stay a whole step's.
 bool g_split = false;
 struct Seen {
     u32 step, t, e;
     u64 context;
+    u64 pub_node;  // the published call: its node, the node's time before the offset, a whole step or not
+    u32 pub_time;
+    bool pub_tick;
     bool operator==(const Seen&) const = default;
 };
 std::vector<Seen> g_seen;
 
 GUEST_ABI void stub_container(u64 container, float* step, u64 definition, u64 context) {
     if (g_split) {
-        g_seen.push_back({bits(*step), load<u32>(container - 0x80 + 0x7c), load<u32>(container - 0x80 + 0xe0), context});
+        const sfx_node::SmoothCall pub = sfx_node::smooth_call();
+        g_seen.push_back({bits(*step), load<u32>(container - 0x80 + 0x7c), load<u32>(container - 0x80 + 0xe0), context, pub.node,
+                          pub.node ? pub.time : 0u, pub.node ? pub.tick : false});
         return;
     }
     rec(1, container, bits(*step), definition, context);
@@ -400,7 +406,8 @@ int check_split(int cases, double fps) {
         for (int frame = 0; t < a_answer.size() && frame < 4000 && !why; ++frame) {
             const double seconds = fps > 0.0 ? 1.0 / fps : std::uniform_real_distribution<double>(1.0 / 240, 1.0 / 20)(jitter);
             const sfx_schedule::Frame f = sfx_schedule::next(carry, seconds, 30);
-            const sfx_node::Steps st{f.whole ? f.seconds * scale : 0.0f, f.frame * scale, f.from * scale, f.into * scale, f.whole > 0};
+            sfx_node::Steps st{f.whole ? f.seconds * scale : 0.0f, f.frame * scale, f.from * scale, f.into * scale, f.whole > 0};
+            st.smooth = fps != 30.0 && (jitter() & 3) != 0;  // most calls published, some as a split without it; at 30 the game's own
             const u32 t_entry = load<u32>(c.node + 0x7c), e_entry = load<u32>(c.node + 0xe0);
             const u32 flags = load<u32>(c.node + 0x78), state = load<u32>(c.node + 0xdc);
             const Snapshot pre = snap(c);
@@ -410,6 +417,7 @@ int check_split(int cases, double fps) {
             const u8 r = sfx_node::update(c.node, st, c.def, c.ctx);
             // The container calls this frame should have made, and what each should have seen.
             std::vector<Seen> want;
+            const u64 pn = st.smooth ? c.node : 0;
             if (!(flags & 4) && (flags & 1)) {
                 const u32 frame_step = bits(st.frame);
                 if (!(flags & 8)) {
@@ -417,15 +425,19 @@ int check_split(int cases, double fps) {
                     for (const Call& x : g_calls) picked |= x.what == 5;
                     const u32 e1 = picked ? none : e_entry;
                     const u32 e2 = st.tick ? bits(addss(as_float(e1), st.counted)) : e1;
-                    want.push_back({frame_step, shifted(t_entry, st.from, none), shifted(e1, st.from, none), c.ctx});
-                    want.push_back({frame_step, shifted(t_entry, st.from, none), shifted(e2, st.into, none), r ? c.ctx : 0});
+                    want.push_back({frame_step, shifted(t_entry, st.from, none), shifted(e1, st.from, none), c.ctx, pn, pn ? t_entry : 0u,
+                                    pn ? st.tick : false});
+                    want.push_back({frame_step, shifted(t_entry, st.from, none), shifted(e2, st.into, none), r ? c.ctx : 0, pn, pn ? t_entry : 0u,
+                                    pn ? st.tick : false});
                 } else {
                     const u32 base = st.tick && state == 2 ? none : t_entry;
                     // a staged node's +0xe0 is its emission count: whatever it holds at the call, never moved
-                    want.push_back({frame_step, shifted(base, st.from, none), g_seen.empty() ? 0u : g_seen.back().e, r ? c.ctx : 0});
+                    want.push_back({frame_step, shifted(base, st.from, none), g_seen.empty() ? 0u : g_seen.back().e, r ? c.ctx : 0, pn,
+                                    pn ? base : 0u, pn ? st.tick : false});
                 }
             }
-            if (!(g_seen == want)) why = "the container calls (their step, the times they saw, their context)";
+            if (!(g_seen == want)) why = "the container calls (their step, the times they saw, their context, the call published)";
+            else if (sfx_node::smooth_call().node) why = "a container call still published after the update";
             else if (st.tick) {
                 if (r != a_answer[t]) why = "a whole step's answer";
                 else if (!(g_calls == a_calls[t])) why = "a whole step's counted calls";
@@ -512,10 +524,10 @@ int main() {
     g_rng.specials = true;
     split_bad += check_split(kSplitCases, 0.0);
     bad += split_bad;
-    // Each mutant must make some case differ: the game's sequence (1-10) and the split (11-17).
+    // Each mutant must make some case differ: the game's sequence (1-10) and the split (11-19).
     int missed = 0;
     g_quiet = true;
-    for (int m = 1; m <= 17; ++m) {
+    for (int m = 1; m <= 19; ++m) {
         g_sfx_node_mutant = m;
         g_rng.specials = true;
         const int found = m <= 10 ? check(20000) : check_split(3000, 120.0) + check_split(3000, 0.0);
@@ -530,7 +542,7 @@ int main() {
         return 1;
     }
     std::printf("decomp_sfx_node_update: %d nodes as the game's (%d with special values, %d under the host's MXCSR); %d split at 30, 60, 120, "
-                "144 and jittered as the game's whole steps; 17 mutants caught\n",
+                "144 and jittered as the game's whole steps, their container calls published for the light; 19 mutants caught\n",
                 2 * kCases + kCases / 4, kCases, kCases / 4, 6 * kSplitCases);
     return 0;
 }

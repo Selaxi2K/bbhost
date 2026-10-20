@@ -34,6 +34,9 @@
 #include "decomp/decomp.h"
 #include "decomp/guest.h"
 
+#include <atomic>
+#include <cstdint>
+
 using namespace decomp;
 
 #ifdef DECOMP_SFX_NODE_UPDATE_MUTANTS
@@ -95,15 +98,27 @@ inline u64 record_offset(u64 node) {
 
 void* g_game_node = nullptr;
 
+// The smooth steps' container call in progress (sfx_node::smooth_call): its node, the node's time of the whole step and
+// whether the frame has one. Written before the call (the node last) and cleared after it.
+std::atomic<std::uint64_t> g_call_node{0};
+std::atomic<std::uint32_t> g_call_time{0}, g_call_tick{0};
+
 // A container call of the smooth steps' frame domain: the frame's step, and the
 // node's time (+0x7c) - and a plain node's definition time (+0xe0) - moved on
 // by an offset for the call (the part of a whole step the frame is past) and
 // put back after it, unless the call changed them; an offset of zero (either
 // sign) or a time that is the "no time" value is left alone, so a call with
-// no offsets is the game's.
-inline void call_container(u64 node, float step, u64 definition, u64 context, float node_offset, float definition_offset) {
+// no offsets is the game's. A smooth call is published for its modules (the
+// node and its time before the offset).
+inline void call_container(u64 node, float step, u64 definition, u64 context, float node_offset, float definition_offset,
+                           const sfx_node::Steps& st) {
     const u32 none = load<u32>(game_address(kNoTime));
     const u32 t = load<u32>(node + 0x7c), e = load<u32>(node + 0xe0);
+    if (st.smooth && !MUTANT(18)) {
+        g_call_time.store(t, std::memory_order_relaxed);
+        g_call_tick.store(st.tick ? 1u : 0u, std::memory_order_relaxed);
+        g_call_node.store(node, std::memory_order_release);
+    }
     const bool shift_t = node_offset != 0.0f && (t != none || MUTANT(16));
     const bool shift_e = definition_offset != 0.0f && (e != none || MUTANT(16));
     u32 t_shifted = t, e_shifted = e;
@@ -117,6 +132,7 @@ inline void call_container(u64 node, float step, u64 definition, u64 context, fl
     }
     float s = step;
     game_function<ContainerFn>(kContainerUpdate)(node + 0x80, &s, definition, context);
+    if (st.smooth && !MUTANT(19)) g_call_node.store(0, std::memory_order_release);
     if (shift_t && load<u32>(node + 0x7c) == t_shifted && !MUTANT(12)) store<u32>(node + 0x7c, t);
     if (shift_e && load<u32>(node + 0xe0) == e_shifted) store<u32>(node + 0xe0, e);
 }
@@ -124,6 +140,16 @@ inline void call_container(u64 node, float step, u64 definition, u64 context, fl
 }  // namespace
 
 namespace sfx_node {
+
+SmoothCall smooth_call() {
+    SmoothCall c;
+    const u64 node = g_call_node.load(std::memory_order_acquire);
+    if (!node) return c;
+    c.time = g_call_time.load(std::memory_order_relaxed);
+    c.tick = g_call_tick.load(std::memory_order_relaxed) != 0;
+    if (g_call_node.load(std::memory_order_acquire) == node) c.node = node;
+    return c;
+}
 
 // The node update with its two kinds of step apart (decomp/sfx/node_update.h).
 DECOMP_LEAF u8 update(u64 node, const Steps& st, u64 definition, u64 context) {
@@ -156,7 +182,7 @@ DECOMP_LEAF u8 update(u64 node, const Steps& st, u64 definition, u64 context) {
                 game_function<ApplyFn>(kApply)(picked, definition, node);
             }
         }
-        call_container(node, container_step, definition, context, st.from, st.from);
+        call_container(node, container_step, definition, context, st.from, st.from, st);
         if (counts) store<float>(node + 0xe0, MUTANT(1) ? load<float>(node + 0xe0) : add(load<float>(node + 0xe0), st.counted));
     } else if (counts) {
 
@@ -259,7 +285,7 @@ DECOMP_LEAF u8 update(u64 node, const Steps& st, u64 definition, u64 context) {
             if (next == 9) {
                 kill(node);
                 keep = 0;
-                call_container(node, container_step, definition, 0, st.from, 0.0f);
+                call_container(node, container_step, definition, 0, st.from, 0.0f, st);
                 store<float>(node + 0x7c, add(load<float>(node + 0x7c), st.counted));
                 return keep;
             }
@@ -312,7 +338,7 @@ DECOMP_LEAF u8 update(u64 node, const Steps& st, u64 definition, u64 context) {
     }
     // Every active node: its container once more, and its time.
     call_container(node, container_step, definition, keep && !MUTANT(5) ? context : 0, st.from,
-                   plain ? (MUTANT(15) ? st.from : st.into) : 0.0f);
+                   plain ? (MUTANT(15) ? st.from : st.into) : 0.0f, st);
     if (st.tick || MUTANT(17))
         store<float>(node + 0x7c, MUTANT(6) ? add(st.counted, load<float>(node + 0x7c)) : add(load<float>(node + 0x7c), st.counted));
     return keep;

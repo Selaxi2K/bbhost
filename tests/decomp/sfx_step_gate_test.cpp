@@ -18,6 +18,18 @@
 //     put back - every byte of the module and of its GX light, every call -
 //     the phase +0x30 and +0x110 unchanged; not held, or a pre-roll's call,
 //     the game's as it is;
+//   - the same light under the smooth steps, inside a node's real update
+//     (sfx_node::update, its container calls published): frame sequences at
+//     60, 120, 144 and jittered rates against the game's light stepped at 30 -
+//     after every whole step the phase +0x30 and a blending mode's words
+//     (+0x110; +0xf0..+0x10f, +0x114, +0x118) bit-equal to the game's calls at
+//     the node's time of each whole step, and on every frame its GX light
+//     byte-equal to the game's call at the frame's time with the rate as 0 and
+//     a blending mode as keeping, on that counted state;
+//   - the effect manager's light fades, 0x12e5500: the smooth steps off, or
+//     the game's own still frame, the game's call as it is; on, the game's call
+//     with the frame's step times the manager's time scale (0 while it is
+//     still) - the list, its lights and every call;
 //   - the wobble motions' updates, 0x2e89d10, 0x2e8e430 and 0x2e896f0: not
 //     held (or on the game's own still frame) ours against the game's - the
 //     same calls and every byte of the motion, its node, the parent and the
@@ -38,6 +50,8 @@ int g_sfx_gate_mutant = 0;
 #include "decomp/sfx/step_gate.cpp"
 
 #include "eboot_kit.h"
+
+#include "engine/sfx_schedule.h"
 
 #include <algorithm>
 #include <cmath>
@@ -81,9 +95,12 @@ std::size_t count(const std::vector<Call>& v, int what) {
 }
 
 bool g_times = false;  // the smooth steps' cases: each container call's node time (+0x7c) and definition time (+0xe0) recorded too
+// The smooth light cases: a light module the container of its node runs (as the game's container update runs its modules).
+u64 g_light_node = 0, g_light_module = 0, g_light_params = 0;
 GUEST_ABI void stub_container(u64 container, float* step, u64 definition, u64 context) {
     const u64 seen = g_times ? (static_cast<u64>(load<u32>(container - 4)) << 32) | load<u32>(container + 0x60) : 0;
     rec(1, container, definition, context, seen, *step);
+    if (g_light_module && container == g_light_node + 0x80) sfx_light_update(g_light_module, g_light_params, context);
 }
 GUEST_ABI u64 stub_controller(u64 controller, u64 instance, float step) {
     rec(2, controller, instance, 0, 0, step);
@@ -396,7 +413,7 @@ constexpr u64 kOnModules[] = {0x56eb2e0, 0x5756e50};  // the children follow, th
 constexpr u64 kCpuBinder = 0x56e3090, kGxBinder = 0x56e3100;
 constexpr u64 kOnGxTypes[] = {0x56eb1d0, 0x56eb220};
 constexpr u64 kComposite = 0x570e750;
-constexpr u64 kOffLight = 0x56ebba0, kOffWobble = 0x570e6d0, kOffGxType = 0x56eb030;
+constexpr u64 kOffModule = 0x5760f20, kOffWobble = 0x570e6d0, kOffGxType = 0x56eb030;
 constexpr u64 kTestConverted[] = {0x570e650, 0x570e790, 0x56eb2e0, 0x5756e50, 0x56e3090, 0x56e3100, 0x56eb1d0, 0x56eb220};
 constexpr u64 kNoTimeAt = 0x5ac82e8;
 
@@ -465,10 +482,10 @@ u64 classes(const Instance& s, bool off, u32 none) {
         if (!off || static_cast<int>(i) != at) continue;
         switch (where) {
         case 0: store<u64>(n + 0x90, object_of(kOffWobble)); kept = kOffWobble; break;
-        case 1: store<u64>(n + 0x98, object_of(kOffLight)); kept = kOffLight; break;
-        case 2: store<u64>(n + 0xa0, object_of(kOffLight)); kept = kOffLight; break;
-        case 3: store<u64>(n + 0xa8, object_of(kOffLight)); kept = kOffLight; break;
-        case 4: pend(n, object_of(kOffLight)); kept = kOffLight; break;
+        case 1: store<u64>(n + 0x98, object_of(kOffModule)); kept = kOffModule; break;
+        case 2: store<u64>(n + 0xa0, object_of(kOffModule)); kept = kOffModule; break;
+        case 3: store<u64>(n + 0xa8, object_of(kOffModule)); kept = kOffModule; break;
+        case 4: pend(n, object_of(kOffModule)); kept = kOffModule; break;
         case 5: pend(n, gx_binder(kOffGxType)); kept = kOffGxType; break;
         case 6: {  // a composite with a part off the list
             const u64 m = object_of(kComposite);
@@ -506,7 +523,7 @@ u64 times(u32 t, u32 e) { return (static_cast<u64>(t) << 32) | e; }
 
 struct SmoothSeen {
     long took = 0, kept = 0, game = 0, between_calls = 0, shifted_t = 0, shifted_e = 0, controllers_30 = 0;
-    long by_class[4] = {};  // kept by the light, the wobble, the GX type left out, the composite too deep
+    long by_class[4] = {};  // kept by a module, the wobble, the GX type left out, the composite too deep
 } g_seen_smooth;
 
 int check_smooth(int cases, u64 sfx, u64 manager) {
@@ -608,7 +625,7 @@ int check_smooth(int cases, u64 sfx, u64 manager) {
                 decomp_sfx_smooth(true);
                 if (r != r0 || !same_calls(calls, c0) || !same(after, a0)) why = "a frame between, a class off the list: the held frames'";
                 ++g_seen_smooth.kept;
-                ++g_seen_smooth.by_class[kept == kOffLight ? 0 : kept == kOffWobble ? 1 : kept == kOffGxType ? 2 : 3];
+                ++g_seen_smooth.by_class[kept == kOffModule ? 0 : kept == kOffWobble ? 1 : kept == kOffGxType ? 2 : 3];
             } else {
                 // released, inactive or the game's own still frame: the game's
                 g_calls.clear();
@@ -649,15 +666,18 @@ u64 curve() {
     store<float>(c + 12, value(-2, 2));
     return c;
 }
-Light make_light() {
+Light make_light(u64 on_node = 0, u64 on_inst = 0) {
     Light l;
     l.module = block(l.module_size);
     for (std::size_t k = 0; k < l.module_size; k += 4) store<float>(l.module + k, value(-3, 3));
-    l.inst = block(0x98);
-    l.node = block(0x100);
-    for (int k = 0; k < 0x100; k += 4) store<float>(l.node + k, value(-50, 50));
-    store<u64>(l.node + 0x58, l.inst);
-    store<float>(l.node + 0x7c, value(0, 10));
+    l.inst = on_inst ? on_inst : block(0x98);
+    l.node = on_node;
+    if (!l.node) {
+        l.node = block(0x100);
+        for (int k = 0; k < 0x100; k += 4) store<float>(l.node + k, value(-50, 50));
+        store<u64>(l.node + 0x58, l.inst);
+        store<float>(l.node + 0x7c, value(0, 10));
+    }
     l.block = 0;
     if (g_rng.chance(0.5)) {
         l.block = block(0x220);
@@ -782,6 +802,207 @@ int check_lights(int cases, u64 sfx, u64 preroll_ctx) {
         }
         decomp_sfx_gate_frame(false);
     }
+    return bad;
+}
+
+// --- the light under the smooth steps -------------------------------------------
+
+struct SmoothLightSeen {
+    long cases = 0, frames = 0, ticks = 0, light_calls = 0, flicker = 0, blending = 0, plain = 0;
+} g_seen_sl;
+
+// A copy of a light's module and GX light that the game's own function runs on (the same node).
+struct LightCopy {
+    u64 module, light;
+};
+LightCopy copy_light(const Light& l, u64 module_from, u64 light_from) {
+    LightCopy c{block(l.module_size), block(l.light_size)};
+    std::memcpy(reinterpret_cast<void*>(c.module), reinterpret_cast<void*>(module_from), l.module_size);
+    std::memcpy(reinterpret_cast<void*>(c.light), reinterpret_cast<void*>(light_from), l.light_size);
+    store<u64>(c.module + 0x28, c.light);
+    return c;
+}
+bool same_words(u64 a, u64 b, u64 off, std::size_t n) { return std::memcmp(reinterpret_cast<void*>(a + off), reinterpret_cast<void*>(b + off), n) == 0; }
+
+int check_smooth_lights(int cases, u64 sfx) {
+    const auto game = eboot_kit::fn<LightUpdate>(0x131e660);
+    const u32 none = load<u32>(reinterpret_cast<u64>(eboot_kit::at(kNoTimeAt)));
+    store<u32>(sfx + 0x8c, 0);
+    decomp_sfx_gate_frame(false);
+    int bad = 0;
+    for (int c = 0; c < cases; ++c) {
+        g_blocks.clear();
+        // A node the node update keeps quiet - plain (two container calls an update), or staged in state 3,
+        // which its controller holds (one) - and its light.
+        const u64 inst = block(0x98);
+        store<u64>(inst + 0x78, block(8));  // not this node: no root-node stop
+        const u64 def = definition(4);
+        const bool plain = g_rng.chance(0.5);
+        const u64 n = node(inst, plain ? 1u : 9u, 3);
+        store<u64>(n + 0xc8, controller(0, 4));
+        store<u64>(n + 0xd0, def);
+        store<u64>(n + 0xd8, 0);
+        for (int k = 0x20; k < 0x50; k += 4) store<float>(n + k, value(-50, 50));
+        store<float>(n + 0x7c, value(0, 6));
+        if (load<u32>(n + 0x7c) == none) store<float>(n + 0x7c, 1.0f);
+        const Light l = make_light(n, inst);
+        if (g_rng.chance(0.6)) store<s32>(l.module + 0x7c, 1);  // the flicker on
+        const u64 params = block(0x80), ctx = block(0x40);
+        LightCopy game30 = copy_light(l, l.module, l.light);
+        const u32 mode = load<u32>(l.module + 0x38), colour_mode = load<u32>(l.module + 0x3c);
+        const int rate_kind = g_rng.range(0, 3);  // 60, 120, 144, jittered
+        const float scale = g_rng.chance(0.5) ? 1.0f : value(0.25f, 2.0f);
+        double carry = 0.0;
+        const int frames = g_rng.range(4, 40);
+        const char* why = nullptr;
+        int at = -1;
+        ++g_seen_sl.cases;
+        g_seen_sl.flicker += load<s32>(l.module + 0x7c) > 0;
+        g_seen_sl.blending += mode == 2 || colour_mode == 2;
+        g_seen_sl.plain += plain;
+        for (int f = 0; f < frames && !why; ++f) {
+            const double dt = rate_kind == 0 ? 1.0 / 60 : rate_kind == 1 ? 1.0 / 120 : rate_kind == 2 ? 1.0 / 144 : g_rng.value(1.0f / 150, 1.0f / 40);
+            const sfx_schedule::Frame fr = sfx_schedule::next(carry, dt, 30);
+            sfx_node::Steps st;
+            st.smooth = true;
+            st.tick = fr.whole > 0;
+            st.counted = fr.seconds * scale;
+            st.frame = fr.frame * scale;
+            st.from = fr.from * scale;
+            st.into = fr.into * scale;
+            const u32 t_step = load<u32>(n + 0x7c);
+            g_calls.clear();
+            g_light_node = n;
+            g_light_module = l.module;
+            g_light_params = params;
+            sfx_node::update(n, st, def, ctx);
+            g_light_module = 0;
+            long calls = 0;
+            for (const Call& k : g_calls) calls += k.what == 1 && k.a == n + 0x80;
+            ++g_seen_sl.frames;
+            g_seen_sl.light_calls += calls;
+            const u32 t_after = load<u32>(n + 0x7c);
+            // The game at 30: on a whole step, each of the update's container calls runs the light at the node's
+            // time of the step.
+            if (st.tick) {
+                ++g_seen_sl.ticks;
+                for (long k = 0; k < calls; ++k) {
+                    store<u32>(n + 0x7c, t_step);
+                    game(game30.module, params, ctx);
+                }
+                store<u32>(n + 0x7c, t_after);
+                if (!same_words(l.module, game30.module, 0x30, 4)) why = "the phase after a whole step";
+                else if (mode == 2 && !same_words(l.module, game30.module, 0x110, 4)) why = "the blended +0x110 after a whole step";
+                else if (colour_mode == 2 && (!same_words(l.module, game30.module, 0xf0, 0x20) || !same_words(l.module, game30.module, 0x114, 8)))
+                    why = "the blended colours after a whole step";
+            }
+            // The frame's: the game's call at the frame's time with the rate as 0 and a blending mode as keeping, on
+            // the counted state - its GX light.
+            if (!why && calls) {
+                const LightCopy want = copy_light(l, game30.module, game30.light);
+                store<float>(want.module + 0x80, 0.0f);
+                if (mode == 2) store<u32>(want.module + 0x38, 1u);
+                if (colour_mode == 2) store<u32>(want.module + 0x3c, 1u);
+                store<u32>(n + 0x7c, shifted(t_step, st.from, none));
+                game(want.module, params, ctx);
+                store<u32>(n + 0x7c, t_after);
+                std::vector<u8> a(l.light_size), b(l.light_size);
+                std::memcpy(a.data(), reinterpret_cast<void*>(l.light), l.light_size);
+                std::memcpy(b.data(), reinterpret_cast<void*>(want.light), l.light_size);
+                if (!same_bytes(a, b)) why = "the GX light at the frame's time";
+            }
+            if (why) at = f;
+        }
+        if (why && ++bad <= 6 && !g_quiet)
+            std::printf("smooth light case %d (%s node, modes %u/%u, flicker %d, rate kind %d, scale %g): %s differs at frame %d\n", c,
+                        plain ? "a plain" : "a staged", mode, colour_mode, load<s32>(l.module + 0x7c), rate_kind, scale, why, at);
+    }
+    return bad;
+}
+
+// --- the light fades ----------------------------------------------------------
+
+GUEST_ABI void stub_light_release(u64 bank, u64 light) { rec(12, bank, light, 0, 0); }
+GUEST_ABI void stub_light_free(u64 light) { rec(13, light, 0, 0, 0); }
+
+int check_light_fades(int cases, u64 sfx) {
+    const auto game = eboot_kit::fn<LightFadesFn>(kLightFades);
+    int bad = 0;
+    for (int c = 0; c < cases; ++c) {
+        g_blocks.clear();
+        const u64 manager = block(0x600), list = manager + 0x118;
+        const u64 vt = block(0x10);
+        store<u64>(vt, reinterpret_cast<u64>(&stub_light_free));
+        const int entries = g_rng.range(0, 5);
+        const u64 begin = block(0x40 * 6);
+        std::vector<u64> lights;
+        for (int e = 0; e < entries; ++e) {
+            const u64 en = begin + 0x40 * e;
+            for (int k = 0; k < 0x20; k += 4) store<float>(en + k, value(-2, 2));
+            store<float>(en + 0x20, value(0.05f, 3));
+            store<float>(en + 0x24, g_rng.chance(0.2) ? value(-0.1f, 0.0f) : value(0, 3));
+            for (const u64 off : {0x28, 0x30, 0x38}) {
+                u64 light = 0;
+                if (g_rng.chance(0.7)) {
+                    light = block(0xd0);
+                    for (int k = 0; k < 0xd0; k += 4) store<float>(light + k, value(-1, 1));
+                    store<u64>(light, vt);
+                    store<s32>(light + 8, g_rng.range(1, 3));
+                    store<u8>(light + 0xc5, g_rng.chance(0.8) ? 0 : 1);
+                    lights.push_back(light);
+                }
+                store<u64>(en + off, light);
+            }
+        }
+        store<u64>(list + 0x10, begin);
+        store<u64>(list + 0x18, begin + 0x40 * entries);
+        const bool smooth = g_rng.chance(0.7), still = g_rng.chance(0.15), game_still = g_rng.chance(0.1);
+        const float ts = g_rng.chance(0.6) ? 1.0f : value(0, 2);
+        store<u8>(manager + 0x5ce, still ? 1 : 0);
+        store<float>(manager + 0x5d8, ts);
+        store<u32>(sfx + 0x8c, game_still ? 1u : 0u);
+        const float frame = g_rng.chance(0.3) ? 1.0f / 30 : value(1.0f / 200, 1.0f / 30);
+        const float step = still || game_still ? 0.0f : (g_rng.chance(0.5) ? 1.0f / 30 : 0.0f) * ts;
+        decomp_sfx_smooth(smooth);
+        decomp_sfx_frame_time(frame, 0.0f, 0.0f);
+        // the memory both may change: the list, its entries and the lights
+        auto snap_all = [&]() {
+            std::vector<u8> v(0x20 + 0x40 * 6);
+            std::memcpy(v.data(), reinterpret_cast<void*>(list), 0x20);
+            std::memcpy(v.data() + 0x20, reinterpret_cast<void*>(begin), 0x40 * 6);
+            for (const u64 li : lights) {
+                const std::size_t o = v.size();
+                v.resize(o + 0xd0);
+                std::memcpy(v.data() + o, reinterpret_cast<void*>(li), 0xd0);
+            }
+            return v;
+        };
+        auto put_all = [&](const std::vector<u8>& v) {
+            std::memcpy(reinterpret_cast<void*>(list), v.data(), 0x20);
+            std::memcpy(reinterpret_cast<void*>(begin), v.data() + 0x20, 0x40 * 6);
+            std::size_t o = 0x20 + 0x40 * 6;
+            for (const u64 li : lights) {
+                std::memcpy(reinterpret_cast<void*>(li), v.data() + o, 0xd0);
+                o += 0xd0;
+            }
+        };
+        const std::vector<u8> before = snap_all();
+        const float want_step = smooth && !game_still ? (still ? 0.0f : frame * ts) : step;
+        g_calls.clear();
+        game(list, want_step);
+        const std::vector<Call> c_want = g_calls;
+        const std::vector<u8> want = snap_all();
+        put_all(before);
+        g_calls.clear();
+        sfx_light_fades(list, step);
+        const std::vector<Call> c_ours = g_calls;
+        const std::vector<u8> ours = snap_all();
+        if ((!same_calls(c_want, c_ours) || !same_bytes(want, ours)) && ++bad <= 6 && !g_quiet)
+            std::printf("light fade case %d (%d entries, smooth %d, still %d, the game's still %d, step %g, frame %g, scale %g): ours differs\n", c,
+                        entries, smooth, still, game_still, step, frame, ts);
+    }
+    decomp_sfx_smooth(false);
+    store<u32>(sfx + 0x8c, 0);
     return bad;
 }
 
@@ -1000,8 +1221,9 @@ int main() {
         std::memcmp(eboot_kit::at(kWobbleA), kWobbleEntry, sizeof kWobbleEntry) != 0 ||
         std::memcmp(eboot_kit::at(kWobbleB), kWobbleEntry, sizeof kWobbleEntry) != 0 ||
         std::memcmp(eboot_kit::at(kWobbleFollow), kFollowEntry, sizeof kFollowEntry) != 0 ||
-        std::memcmp(eboot_kit::at(kGxRecordUpdate), kGxRecordEntry, sizeof kGxRecordEntry) != 0) {
-        std::printf("decomp_sfx_step_gate: the six entries are not where the gate expects them\n");
+        std::memcmp(eboot_kit::at(kGxRecordUpdate), kGxRecordEntry, sizeof kGxRecordEntry) != 0 ||
+        std::memcmp(eboot_kit::at(kLightFades), kLightFadesEntry, sizeof kLightFadesEntry) != 0) {
+        std::printf("decomp_sfx_step_gate: the seven entries are not where the gate expects them\n");
         return 1;
     }
     // The singletons: SprjSfx (its still-frame word +0x8c), the node pool, and
@@ -1024,6 +1246,11 @@ int main() {
     eboot_kit::stub(0x2c4cdd0, reinterpret_cast<const void*>(&stub_finished));
     eboot_kit::stub(0x2701fc0, reinterpret_cast<const void*>(&stub_light_enable));
     eboot_kit::stub(0x12a2500, reinterpret_cast<const void*>(&stub_light_params));
+    // The light fades let a GX light go through the GX light bank (sub_263ede0, the bank *(0x5940dd8) +0x5870).
+    eboot_kit::stub(0x263ede0, reinterpret_cast<const void*>(&stub_light_release));
+    alignas(64) static u8 gx_mem[0x5900];
+    store<u64>(reinterpret_cast<u64>(eboot_kit::at(0x5940dd8)), reinterpret_cast<u64>(gx_mem));
+    g_game_light_fades = eboot_kit::at(kLightFades);
     g_game_light = eboot_kit::at(0x131e660);
     g_game_instance = eboot_kit::at(0x2c4ff30);
     g_game_wobble_a = eboot_kit::at(kWobbleA);
@@ -1042,6 +1269,18 @@ int main() {
     bad += run(false);
     bad += run(true);
     total += 4 * kCases;
+    // The light under the smooth steps, inside the node update, and the light fades.
+    int lbad = 0;
+    for (const bool specials : {false, true}) {
+        g_rng.specials = specials;
+        lbad += check_smooth_lights(kCases / 4, sfx);
+        lbad += check_light_fades(kCases / 2, sfx);
+    }
+    std::printf("decomp_sfx_step_gate: %d smooth light cases (%ld frames, %ld whole steps, %ld light calls; %ld with the flicker, %ld blending, "
+                "%ld on plain nodes) and %d light fade cases, %d differ\n",
+                kCases / 2, g_seen_sl.frames, g_seen_sl.ticks, g_seen_sl.light_calls, g_seen_sl.flicker, g_seen_sl.blending, g_seen_sl.plain,
+                kCases, lbad);
+    if (lbad) return 1;
     // node_held's mutants against the game's own node update, while it is still there.
     int missed = 0;
     g_quiet = true;
@@ -1049,6 +1288,15 @@ int main() {
         g_sfx_gate_mutant = m;
         g_rng.specials = false;
         if (!check_nodes(2000)) {
+            std::printf("decomp_sfx_step_gate: mutant %d not caught\n", m);
+            ++missed;
+        }
+    }
+    g_sfx_gate_mutant = 0;
+    for (const int m : {22, 23, 24, 25, 26, 27, 28}) {
+        g_sfx_gate_mutant = m;
+        g_rng.specials = false;
+        if (!(m == 28 ? check_light_fades(2000, sfx) : check_smooth_lights(2000, sfx))) {
             std::printf("decomp_sfx_step_gate: mutant %d not caught\n", m);
             ++missed;
         }
@@ -1069,9 +1317,10 @@ int main() {
     std::printf("decomp_sfx_step_gate: %d cases (nodes, lights, instances; ordinary values, then special ones), %d differ\n", total, bad);
     if (bad) return 1;
     // The build's converted list: never the composite motion (it is its parts), nor a class that counts its
-    // updates (the light, the wobbles) or the grid simulation.
+    // updates (the wobbles) or the grid simulation. (The FFX light is on it: sfx_light_update counts its phase
+    // once a whole step itself, checked below.)
     for (const u64 vt : kConverted)
-        for (const u64 off : {0x570e750ull, 0x56ebba0ull, 0x570e6d0ull, 0x570e690ull, 0x570e8d0ull, 0x56eb030ull})
+        for (const u64 off : {0x570e750ull, 0x570e6d0ull, 0x570e690ull, 0x570e8d0ull, 0x56eb030ull})
             if (vt == off) {
                 std::printf("decomp_sfx_step_gate: 0x%llx is on the converted list\n", static_cast<unsigned long long>(vt));
                 return 1;
@@ -1084,7 +1333,7 @@ int main() {
     int sbad = check_smooth(kCases / 2, sfx, manager);
     std::printf("decomp_sfx_step_gate: %d smooth-step instance cases, %d differ - %ld took the smooth steps (%ld container calls between whole "
                 "steps, %ld node times and %ld definition times moved for them; %ld controller calls at 30), %ld kept by a class off the list "
-                "(the light %ld, a wobble %ld, a GX type %ld, a composite too deep %ld), %ld the game's\n",
+                "(a module %ld, a wobble %ld, a GX type %ld, a composite too deep %ld), %ld the game's\n",
                 kCases / 2, sbad, g_seen_smooth.took, g_seen_smooth.between_calls, g_seen_smooth.shifted_t, g_seen_smooth.shifted_e,
                 g_seen_smooth.controllers_30, g_seen_smooth.kept, g_seen_smooth.by_class[0], g_seen_smooth.by_class[1], g_seen_smooth.by_class[2],
                 g_seen_smooth.by_class[3], g_seen_smooth.game);
@@ -1160,6 +1409,6 @@ int main() {
         }
     }
     g_sfx_gate_mutant = 0;
-    std::printf("decomp_sfx_step_gate: %d of 20 mutants caught\n", 20 - missed);
+    std::printf("decomp_sfx_step_gate: %d of 27 mutants caught\n", 27 - missed);
     return missed ? 1 : 0;
 }

@@ -68,6 +68,7 @@ constexpr u64 kWobbleABase = 0x2e866f0;        //   its base motion, which moves
 constexpr u64 kWobbleB = 0x2e8e430;            // motion 0x570e8d0's update: count +0x7c, period +0x78
 constexpr u64 kWobbleBBase = 0x2e8bfd0;        //   its base motion
 constexpr u64 kWobbleFollow = 0x2e896f0;       // motion 0x570e690's update: the lerp toward the parent, then kWobbleA
+constexpr u64 kLightFades = 0x12e5500;         // the effect manager's fading GX lights (+0x118): (list, step)
 
 using InstanceUpdate = GUEST_ABI u8 (*)(u64 instance, u64 context, float step);
 using LightUpdate = GUEST_ABI void (*)(u64 module, u64 params, u64 context);
@@ -78,6 +79,7 @@ using ContainerFn = GUEST_ABI void (*)(u64 container, float* step, u64 definitio
 using ControllerFn = GUEST_ABI u64 (*)(u64 controller, u64 instance, float step);
 using MotionFn = GUEST_ABI void (*)(u64 motion, u64 node, const float* step, u64 local);
 using GxRecordFn = GUEST_ABI void (*)(u64 record, u64 item);
+using LightFadesFn = GUEST_ABI void (*)(u64 list, float step);
 
 void* g_game_instance = nullptr;
 void* g_game_light = nullptr;
@@ -85,6 +87,7 @@ void* g_game_wobble_a = nullptr;
 void* g_game_wobble_b = nullptr;
 void* g_game_wobble_follow = nullptr;
 void* g_game_gx_record = nullptr;
+void* g_game_light_fades = nullptr;
 
 std::atomic<u32> g_between{0};
 std::atomic<u32> g_step_between{0};  // a frame between whole effect steps, the gate on or off (decomp_sfx_step_frame)
@@ -93,6 +96,7 @@ std::atomic<u32> g_step_between{0};  // a frame between whole effect steps, the 
 std::atomic<float> g_frame_step{0.0f}, g_frame_from{0.0f}, g_frame_into{0.0f};
 std::atomic<u32> g_smooth{0};
 std::atomic<u64> g_smooth_updates{0}, g_smooth_kept{0};
+std::atomic<u64> g_lights_smooth{0}, g_lights_counted{0}, g_fades_smooth{0};
 std::atomic<u64> g_frames_between{0}, g_instances_held{0}, g_lights_held{0}, g_motions_held{0}, g_still_frames{0}, g_records_held{0};
 
 // A frame bbhost put between whole steps that is not the game's own still frame.
@@ -163,11 +167,13 @@ constexpr u64 kManagerOf = 0x70;  // SprjSfx +0x70: the effect manager (its time
 // the motions, the modules, the binders and the StandardParticle and Spark
 // simulations also held to the game's own code by
 // tests/decomp/sfx_classes_test.cpp (one whole step against the frame domain's
-// frames). Off the list, and so on the held frames as with 30: the FFX light 0x56ebba0 and the wobble motions 0x570e6d0,
-// 0x570e690 and 0x570e8d0 (they count their updates), the module 0x5760f20,
-// and the GPU particle types 0x2712 (0x56eb030: whole grid passes of elapsed x
-// 30), 0x2713 (0x56eb0d0: its parameters are curves read at the elapsed time),
-// 0x283c (0x56eadf0) and 0x283d (0x56eac40), not read through yet.
+// frames) - and the FFX light, whose one counted part sfx_light_update runs
+// once a whole step (tests/decomp/sfx_step_gate_test.cpp). Off the list, and so
+// on the held frames as with 30: the wobble motions 0x570e6d0, 0x570e690 and
+// 0x570e8d0 (they count their updates), the module 0x5760f20, and the GPU
+// particle types 0x2712 (0x56eb030: whole grid passes of elapsed x 30), 0x2713
+// (0x56eb0d0: its parameters are curves read at the elapsed time), 0x283c
+// (0x56eadf0) and 0x283d (0x56eac40), not read through yet.
 constexpr u64 kConverted[] = {
     0x570e650,  // motion: velocity along itself by step x speed curve x +0x24, position by step x velocity, facing the move
     0x570e790,  // motion: turned by step x its rates (or three curves)
@@ -182,6 +188,7 @@ constexpr u64 kConverted[] = {
     0x56ea9b0,  // GPU particle type 0x283e: a volume from the record's matrix; no time
     0x56eaa90,  // GPU particle type 0x27d8: no time
     0x56eb290,  // GPU particle type 0x2968: constant bounds
+    0x56ebba0,  // module: the FFX light; its flicker phase counted once a whole step at the step's time (sfx_light_update)
 };
 const u64* g_converted = kConverted;
 std::size_t g_converted_count = sizeof kConverted / sizeof kConverted[0];
@@ -264,6 +271,7 @@ u8 smooth_update(u64 instance, u64 context, float step) {
     // on it, the game's order: at 30 the whole step's bits.
     sfx_node::Steps st;
     st.tick = tick;
+    st.smooth = true;
     st.counted = step * scale;
     st.frame = (still ? 0.0f : g_frame_step.load(std::memory_order_relaxed) * time_scale) * scale;
     if (!still) {
@@ -334,12 +342,53 @@ DECOMP_LEAF u8 sfx_instance_update(u64 instance, u64 context, float step) {
 // - its GX light's colour, radius and place from its curves at the node's
 // age, its flicker from noise at the phase +0x30, which first adds the age
 // times the rate +0x80 (when +0x7c > 0), and +0x110, which mode +0x38
-// (2) blends toward a curve each call and (0) sets, (1) keeps. On a held
+// (2) blends toward a curve each call and (0) sets, (1) keeps, and its
+// colours +0xf0 / +0x100 and radii +0x114 / +0x118, which mode +0x3c does
+// the same with (a new definition sets the modes, sub_131f120). On a held
 // frame (not a pre-roll's) the call runs with +0x80 as 0 and +0x38 as 1, so
 // the phase and +0x110 stay; both are put back, and the phase's bits too.
+//
+// The smooth steps' frame domain (a light in the node whose container call
+// sfx_node::smooth_call names): on a frame with a whole step the game's call
+// first, at the node's time of the step - its phase add, blends and their
+// stores exactly as on the update the game makes at 30 - and then on every
+// frame the call at the frame's time with the rate as 0 and a blending mode
+// (2) as keeping (1), all put back: the GX light's colour, radius, place and
+// visibility at the frame's own time, the flicker from the phase of the last
+// whole step, 30 noise steps a second as on the PS4.
+inline void light_frame_call(LightUpdate game, u64 module, u64 params, u64 context) {
+    const u32 rate = load<u32>(module + 0x80), phase = load<u32>(module + 0x30);
+    const u32 mode = load<u32>(module + 0x38), colour_mode = load<u32>(module + 0x3c);
+    if (!MUTANT(24)) store<float>(module + 0x80, 0.0f);
+    if (mode == 2 && !MUTANT(25)) store<u32>(module + 0x38, 1u);
+    if (colour_mode == 2 && !MUTANT(25)) store<u32>(module + 0x3c, 1u);
+    game(module, params, context);
+    store<u32>(module + 0x80, rate);
+    store<u32>(module + 0x38, mode);
+    store<u32>(module + 0x3c, colour_mode);
+    if (!MUTANT(24)) store<u32>(module + 0x30, phase);  // the add of the age times 0 kept a -0 or an infinite age's NaN from it
+}
+
 DECOMP_LEAF void sfx_light_update(u64 module, u64 params, u64 context) {
     const auto game = reinterpret_cast<LightUpdate>(g_game_light);
-    if (!held() || (context && load<u64>(context) == game_address(kPrerollContext))) {
+    const bool preroll = context && load<u64>(context) == game_address(kPrerollContext);
+    const u64 node = load<u64>(module + 8);
+    if (!preroll && node) {
+        const sfx_node::SmoothCall call = sfx_node::smooth_call();
+        if (call.node == node) {
+            g_lights_smooth.fetch_add(1, std::memory_order_relaxed);
+            if (call.tick && !MUTANT(22)) {
+                g_lights_counted.fetch_add(1, std::memory_order_relaxed);
+                const u32 shifted = load<u32>(node + 0x7c);
+                if (!MUTANT(23)) store<u32>(node + 0x7c, call.time);
+                game(module, params, context);
+                if (load<u32>(node + 0x7c) == call.time && !MUTANT(27)) store<u32>(node + 0x7c, shifted);
+            }
+            if (!MUTANT(26)) light_frame_call(game, module, params, context);
+            return;
+        }
+    }
+    if (!held() || preroll) {
         game(module, params, context);
         return;
     }
@@ -351,6 +400,28 @@ DECOMP_LEAF void sfx_light_update(u64 module, u64 params, u64 context) {
     store<u32>(module + 0x80, rate);
     if (!MUTANT(7)) store<u32>(module + 0x38, mode);
     if (!MUTANT(5)) store<u32>(module + 0x30, phase);  // the add of the age times 0 kept a -0 or an infinite age's NaN from it
+}
+
+// sub_12e5500(the effect manager's fade list +0x118, step): the GX lights of
+// FFX lights that ended, each fading out over its time (+0x20) - its colours
+// times the time left (+0x24) over it, the time left less the step, the
+// lights let go once none is left - stepped by the manager's update with the
+// effects' step times its time scale (+0x5d8; 0 when it is still, +0x5ce),
+// so above 30 a fade came in whole 1/30 s steps. The smooth steps give it the
+// frame's own time instead, on the game's scale: the same seconds of fade, a
+// change each frame. The game's own still frame (SprjSfx+0x8c) is left to it.
+DECOMP_LEAF void sfx_light_fades(u64 list, float step) {
+    const auto game = reinterpret_cast<LightFadesFn>(g_game_light_fades);
+    float s = step;
+    if (g_smooth.load(std::memory_order_relaxed) && !MUTANT(28)) {
+        const u64 sfx = load<u64>(game_address(kSprjSfx));
+        if (!(sfx && load<u32>(sfx + 0x8c))) {
+            const u64 manager = list - 0x118;
+            g_fades_smooth.fetch_add(1, std::memory_order_relaxed);
+            s = load<u8>(manager + 0x5ce) ? 0.0f : g_frame_step.load(std::memory_order_relaxed) * load<float>(manager + 0x5d8);
+        }
+    }
+    game(list, s);
 }
 
 // The wobble motions. Motion classes 0x570e6d0 and 0x570e690 (whose update,
@@ -460,6 +531,8 @@ constexpr std::uint8_t kWobbleEntry[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x4
 constexpr std::uint8_t kFollowEntry[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x58};
 // The record update's (sub rsp, 0x68).
 constexpr std::uint8_t kGxRecordEntry[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x68};
+// The light fades' (sub rsp, 0x18).
+constexpr std::uint8_t kLightFadesEntry[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x18};
 
 void report() {
     if (!decomp_sfx_gate_placed()) return;
@@ -471,6 +544,8 @@ void report() {
     host_log("decomp: the smooth effect steps: %llu instance updates took them, %llu stayed on the held frames for a class off the converted "
              "list (%zu classes on it)",
              static_cast<ull>(g_smooth_updates.load()), static_cast<ull>(g_smooth_kept.load()), g_converted_count);
+    host_log("decomp:   FFX light updates by the frame's time: %llu, %llu of them after the whole step's own; light fades by the frame's time: %llu",
+             static_cast<ull>(g_lights_smooth.load()), static_cast<ull>(g_lights_counted.load()), static_cast<ull>(g_fades_smooth.load()));
     for (std::size_t i = 0; i < kKeptSlots; ++i) {
         const u64 vt = g_kept_class[i].load();
         if (!vt) break;
@@ -498,4 +573,6 @@ void decomp_sfx_step_gate_add() {
                 DecompKind::Leaf, &g_game_wobble_follow});
     decomp_add({"sub_2cbcf50", area, kGxRecordUpdate, kGxRecordEntry, sizeof(kGxRecordEntry), reinterpret_cast<void*>(&sfx_gx_record_update),
                 DecompKind::Leaf, &g_game_gx_record});
+    decomp_add({"sub_12e5500", area, kLightFades, kLightFadesEntry, sizeof(kLightFadesEntry), reinterpret_cast<void*>(&sfx_light_fades),
+                DecompKind::Leaf, &g_game_light_fades});
 }
