@@ -50,6 +50,12 @@ bool tbuffer_dst_sel() {
     return on;
 }
 
+namespace {
+std::atomic<bool> g_index_bounds{false};  // set_index_bounds
+}  // namespace
+void set_index_bounds(bool on) { g_index_bounds.store(on, std::memory_order_relaxed); }
+bool index_bounds() { return g_index_bounds.load(std::memory_order_relaxed); }
+
 std::string translation_switches() {
     // The variables as given rather than what each decides: two spellings of
     // one setting only cost a second entry.
@@ -2722,10 +2728,22 @@ struct Translator {
             stride = sel(ine(spec, c_zero_u), spec, stride);
         }
         const Id stride_dw = shr(stride, cu(2));
-        const Id first = iadd(cu(static_cast<std::uint32_t>(off / 4)), imul(ld(vgpr_var(in.vaddr)), stride_dw));
+        const Id vindex = ld(vgpr_var(in.vaddr));
+        Id first = iadd(cu(static_cast<std::uint32_t>(off / 4)), imul(vindex, stride_dw));
         // The element's guest address feeds only the fallback walk.
         const Id guest = opt.cb_no_fallback ? m.const_u64(0) : buffer_address(in).addr;
-        comps = format_decode(read_bound(index, in.srsrc, first, nwords, guest), in.dfmt, in.nfmt, 4);
+        if (!index_bounds()) {
+            comps = format_decode(read_bound(index, in.srsrc, first, nwords, guest), in.dfmt, in.nfmt, 4);
+            return true;
+        }
+        // gcn::set_index_bounds: an index at or past num_records reads 0, as on
+        // GCN - the binding's first element read instead (its dwords are in the
+        // binding whatever the records: buffer_for sized it), the words dropped.
+        const Id ok = ult(vindex, read_s(static_cast<std::uint16_t>(in.srsrc + 2), in));
+        first = sel(ok, first, cu(static_cast<std::uint32_t>(off / 4)));
+        std::vector<Id> words = read_bound(index, in.srsrc, first, nwords, guest);
+        for (Id& w : words) w = sel(ok, w, c_zero_u);
+        comps = format_decode(words, in.dfmt, in.nfmt, 4);
         return true;
     }
     // TranslateOptions::cb_ssbo + cb_no_fallback in a compute shader (a

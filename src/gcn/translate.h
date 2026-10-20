@@ -454,6 +454,18 @@ std::uint32_t subgroup_stages();
 // key (translation_cache.cpp).
 void set_clip_demote(bool on);
 bool clip_demote();
+// A typed load by index from a bound storage buffer (tbuffer_load_format_*
+// with idxen, translate.cpp indexed_buffer_load and the lift's) checks the
+// index against the V#'s num_records (word 2) and reads 0 at or past it, as
+// GCN does - where the binding ends at the records (the host binds count x
+// stride), an index past them reads past the binding: AMD's descriptors give
+// 0 there too, other drivers whatever memory follows. Set once by the host
+// before its first translation, as set_clip_demote; off until then. Keyed for
+// the programs that hold such a load (indexed_typed_load), so turning it on
+// moves no other program's key.
+void set_index_bounds(bool on);
+bool index_bounds();
+inline bool indexed_typed_load(const Inst& in) { return in.enc == Enc::MTBUF && in.op < 4 && in.idxen; }
 // The Vulkan stage a translation or lift with these options runs in.
 std::uint32_t vk_stage_of(const TranslateOptions& o);
 inline bool subgroup_ops_in(const TranslateOptions& o) { return (subgroup_stages() & vk_stage_of(o)) != 0; }

@@ -3286,14 +3286,23 @@ private:
         }
         const std::uint32_t index = site->second;
         const Id stride_dw = shift(spv::OpShiftRightLogical, stride_value(index), cu(2));
-        const Id first = ibin(spv::OpIAdd, cu(static_cast<std::uint32_t>(off / 4)), ibin(spv::OpIMul, as_u(value(256 + in.vaddr)), stride_dw));
+        const Id vindex = as_u(value(256 + in.vaddr));
+        Id first = ibin(spv::OpIAdd, cu(static_cast<std::uint32_t>(off / 4)), ibin(spv::OpIMul, vindex, stride_dw));
+        // gcn::set_index_bounds, as the reference: past num_records the
+        // binding's first element is read and the words are 0.
+        Id ok = 0;
+        if (index_bounds()) {
+            ok = m.emit(spv::OpULessThan, t_bool, {vindex, as_u(read(static_cast<std::uint16_t>(in.srsrc + 2), in))});
+            first = m.emit(spv::OpSelect, t_u32, {ok, first, cu(static_cast<std::uint32_t>(off / 4))});
+        }
         const Id bias = cb_bias(index);
         int total = 0;
         for (int k = 0; k < count; ++k) total += bits[k];
         std::vector<Id> words;
         for (int k = 0; k < (total + 31) / 32; ++k) {
             const Id at = ibin(spv::OpIAdd, bias, ibin(spv::OpIAdd, first, cu(static_cast<std::uint32_t>(k))));
-            words.push_back(m.load(t_u32, m.access_chain(p_ssbo_u32, buffer_vars[index], {cu(0), at})));
+            const Id w = m.load(t_u32, m.access_chain(p_ssbo_u32, buffer_vars[index], {cu(0), at}));
+            words.push_back(ok ? m.emit(spv::OpSelect, t_u32, {ok, w, cu(0)}) : w);
         }
         typed_load_result(in, words, count, bits);
         ++buffer_loads;

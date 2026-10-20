@@ -3264,6 +3264,16 @@ bool init_locked() {
         f2.features.robustBufferAccess = VK_TRUE;  // core since 1.0, always supported
         host_log("gpu: robust buffer access on (BBHOST_ROBUST=1)");
     }
+    // BBHOST_INDEX_BOUNDS=1: the shaders' own check instead, where GCN makes
+    // one - a typed load by index past the V#'s num_records reads 0
+    // (gcn::set_index_bounds), on every driver, at a compare and a select a
+    // load. Off by default: the modules of about 1,100 of the game's 2,680
+    // programs change with it (a pipeline compile each, once).
+    {
+        const char* e = std::getenv("BBHOST_INDEX_BOUNDS");
+        gcn::set_index_bounds(e && e[0] == '1');
+        if (gcn::index_bounds()) host_log("gpu: typed loads by index read 0 past the V#'s records (BBHOST_INDEX_BOUNDS=1)");
+    }
     f2.features.fragmentStoresAndAtomics = VK_TRUE;
     f2.features.vertexPipelineStoresAndAtomics = VK_TRUE;
     f2.features.pipelineStatisticsQuery = g.profile_stats ? VK_TRUE : VK_FALSE;
