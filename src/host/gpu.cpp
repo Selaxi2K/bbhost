@@ -3206,6 +3206,18 @@ bool init_locked() {
         const bool demote = q13.shaderDemoteToHelperInvocation == VK_TRUE && !(e && e[0] == '0');
         if (demote) f13.shaderDemoteToHelperInvocation = VK_TRUE;
         gcn::set_clip_demote(demote);
+        // BBHOST_ROBUST_IMAGES=1: robust image access (also required by 1.3).
+        // GCN gives 0 for an image load outside the image and drops a store
+        // there; the translation and the lift load and store at the
+        // program's coordinates (image_load as OpImageFetch, image_store as
+        // OpImageWrite), which Vulkan leaves undefined outside the image -
+        // a 1x1 dummy bound for a missing texture among them. Off by default:
+        // the driver compiles every pipeline again once with it.
+        const char* ri = std::getenv("BBHOST_ROBUST_IMAGES");
+        if (ri && ri[0] == '1' && q13.robustImageAccess == VK_TRUE) {
+            f13.robustImageAccess = VK_TRUE;
+            host_log("gpu: robust image access on (BBHOST_ROBUST_IMAGES=1)");
+        }
     }
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     f12.pNext = &f13;
