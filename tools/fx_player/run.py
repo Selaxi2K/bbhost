@@ -110,7 +110,7 @@ def main():
     fams = {k: v for k, v in fams.items() if k in {s[0] for s in shots}}
     plan_file = out / 'plan.txt'
     plan_file.write_text('# fx_player plan: %d shots\n' % len(shots) +
-                         ''.join('shot %s %s %d %g %.1f %d %s\n' % s for s in shots))
+                         ''.join('shot %s %s %d %g %.1f %d %s %.3f\n' % s for s in shots))
     import json
     (out / 'families.json').write_text(json.dumps(fams, indent=1, sort_keys=True) + '\n')
     plugin = out / 'fx_player.so'

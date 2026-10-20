@@ -28,11 +28,13 @@ The families and how fx_player.c spawns each through the game's paths:
                SpEffectVfxParam row whose midstSfxId is the effect.
 
 The plan file fx_player.c reads (FXP_PLAN), one line a shot:
-    shot <family> <kind> <id> <dummy poly> <pitch degrees> <repeat> <name>
+    shot <family> <kind> <id> <dummy poly> <pitch degrees> <repeat> <name> <hold>
 kind: sfx (an effect id at a dummy poly), behavior (a BehaviorParam_PC row),
 goods (an EquipParamGoods row), speffect (a SpEffectParam row; the dummy poly
 field holds the game seconds it stays on). pitch: a bullet's launch below the
-level (positive: down). --json writes each family's expected effect ids (the
+level (positive: down). hold: an sfx shot's TAE event length in seconds - the
+effect is ended then, as the game ends a character's effect when its event
+ends (0 for the other kinds). --json writes each family's expected effect ids (the
 params' and the TAE's; the effects' own children come from the run).
 """
 import argparse
@@ -118,13 +120,13 @@ def effects_of(ch):
 
 
 def tae_effects(app0):
-    """[(anim id, event type, effect id, dummy poly)] of the player's TAE effect events (type 96)."""
+    """[(anim id, event type, effect id, dummy poly, TAE file, start s, end s)] of the player's TAE effect events (type 96)."""
     _path, taes = tae_plan.tae_files(app0, 0)
     out = []
     for name, b in sorted(taes.items()):
         for (aid, t, st, en, ints) in tae_plan.events(b):
             if t == 96 and len(ints) >= 2 and ints[0] >= 1000:
-                out.append((aid, t, ints[0], ints[1], os.path.basename(name), st))
+                out.append((aid, t, ints[0], ints[1], os.path.basename(name), st, en))
     return out
 
 
@@ -148,11 +150,11 @@ def build(app0, repeat=1, speffect_s=3.0):
 
     # Muzzle flashes: the TAE's gun effects ending in 02-04, each once, at the first dummy poly it is made at.
     muzzle = {}
-    for (aid, _t, eid, dmy, tname, _st) in tae:
+    for (aid, _t, eid, dmy, tname, st, en) in tae:
         if 6100 <= eid < 6900 and eid % 100 in (2, 3, 4) and eid not in muzzle:
-            muzzle[eid] = (dmy, tname, aid)
-    for eid, (dmy, tname, aid) in sorted(muzzle.items()):
-        shots.append(('muzzle', 'sfx', eid, dmy, 0.0, repeat, '%s-a%d' % (tname[:-4], aid)))
+            muzzle[eid] = (dmy, tname, aid, max(en - st, 0.0))
+    for eid, (dmy, tname, aid, hold) in sorted(muzzle.items()):
+        shots.append(('muzzle', 'sfx', eid, dmy, 0.0, repeat, '%s-a%d' % (tname[:-4], aid), hold))
         fam('muzzle')['shots'] += 1
     expect('muzzle', muzzle)
 
@@ -176,7 +178,7 @@ def build(app0, repeat=1, speffect_s=3.0):
             if not flight and not hits:
                 continue
             nm = weapons.get(wid, 'weapon %d' % wid).replace(' ', '_')
-            shots.append(('firearms', 'behavior', bid, -1, PITCH_GUN, repeat, '%s-%d' % (nm, j)))
+            shots.append(('firearms', 'behavior', bid, -1, PITCH_GUN, repeat, '%s-%d' % (nm, j), 0.0))
             fam('firearms')['shots'] += 1
             expect('firearms', flight + hits)
 
@@ -188,17 +190,17 @@ def build(app0, repeat=1, speffect_s=3.0):
                 continue
             nm = items.get(gid, 'goods %d' % gid).replace(' ', '_')
             anim = 100000 + (g['goodsUseAnim'] + 12) * 10
-            casts = [(eid, dmy) for (aid, _t, eid, dmy, tname, _st) in tae if tname == 'a00.tae' and aid == anim]
+            casts = [(eid, dmy, max(en - st, 0.0)) for (aid, _t, eid, dmy, tname, st, en) in tae if tname == 'a00.tae' and aid == anim]
             if key not in BUFFS and key != 'molotov':
-                for eid, dmy in casts:
-                    shots.append((key, 'sfx', eid, dmy if 0 <= dmy < 10000 else BODY_DUMMY, 0.0, repeat, '%s-cast-a%d' % (nm, anim)))
+                for eid, dmy, hold in casts:
+                    shots.append((key, 'sfx', eid, dmy if 0 <= dmy < 10000 else BODY_DUMMY, 0.0, repeat, '%s-cast-a%d' % (nm, anim), hold))
                     fam(key)['shots'] += 1
                     expect(key, [eid])
             if g['refCategory'] == 1:
                 ch = chain(bul, g['refId'])
                 flight, hits = effects_of(ch)
                 pitch = PITCH_THROW if key == 'molotov' else 0.0
-                shots.append((key, 'goods', gid, -1, pitch, repeat, nm))
+                shots.append((key, 'goods', gid, -1, pitch, repeat, nm, 0.0))
                 fam(key)['shots'] += 1
                 expect(key, flight + hits)
             elif g['refCategory'] == 2:
@@ -206,7 +208,7 @@ def build(app0, repeat=1, speffect_s=3.0):
                 state = spe.get(sid, {}).get('stateInfo', 0)
                 row = vfx.get(state, {})
                 ids = [row.get(k, -1) for k in ('midstSfxId', 'initSfxId', 'finishSfxId')]
-                shots.append((key, 'speffect', sid, speffect_s, 0.0, repeat, '%s-speffect%d-vfx%d' % (nm, sid, state)))
+                shots.append((key, 'speffect', sid, speffect_s, 0.0, repeat, '%s-speffect%d-vfx%d' % (nm, sid, state), 0.0))
                 fam(key)['shots'] += 1
                 expect(key, ids)
     return shots, fams
@@ -233,8 +235,8 @@ def main():
     order = {k: i for i, k in enumerate(ORDER)}
     shots.sort(key=lambda s: order.get(s[0], 99))
     lines = ['# fx_player plan: %d shots' % len(shots)]
-    for (f, kind, ident, dmy, pitch, rep, name) in shots:
-        lines.append('shot %s %s %d %g %.1f %d %s' % (f, kind, ident, dmy, pitch, rep, name))
+    for (f, kind, ident, dmy, pitch, rep, name, hold) in shots:
+        lines.append('shot %s %s %d %g %.1f %d %s %.3f' % (f, kind, ident, dmy, pitch, rep, name, hold))
     for key in sorted(fams, key=lambda k: order.get(k, 99)):
         v = fams[key]
         print('%-22s %3d shots, %3d expected effect ids: %s' % (key, v['shots'], len(v['expected']), ' '.join(map(str, v['expected']))))

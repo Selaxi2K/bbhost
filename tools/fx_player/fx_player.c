@@ -1,6 +1,6 @@
 /* fx_player: a test plugin that makes the player's own combat effects through
  * the game's paths, one shot after another (tools/fx_player/plan.py's plan,
- * FXP_PLAN), and measures every effect request each shot makes, for
+ * FXP_PLAN), and measures every effect instance each shot makes, for
  * tools/fx_player/report.py. Never shipped.
  *
  * The shots, each from the main thread at a frame's start:
@@ -8,8 +8,12 @@
  *             own effects are made (sfx_at below: a SprjSfx request for the
  *             character, bound to the dummy poly's model, as sub_1ca6410 does
  *             it); a weapon's dummy poly with no such weapon in hand is the
- *             body's dummy poly 1, and when no request of that id appears
+ *             body's dummy poly 1, and when no effect of that id appears
  *             within FXP_SPAWN_FRAMES (6) frames, once more at dummy poly 1.
+ *             The request is ended when the shot's TAE event length (the
+ *             plan's hold) has passed, as a character's effect components end
+ *             theirs when their event ends (the request's flags +0x10 |= 1);
+ *             FXP_TAE_END=0 leaves it to run, so a looping effect lives on.
  *   behavior  a BehaviorParam_PC row, and
  *   goods     an EquipParamGoods row, both through the character's behaviour
  *             call sub_1cb61c0(emit, chr + 0x178, chr), where every bullet a
@@ -25,8 +29,9 @@
  *             the game's own SpEffect call), taken off again after the shot's
  *             seconds through the game's removal (sub_1be1d90 on the
  *             player's SpEffect list, as EraseEventSpecialEffect does).
- * A shot ends once FXP_MIN_S (1) game seconds have gone and every request it
- * made has gone, or after FXP_MAX_S (15); FXP_GAP_S (0.5) later the next.
+ * A shot ends once FXP_MIN_S (1) game seconds have gone, its TAE effects were
+ * ended and every effect it made has gone, or after FXP_MAX_S (15);
+ * FXP_GAP_S (0.5) later the next.
  * Game seconds are frames / FXP_FPS (the run's rate: each frame one step of
  * it - the game's own 1/30 below 30 fps, BBHOST_SIM_FRAME_TIME's target at a
  * converted rate).
@@ -96,6 +101,7 @@ typedef struct {
     char family[48], name[96];
     int kind, id, dummy, repeat;
     float arg, pitch;  /* arg: a SpEffect's seconds */
+    float hold;        /* an sfx shot's TAE event length, game seconds: its effect is ended then (0: at once) */
 } Shot;
 #define MAXS 512
 static Shot plan[MAXS];
@@ -107,14 +113,15 @@ static int load_plan(const char* path) {
     char line[512], fam[48], kind[16], name[96];
     while (fgets(line, sizeof line, f) && nshots < MAXS) {
         int id = 0, rep = 1;
-        float dmy = 0, pitch = 0;
-        if (sscanf(line, "shot %47s %15s %d %f %f %d %95s", fam, kind, &id, &dmy, &pitch, &rep, name) != 7) continue;
+        float dmy = 0, pitch = 0, hold = 0;
+        if (sscanf(line, "shot %47s %15s %d %f %f %d %95s %f", fam, kind, &id, &dmy, &pitch, &rep, name, &hold) < 7) continue;
         Shot* s = &plan[nshots];
         memset(s, 0, sizeof *s);
         snprintf(s->family, sizeof s->family, "%s", fam);
         snprintf(s->name, sizeof s->name, "%s", name);
         s->id = id;
         s->pitch = pitch;
+        s->hold = hold > 0 ? hold : 0;
         s->repeat = rep < 1 ? 1 : rep;
         if (!strcmp(kind, "sfx")) s->kind = K_SFX, s->dummy = (int)dmy;
         else if (!strcmp(kind, "behavior")) s->kind = K_BEHAVIOR, s->dummy = -1;
@@ -793,6 +800,44 @@ static int call_behavior(uint64_t chr, int goods, int behavior, int bullet, floa
  * model is not there (a weapon not in hand) is the body's dummy poly 1. Returns the dummy poly used, -1 for none made.
  * (CreateSfx_DummyPoly's work, sub_1719e10, makes its effects in the manager directly, with no request a harness can
  * follow: not used.) */
+/* The TAE effects' requests a shot holds (FXP_TAE_END, on by default): each is ended when the shot's event length has
+ * passed, the way a character's effect components end theirs (sub_1cac8b0, sub_1ca6410: the request's flags +0x10 |= 1,
+ * which SprjSfx's request update, sub_2373850, takes as the end of its effect), and our reference dropped. Off: the
+ * request is left to run (a looping effect then lives on into the shots after it). */
+#define MAXTAE 8
+static uint64_t tae_req[MAXTAE];
+static int ntae;
+static int tae_end_on = 1;
+static void req_unref(uint64_t req) {
+    volatile int32_t* refs = (volatile int32_t*)(uintptr_t)(req + 8);
+    if (*refs > 1) {
+        *refs -= 1;
+        return;
+    }
+    if (*refs != 1) return;
+    /* ours was the last reference: the object's release, its vtable's first slot, as DLReferenceCountObject's Unref calls it */
+    *refs = 0;
+    const uint32_t fn = bn_of(r64(r64(req)));
+    if (fn) {
+        BbCallRegs r;
+        memset(&r, 0, sizeof r);
+        r.arg[0] = req;
+        api->call_guest(fn, &r);
+    }
+}
+static void tae_end_all(const char* why) {
+    for (int i = 0; i < ntae; ++i) {
+        const uint64_t req = tae_req[i];
+        if (!heap_ptr(req)) continue;
+        volatile uint8_t* flags = (volatile uint8_t*)(uintptr_t)(req + 0x10);
+        const uint32_t state = r32(req + 0xc);
+        *flags |= 1;
+        api->log("fxp: f%llu shot s%d: its TAE effect %u ended %s (request state %u)", (unsigned long long)frames, shot_index - 1, r32(req + 0x68), why,
+                 state);
+        req_unref(req);
+    }
+    ntae = 0;
+}
 static int sfx_at(uint64_t chr, int dummy, int id) {
     static int32_t eid, dmy_model, dmy_bind;
     static uint64_t request;
@@ -834,8 +879,12 @@ static int sfx_at(uint64_t chr, int dummy, int id) {
     r.arg[1] = (uint64_t)(uintptr_t)&dmy_bind;
     r.arg[2] = model;
     api->call_guest(0x2372fd0, &r);
-    volatile uint32_t* refs = (volatile uint32_t*)(uintptr_t)(request + 8);
-    if (*refs > 1) *refs -= 1;  /* ours; SprjSfx's list keeps its own */
+    if (tae_end_on && ntae < MAXTAE) {
+        tae_req[ntae++] = request;  /* ours, ended and dropped when the shot's event length has passed */
+    } else {
+        volatile uint32_t* refs = (volatile uint32_t*)(uintptr_t)(request + 8);
+        if (*refs > 1) *refs -= 1;  /* ours; SprjSfx's list keeps its own */
+    }
     return dummy;
 }
 
@@ -1017,6 +1066,7 @@ static void on_frame(void* user) {
                          used);
             }
         }
+        if (ntae && t >= s->hold) tae_end_all("at its event's length");
         if (speffect_on && t >= s->arg) {
             const int off = speffect_off(chr, s->id);
             speffect_on = 0;
@@ -1034,7 +1084,7 @@ static void on_frame(void* user) {
         }
         const int live = shot_live(shot_index - 1) + req_live(shot_index - 1);
         const double min_s = env_f("FXP_MIN_S", 1.0), max_s = env_f("FXP_MAX_S", 15.0);
-        if (t < min_s || speffect_on || (live && t < max_s)) return;
+        if (t < min_s || speffect_on || ntae || (live && t < max_s)) return;
         if (live) api->log("fxp: f%llu shot s%d: %d instance(s) live at %.1f s, the cap - on to the next", (unsigned long long)frames, shot_index - 1, live, t);
         api->log("fxp: f%llu shot s%d done after %.2f s", (unsigned long long)frames, shot_index - 1, t);
         shot_end_at = frames;
@@ -1090,6 +1140,7 @@ BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* a) {
         return 1;
     }
     fps = env_f("FXP_FPS", 30.0);
+    tae_end_on = env_i("FXP_TAE_END", 1) != 0;
     if (getenv("FXP_BLOCK")) want_block = (uint32_t)strtoul(getenv("FXP_BLOCK"), 0, 16);
     word_bytes = env_i("FXP_WORD_BYTES", 0x200) & ~3;
     if (word_bytes <= 0 || word_bytes > 0x200) word_bytes = 0x200;
@@ -1118,7 +1169,7 @@ BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* a) {
     static const uint8_t p_created[17] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x54, 0x53, 0x48, 0x89, 0xf3, 0x49, 0x89, 0xfe};
     const int hc = a->hook2(0x2c53020, p_create, sizeof p_create, h_create, 0);
     const int hd = a->hook2(0x2c505f0, p_created, sizeof p_created, h_created, 0);
-    a->log("fxp: creation hooks %d %d (0 in)", hc, hd);
+    a->log("fxp: creation hooks %d %d (0 in); TAE effects %s", hc, hd, tae_end_on ? "ended at their event's length" : "left to run (FXP_TAE_END=0)");
     a->on_frame(on_frame, 0);
     a->log("fxp: %d shots (FXP_PLAN), %.0f frames a game second, block %08x; container hook %d (0 in); the step slot %s; word bytes 0x%x; %d dumps a shot",
            nshots, fps, want_block, hk, step_slot ? "found" : "NOT found", word_bytes, ndump);
