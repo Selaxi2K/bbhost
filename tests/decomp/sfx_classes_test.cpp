@@ -36,6 +36,18 @@
 //   - the GX binder 0x56e3100 (sub_2cbcf50): the record's time chain (+0x24 =
 //     +0x28, +0x28 += the item's step) and its type's update once an item,
 //     handed that elapsed time;
+//   - the FFX-format GX types 0x6b (0x56e35d0, sub_2ec0a60: only its bounds),
+//     0x14 / 0x3b (0x56e3530, sub_2eb6550: +0x10 += the elapsed time times a
+//     rate at the scaled time), 0x2b (0x56e3580, sub_2ebc280: +0x20, or +0x18
+//     and +0x1c, the same) and 3 / 0x3d (0x56ebe20, sub_1325cd0: +0x18 and
+//     +0x1c the same): the same bounds and bytes, the accumulations within a
+//     rounding a frame, nothing added by a step of 0;
+//   - the wind source 0x283c (0x56eadf0, sub_12e3c30): its fade (+0xd0) by
+//     the elapsed time, its strengths from a curve at the record's time and
+//     that fade, its velocity the handle's move over the elapsed time: the
+//     same shape, place and bounds, the fade, strengths and velocity within
+//     the times' and places' rounding; a step of 0 fades nothing and moves
+//     at 0;
 //   - the GPU particle simulations StandardParticle (sub_13040b0) and Spark
 //     (sub_12fef10): their time and emission timers moved by the elapsed time
 //     and an emission each interval - over a second the same particles emitted
@@ -53,6 +65,8 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
+
+#include <xmmintrin.h>
 
 using namespace decomp;
 
@@ -864,6 +878,336 @@ int check_gx_record(int cases) {
     return bad;
 }
 
+// --- the FFX-format GX types ------------------------------------------------------------
+
+// Their properties are records the type's definition holds inline - +0 a kind, the index into an
+// evaluator table, +8 its keys {count n, n times, n values} - and the kind 0 of each table is the plain
+// one: 0x56dc6a0's the value of the last key at or before the time, 0x56dc900's the largest value, and
+// 0x570eec0's the value handed to it.
+using TypeUpdate = GUEST_ABI void (*)(u64 bounds, u64 type, u64 record10, u64 buffer);
+void property(u64 at, const std::vector<std::pair<float, float>>& keys) {
+    const u64 k = block(4 + 8 * keys.size());
+    store<s32>(k, static_cast<s32>(keys.size()));
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        store<float>(k + 4 + 4 * i, keys[i].first);
+        store<float>(k + 4 + 4 * (keys.size() + i), keys[i].second);
+    }
+    store<u64>(at, 0);
+    store<u64>(at + 8, k);
+}
+// The record an FFX-format type's update reads (record +0x10): its node (+0), birth +0x10, previous +0x14
+// and current +0x18 times, the matrix rows +0x20 / +0x30, +0x70; the node a plain one (its time scale 1),
+// its instance's sizes +0x20 / +0x24.
+u64 ffx_record(float cur, float birth) {
+    const u64 r = block(0x80), node = block(0x100), inst = block(0x98);
+    store<u32>(node + 0x78, 0);
+    store<u64>(node + 0x58, inst);
+    store<float>(inst + 0x20, uni(0.5f, 2));
+    store<float>(inst + 0x24, uni(0.5f, 2));
+    store<u64>(r, node);
+    store<float>(r + 0x10, birth);
+    store<float>(r + 0x14, cur);
+    store<float>(r + 0x18, cur);
+    for (int k = 0x20; k < 0x40; k += 4) store<float>(r + k, uni(-20, 20));
+    store<u32>(r + 0x70, g_rng.u32());
+    return r;
+}
+
+// The bounds the type 3 / 0x3d update ends with: its own vtable +0x40 (type, out, &record +0x40, three radii), a stub
+// of the test's that writes the radii as the bounds.
+GUEST_ABI void stub_type_bounds(u64, u64 out, u64, float a, float b, float c) {
+    store<float>(out, a);
+    store<float>(out + 4, b);
+    store<float>(out + 8, c);
+    store<float>(out + 12, 1.0f);
+    std::memset(reinterpret_cast<void*>(out + 16), 0, 16);
+}
+alignas(64) u8 g_type3d_vt[0x80];
+// The root definition's value type 3 / 0x3d reads (sub_2712f40): a fixed one.
+GUEST_ABI float stub_root_value(u64) { return 0.25f; }
+
+// The FFX-format GX types' updates (vtable +0x10), each a step's worth of what time does:
+//   - 0x6b (0x56e35d0, sub_2ec0a60): only the bounds, from its properties' largest values;
+//   - 0x14 / 0x3b (0x56e3530, sub_2eb6550): +0x10 += the elapsed time x the rate +0xa8 (at the scaled time,
+//     through the blend +0x180);
+//   - 0x2b (0x56e3580, sub_2ebc280): +0x20 += it x +0xf0 (mode +0x40 = 0), or +0x18 += it x +0x120 and +0x1c += it
+//     x +0x130 (sub_2ebc510, through the blends +0x110 / +0x140 and a parent at +0x28);
+//   - 3 / 0x3d (0x56ebe20, sub_1325cd0 -> sub_2ebe1b0): +0x18 += it x +0x118, +0x1c += it x +0x128 (blend +0x158,
+//     a parent at +0x30), +0x110 the root definition's value, the bounds through its own +0x40;
+// and their bounds. Frames of 1/60 or 1/120 s add up to the whole step's within a rounding each (and the times'
+// own rounding), a step of 0 adds nothing, and the bounds are the same.
+struct FfxType {
+    const char* name;
+    u64 fn;
+    std::vector<u64> bounds_props;  // records the bounds read (0x56dc900's kind 0: the largest value)
+    std::vector<u64> rate_props;    // the rates (0x56dc6a0's kind 0)
+    std::vector<u64> blend_kinds;   // their blends' kinds (0x570eec0's kind 0: the value handed on)
+    u64 flag;                       // the radius switch
+    u64 parent;                     // the type's parent pointer (0: none)
+};
+int check_ffx_types(int cases) {
+    const FfxType types[] = {
+        {"0x6b", 0x2ec0a60, {0x40, 0x50, 0x60, 0x80, 0x90}, {}, {}, 0x130, 0},
+        {"0x14", 0x2eb6550, {0x48, 0x58, 0x68, 0x78, 0x88}, {0xa8}, {0x1c4}, 0x1e8, 0x20},
+        {"0x2b", 0x2ebc280, {0x50, 0x60, 0x70, 0x90, 0xa0, 0xb0}, {0xf0, 0x120, 0x130}, {0x1a8, 0x1ac}, 0x1b8, 0x28},
+        {"0x3d", 0x1325cd0, {0x48, 0x58, 0x68}, {0x118, 0x128}, {0x1cc}, 0x1c4, 0x30},
+    };
+    int bad = 0;
+    for (const FfxType& ty : types) {
+        const auto update = eboot_kit::fn<TypeUpdate>(ty.fn);
+        for (int c = 0; c < cases; ++c) {
+            g_blocks.clear();
+            const u64 type = block(0x140), def = block(0x200), parent = block(0x40);
+            store<u64>(type, reinterpret_cast<u64>(g_type3d_vt));
+            store<u64>(type + 8, def);
+            for (const u64 off : {0x10, 0x18, 0x1c, 0x20}) store<float>(type + off, uni(-5, 5));
+            if (ty.parent) store<u64>(type + ty.parent, g_rng.chance(0.5) ? parent : 0);
+            for (int k = 0x20; k < 0x40; k += 4) store<float>(parent + k, uni(-2, 2));
+            for (const u64 off : ty.bounds_props) {
+                std::vector<std::pair<float, float>> keys;
+                const int n = g_rng.range(1, 3);
+                for (int i = 0; i < n; ++i) keys.push_back({uni(0, 2), uni(-3, 3)});
+                property(def + off, keys);
+            }
+            std::vector<float> rates;
+            for (const u64 off : ty.rate_props) {
+                rates.push_back(g_rng.chance(0.3) ? 0.0f : uni(-4, 4));
+                property(def + off, {{0.0f, rates.back()}});
+            }
+            for (const u64 off : ty.blend_kinds) store<u32>(def + off, 0);
+            store<u32>(def + ty.flag, g_rng.u32() & 1);
+            if (ty.fn == 0x2ebc280) store<u32>(def + 0x40, g_rng.chance(0.5) ? 0u : 1u);  // 0x2b's mode (+0x20, or +0x18 and +0x1c)
+            const float t = g_rng.chance(0.2) ? uni(0, 1000) : uni(0, 20);
+            const u64 rec = ffx_record(t, t - uni(0, 5));
+            store<float>(load<u64>(load<u64>(rec) + 0x58) + 0x28, uni(0.5f, 2));
+            const u64 buf = block(0x100);
+            const std::vector<u8> type0 = bytes_of(type, 0x140), rec0 = bytes_of(rec, 0x80);
+            const float h = 1.0f / 30.0f;
+            alignas(16) u8 b_whole[32], b_frame[32];
+            store<float>(rec + 0x14, t);
+            store<float>(rec + 0x18, t + h);
+            update(reinterpret_cast<u64>(b_whole), type, rec, buf);
+            const std::vector<u8> type_whole = bytes_of(type, 0x140);
+            const char* why = nullptr;
+            // the times' own rounding: each frame's elapsed time is the difference of two floats near t
+            const double ulp = std::ldexp(1.0, std::ilogb(std::max(1.0, std::fabs(static_cast<double>(t)) + 1.0)) - 23);
+            double rmax = 0;
+            for (const float r : rates) rmax = std::max(rmax, static_cast<double>(std::fabs(r)));
+            for (const int n : {2, 4}) {
+                put_bytes(type, type0);
+                put_bytes(rec, rec0);
+                float cur = t;
+                for (int i = 0; i < n; ++i) {
+                    const float next = g_control == 3 ? cur + h : cur + h / n;
+                    store<float>(rec + 0x14, cur);
+                    store<float>(rec + 0x18, next);
+                    update(reinterpret_cast<u64>(b_frame), type, rec, buf);
+                    cur = next;
+                }
+                if (std::memcmp(b_whole, b_frame, 32) != 0) {
+                    why = "the bounds";
+                    break;
+                }
+                for (u64 off = 0; off < 0x140 && !why; off += 4) {
+                    float a, b;
+                    std::memcpy(&a, type_whole.data() + off, 4);
+                    std::memcpy(&b, reinterpret_cast<void*>(type + off), 4);
+                    if (eboot_kit::same_float(a, b)) continue;
+                    const double tol = (n + 1) * 1.2e-7 * (1 + std::fabs(static_cast<double>(a))) + (n + 1) * 1.2e-7 * rmax * h + 2.0 * n * ulp * rmax;
+                    if (std::fabs(static_cast<double>(a) - b) > tol) why = "an accumulation";
+                }
+                if (why) break;
+            }
+            // a step of 0: nothing added
+            if (!why) {
+                put_bytes(type, type0);
+                put_bytes(rec, rec0);
+                store<float>(rec + 0x14, t);
+                store<float>(rec + 0x18, t);
+                update(reinterpret_cast<u64>(b_frame), type, rec, buf);
+                for (const u64 off : {0x10, 0x18, 0x1c, 0x20})
+                    if (load<u32>(type + off) != load<u32>(reinterpret_cast<u64>(type0.data()) + off)) why = "a step of 0";
+            }
+            if (why && ++bad <= 6 && !g_quiet) std::printf("FFX type %s case %d (time %g): %s differs\n", ty.name, c, t, why);
+        }
+    }
+    if (!g_quiet) std::printf("decomp_sfx_classes: FFX-format GX types 0x6b, 0x14/0x3b, 0x2b and 3/0x3d: %d cases each, %d differ\n", cases, bad);
+    return bad;
+}
+
+// --- the wind source, GX type 0x283c ----------------------------------------------------
+//
+// sub_12e3c30 (0x56eadf0 +0x10): an FFX wind source through the wind system's handle +0xe0 - its shape
+// (+0x20: 1 a sphere, 2 a box, 3 and 4 a segment) at the record's translation, its strengths (+0x78,
+// +0x7c) times a curve (+0xb8) at the record's time and, while its node ends (state 4 to 7), times what
+// is left of a fade (+0xd0 += the elapsed time, over +0x58), the transform, and (+0x44) a velocity: the
+// handle's move over the elapsed time times +0x48 (0 for an elapsed time of 0). An ended node
+// (sub_2c4f110) lets the handle go. The wind system's calls are the test's, each seen by its last call;
+// the handle's position is the translation last set on it.
+struct WindSeen {
+    int releases = 0, shapes = 0, strengths = 0, velocities = 0;
+    float shape[28] = {};  // the last shape call's vectors and radius
+    float strength[2] = {};
+    float velocity[4] = {};
+    float position[4] = {};  // the handle's
+};
+WindSeen g_wind;
+bool g_wind_ended = false;  // sub_2c4f110's answer
+GUEST_ABI u8 stub_node_ended(u64) { return g_wind_ended ? 1 : 0; }
+GUEST_ABI void stub_wind_release(u64 handle_at) {
+    ++g_wind.releases;
+    store<u64>(handle_at, ~0ull);
+}
+GUEST_ABI __m128 stub_wind_position(u64) { return _mm_loadu_ps(g_wind.position); }
+void wind_shape(int kind, const float* a, const float* b, const float* c, float r) {
+    ++g_wind.shapes;
+    std::memset(g_wind.shape, 0, sizeof g_wind.shape);
+    g_wind.shape[0] = static_cast<float>(kind);
+    std::memcpy(g_wind.shape + 1, a, 16);
+    if (b) std::memcpy(g_wind.shape + 5, b, 16);
+    if (c) std::memcpy(g_wind.shape + 9, c, 64);
+    g_wind.shape[25] = r;
+}
+GUEST_ABI void stub_wind_sphere(u64, const float* at, float r) { wind_shape(1, at, nullptr, nullptr, r); }
+GUEST_ABI void stub_wind_box(u64, const float* lo, const float* hi, const float* rotation) { wind_shape(2, lo, hi, rotation, 0.0f); }
+GUEST_ABI void stub_wind_segment3(u64, const float* a, const float* b, float r) { wind_shape(3, a, b, nullptr, r); }
+GUEST_ABI void stub_wind_segment4(u64, const float* a, const float* b, float r) { wind_shape(4, a, b, nullptr, r); }
+GUEST_ABI void stub_wind_strength(u64, float a, float b) {
+    ++g_wind.strengths;
+    g_wind.strength[0] = a;
+    g_wind.strength[1] = b;
+}
+GUEST_ABI void stub_wind_transform(u64, const float* m) { std::memcpy(g_wind.position, m + 12, 16); }
+GUEST_ABI void stub_wind_velocity(u64, const float* v) {
+    ++g_wind.velocities;
+    std::memcpy(g_wind.velocity, v, 16);
+}
+GUEST_ABI u64 stub_wind_object(u64) { return 0; }
+
+int check_wind_source(int cases) {
+    const auto update = eboot_kit::fn<TypeUpdate>(0x12e3c30);
+    int bad = 0;
+    long ending = 0, released = 0, moving = 0;
+    for (int c = 0; c < cases; ++c) {
+        g_blocks.clear();
+        const u64 type = block(0x100), rec = block(0x80), node = block(0x100), inst = block(0x98);
+        for (int k = 0x10; k < 0x100; k += 4) store<float>(type + k, uni(-3, 3));
+        store<u32>(type + 0x20, static_cast<u32>(g_rng.range(0, 5)));
+        store<u32>(type + 0x44, g_rng.chance(0.7) ? 1u : 0u);
+        store<float>(type + 0x58, g_rng.chance(0.1) ? 0.0f : uni(0.05f, 2));
+        store<u64>(type + 0xb8, g_rng.chance(0.6) ? curve(uni(0, 2), g_rng.chance(0.5) ? 0.0f : uni(-0.5f, 0.5f)) : 0);
+        store<float>(type + 0xd0, g_rng.chance(0.3) ? 0.0f : uni(0, 1));
+        store<u64>(type + 0xe0, g_rng.chance(0.1) ? ~0ull : 0x100 + static_cast<u64>(c));
+        const u32 state = static_cast<u32>(g_rng.range(0, 9));
+        store<u32>(node + 0xdc, state);
+        store<u64>(node + 0x58, inst);  // no overrides (+0x40)
+        g_wind_ended = state >= 4 && state <= 7 && g_rng.chance(0.2);
+        ending += state >= 4 && state <= 7;
+        released += g_wind_ended;
+        store<u64>(rec, node);
+        // The record's transform: rows +0x40 / +0x50 / +0x60, the translation in their last lanes, moving by v.
+        for (int k = 0x40; k < 0x70; k += 4) store<float>(rec + k, uni(-1, 1));
+        const bool still = g_rng.chance(0.1);
+        moving += !still;
+        float p0[3], v[3];
+        for (int i = 0; i < 3; ++i) {
+            p0[i] = uni(-20, 20);
+            v[i] = still ? 0.0f : uni(-6, 6);
+        }
+        auto put_at = [&](double s) {
+            for (int i = 0; i < 3; ++i) store<float>(rec + 0x4c + 0x10 * static_cast<u64>(i), static_cast<float>(p0[i] + v[i] * s));
+        };
+        const float t = g_rng.chance(0.2) ? uni(0, 1000) : uni(0, 20);
+        const float h = 1.0f / 30.0f, t1 = t + h;
+        const std::vector<u8> type0 = bytes_of(type, 0x100), rec0 = bytes_of(rec, 0x80);
+        auto begin = [&]() {
+            put_bytes(type, type0);
+            put_bytes(rec, rec0);
+            g_wind = WindSeen{};
+            for (int i = 0; i < 3; ++i) g_wind.position[i] = p0[i];
+            g_wind.position[3] = 1.0f;
+        };
+        alignas(16) u8 b_whole[32], b_frame[32];
+        begin();
+        store<float>(rec + 0x14, t);
+        store<float>(rec + 0x18, t1);
+        put_at(h);
+        update(reinterpret_cast<u64>(b_whole), type, rec, 0);
+        const std::vector<u8> type_whole = bytes_of(type, 0x100);
+        const WindSeen whole = g_wind;
+        const char* why = nullptr;
+        const double ulp_t = std::ldexp(1.0, std::ilogb(std::max(1.0, std::fabs(static_cast<double>(t)) + 1.0)) - 23);
+        const double ulp_p = std::ldexp(1.0, std::ilogb(26.0) - 23);
+        // the strength's largest size: the curve's value at the end (or 1); the fade only lowers it
+        const u64 strength_curve = load<u64>(type + 0xb8);
+        const double s_max = strength_curve ? std::fabs(static_cast<double>(load<float>(strength_curve + 8))) +
+                                                  std::fabs(static_cast<double>(load<float>(strength_curve + 12))) * (std::fabs(static_cast<double>(t)) + 1.0)
+                                            : 1.0;
+        for (const int n : {2, 4}) {
+            begin();
+            float cur = t;
+            for (int i = 1; i <= n; ++i) {
+                const float next = g_control == 3 ? cur + h : i == n ? t1 : t + h * static_cast<float>(i) / static_cast<float>(n);
+                store<float>(rec + 0x14, cur);
+                store<float>(rec + 0x18, next);
+                put_at(static_cast<double>(h) * i / n);
+                update(reinterpret_cast<u64>(b_frame), type, rec, 0);
+                cur = next;
+            }
+            const WindSeen& fr = g_wind;
+            if (std::memcmp(b_whole, b_frame, 32) != 0) why = "the bounds";
+            else if (fr.releases != whole.releases) why = "the handle let go";
+            else if ((fr.shapes > 0) != (whole.shapes > 0) || std::memcmp(fr.shape, whole.shape, sizeof fr.shape) != 0) why = "the shape";
+            else if (std::memcmp(fr.position, whole.position, 16) != 0) why = "the handle's position";
+            else if ((fr.strengths > 0) != (whole.strengths > 0) || (fr.velocities > 0) != (whole.velocities > 0)) why = "the calls made";
+            if (why) break;
+            for (u64 off = 0; off < 0x100 && !why; off += 4) {
+                const float a = load<float>(reinterpret_cast<u64>(type_whole.data()) + off), b = load<float>(type + off);
+                if (eboot_kit::same_float(a, b)) continue;
+                if (off != 0xd0 || std::fabs(static_cast<double>(a) - b) > 2.0 * n * (ulp_t + 1.2e-7 * (1 + std::fabs(static_cast<double>(a)))))
+                    why = off == 0xd0 ? "the fade" : "a word of the type";
+            }
+            if (why) break;
+            // the strengths: the curve at the same time, the fade within its rounding
+            const double fade_err = 2.0 * n * (ulp_t + 1.2e-7) / std::max(0.05, static_cast<double>(load<float>(type + 0x58)));
+            for (int i = 0; i < 2 && !why; ++i) {
+                const double a = whole.strength[i], b = fr.strength[i];
+                const double k = s_max * std::fabs(static_cast<double>(load<float>(type + 0x78 + 4 * static_cast<u64>(i))));
+                if (!eboot_kit::same_float(whole.strength[i], fr.strength[i]) && std::fabs(a - b) > 4e-6 * (1 + std::fabs(a)) + 4.0 * fade_err * k)
+                    why = "the strengths";
+            }
+            // the velocity: the move over the elapsed time (times 0.09), within the positions' and the times' rounding
+            double vmax = 0;
+            for (int i = 0; i < 4; ++i) vmax = std::max(vmax, std::fabs(static_cast<double>(whole.velocity[i])));
+            const double tol_v = 4e-6 * (1 + vmax) + vmax * 2.0 * n * ulp_t / h +
+                                 3.0 * n * ulp_p / h * s_max * std::fabs(static_cast<double>(load<float>(type + 0x48)));
+            for (int i = 0; i < 4 && !why; ++i) {
+                const double a = whole.velocity[i], b = fr.velocity[i];
+                if (!eboot_kit::same_float(whole.velocity[i], fr.velocity[i]) && std::fabs(a - b) > tol_v) why = "the velocity";
+            }
+            if (why) break;
+        }
+        // a step of 0: no fade added, no velocity
+        if (!why) {
+            begin();
+            store<float>(rec + 0x14, t);
+            store<float>(rec + 0x18, t);
+            put_at(0.0);
+            update(reinterpret_cast<u64>(b_frame), type, rec, 0);
+            if (load<u32>(type + 0xd0) != load<u32>(reinterpret_cast<u64>(type0.data()) + 0xd0)) why = "a step of 0's fade";
+            for (int i = 0; i < 3 && !why; ++i)
+                if (g_wind.velocities && g_wind.velocity[i] != 0.0f) why = "a step of 0's velocity";
+        }
+        if (why && ++bad <= 6 && !g_quiet)
+            std::printf("wind source case %d (shape %u, state %u, time %g, velocity %u): %s differs\n", c,
+                        load<u32>(reinterpret_cast<u64>(type0.data()) + 0x20), state, t, load<u32>(reinterpret_cast<u64>(type0.data()) + 0x44), why);
+    }
+    if (!g_quiet)
+        std::printf("decomp_sfx_classes: the wind source 0x283c: %d cases (%ld ending, %ld of them let go, %ld moving), %d differ\n", cases, ending, released,
+                    moving, bad);
+    return bad;
+}
+
 // --- the GPU particle simulations ------------------------------------------------------
 
 using SimFn = GUEST_ABI void (*)(u64 sim, float dt);
@@ -965,6 +1309,20 @@ int main() {
     store<u64>(reinterpret_cast<u64>(g_init_vt) + 0x18, reinterpret_cast<u64>(&stub_init));
     store<u64>(reinterpret_cast<u64>(g_bounds_vt) + 0x18, reinterpret_cast<u64>(&stub_attribute_bounds));
     store<u64>(reinterpret_cast<u64>(g_type_vt) + 0x10, reinterpret_cast<u64>(&stub_type_update));
+    store<u64>(reinterpret_cast<u64>(g_type3d_vt) + 0x40, reinterpret_cast<u64>(&stub_type_bounds));
+    eboot_kit::stub(0x2712f40, reinterpret_cast<const void*>(&stub_root_value));
+    // The wind source's reach: the node's end (sub_2c4f110) and the wind system's calls.
+    eboot_kit::stub(0x2c4f110, reinterpret_cast<const void*>(&stub_node_ended));
+    eboot_kit::stub(0x2717e10, reinterpret_cast<const void*>(&stub_wind_release));
+    eboot_kit::stub(0x27182b0, reinterpret_cast<const void*>(&stub_wind_position));
+    eboot_kit::stub(0x2718050, reinterpret_cast<const void*>(&stub_wind_sphere));
+    eboot_kit::stub(0x27181c0, reinterpret_cast<const void*>(&stub_wind_box));
+    eboot_kit::stub(0x27180c0, reinterpret_cast<const void*>(&stub_wind_segment3));
+    eboot_kit::stub(0x2718140, reinterpret_cast<const void*>(&stub_wind_segment4));
+    eboot_kit::stub(0x2718440, reinterpret_cast<const void*>(&stub_wind_strength));
+    eboot_kit::stub(0x2718370, reinterpret_cast<const void*>(&stub_wind_transform));
+    eboot_kit::stub(0x2718240, reinterpret_cast<const void*>(&stub_wind_velocity));
+    eboot_kit::stub(0x2717e50, reinterpret_cast<const void*>(&stub_wind_object));
     for (u8* vt : {g_emitter_vt, g_init_vt, g_bounds_vt}) store<u64>(reinterpret_cast<u64>(vt) + 0x20, reinterpret_cast<u64>(&stub_attribute_prepare));
     // What the systems reach and a test does not set up: the scratch allocator, the buffers' fills, the bounds, the FX RNG.
     eboot_kit::stub(0x247d5b0, reinterpret_cast<const void*>(&stub_mark));
@@ -1001,6 +1359,8 @@ int main() {
     bad += check_cpu_particles(kCases);
     bad += check_gx_record(kCases);
     bad += check_sims(kCases / 8);
+    bad += check_ffx_types(kCases);
+    bad += check_wind_source(kCases);
     // The controls: each check catches the frame domain it guards against.
     g_quiet = true;
     int missed = 0;
@@ -1011,6 +1371,8 @@ int main() {
     } controls[] = {{1, check_cpu_particles, "the emission count on every frame (the CPU particles)"},
                     {2, check_euler, "the node's time left at its whole step (the Euler motion's curve)"},
                     {3, check_gx_record, "each frame handed the whole step (the GX record)"},
+                    {3, check_ffx_types, "each frame handed the whole step (the FFX-format GX types' rates)"},
+                    {3, check_wind_source, "each frame handed the whole step (the wind source's fade, strengths and velocity)"},
                     {4, check_sims, "each simulation update the whole step's time"}};
     for (const auto& k : controls) {
         g_control = k.control;
@@ -1020,6 +1382,6 @@ int main() {
         }
     }
     g_control = 0;
-    std::printf("decomp_sfx_classes: %s; %d of 4 controls caught\n", bad ? "the converted classes do not all hold" : "the converted classes hold", 4 - missed);
+    std::printf("decomp_sfx_classes: %s; %d of 6 controls caught\n", bad ? "the converted classes do not all hold" : "the converted classes hold", 6 - missed);
     return bad || missed ? 1 : 0;
 }

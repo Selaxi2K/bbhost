@@ -164,16 +164,18 @@ constexpr u64 kManagerOf = 0x70;  // SprjSfx +0x70: the effect manager (its time
 
 // The converted classes' vtables, by Binary Ninja address: the classes whose
 // updates do with their step only what time does, each read in Binary Ninja -
-// the motions, the modules, the binders and the StandardParticle and Spark
-// simulations also held to the game's own code by
-// tests/decomp/sfx_classes_test.cpp (one whole step against the frame domain's
-// frames) - and the FFX light, whose one counted part sfx_light_update runs
-// once a whole step (tests/decomp/sfx_step_gate_test.cpp). Off the list, and so
-// on the held frames as with 30: the wobble motions 0x570e6d0, 0x570e690 and
-// 0x570e8d0 (they count their updates), the module 0x5760f20, and the GPU
-// particle types 0x2712 (0x56eb030: whole grid passes of elapsed x 30), 0x2713
-// (0x56eb0d0: its parameters are curves read at the elapsed time), 0x283c
-// (0x56eadf0) and 0x283d (0x56eac40), not read through yet.
+// the motions, the modules, the binders, the StandardParticle and Spark
+// simulations, the FFX-format GX types and the wind source 0x283c also held to
+// the game's own code by tests/decomp/sfx_classes_test.cpp (one whole step
+// against the frame domain's frames) - and the FFX light, whose one counted
+// part sfx_light_update runs once a whole step
+// (tests/decomp/sfx_step_gate_test.cpp). Off the list, and so on the held
+// frames as with 30: the wobble motions 0x570e6d0, 0x570e690 and 0x570e8d0
+// (they count their updates), the module 0x5760f20, the GPU particle types
+// 0x2712 (0x56eb030: whole grid passes of elapsed x 30), 0x2713 (0x56eb0d0:
+// its parameters are curves read at the elapsed time) and 0x283d (0x56eac40),
+// and the FFX-format GX type 0x28 (0x56e3620: a ribbon, its points added an
+// update with a draw of the FX RNG).
 constexpr u64 kConverted[] = {
     0x570e650,  // motion: velocity along itself by step x speed curve x +0x24, position by step x velocity, facing the move
     0x570e790,  // motion: turned by step x its rates (or three curves)
@@ -189,6 +191,11 @@ constexpr u64 kConverted[] = {
     0x56eaa90,  // GPU particle type 0x27d8: no time
     0x56eb290,  // GPU particle type 0x2968: constant bounds
     0x56ebba0,  // module: the FFX light; its flicker phase counted once a whole step at the step's time (sfx_light_update)
+    0x56e35d0,  // GX type 0x6b (FFX format): only its bounds, from its properties' largest values; no time
+    0x56e3530,  // GX type 0x14 / 0x3b (FFX format): +0x10 += the elapsed time x a rate read at the scaled time, its bounds
+    0x56e3580,  // GX type 0x2b (FFX format): +0x20, or +0x18 and +0x1c, += the elapsed time x rates at the scaled time
+    0x56ebe20,  // GX type 3 / 0x3d (FFX format): +0x18 and +0x1c += the elapsed time x rates; a root definition's value
+    0x56eadf0,  // GX type 0x283c: a wind source; its fade += the elapsed time, its velocity the move over it (0 for none)
 };
 const u64* g_converted = kConverted;
 std::size_t g_converted_count = sizeof kConverted / sizeof kConverted[0];
