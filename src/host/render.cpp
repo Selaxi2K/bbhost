@@ -17,6 +17,7 @@
 #include "host/vertex_plan.h"
 
 #include "host/cb_proof.h"
+#include "host/gxvk.h"
 #include "host/draw_capture.h"
 #include "gcn/container.h"
 #include "gcn/lift.h"
@@ -1131,6 +1132,10 @@ thread_local const char* t_draw_pipeline = nullptr;  // the draw being resolved,
 // The draw being resolved came from a Scaleform (or wrapper) token: its
 // constant buffers are bound from a copy taken now (resolve_stage_buffers).
 thread_local bool t_snapshot_cbs = false;
+// The draw's call stamp for the GX upload heap's checks (host/gxvk.h; set by
+// draw_impl for the draw it resolves, 0 otherwise - dispatches, the census
+// off).
+thread_local std::uint64_t t_gxvk_call_seq = 0;
 std::atomic<std::uint64_t> g_sf_cb_snapshots{0};
 thread_local char t_draw_origin[160] = "";             // and where it came from
 void clear_image_locked(RtImage& r, const float rgba[4], std::uint32_t first_layer, std::uint32_t layer_count, bool barrier = true);  // below, outside the unnamed namespace
@@ -12402,6 +12407,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
         // A V# keeps memory-type bits above its 40-bit address; a pointer pair is the address.
         const std::uint64_t hi = b.pointer ? words[1] : (words[1] & 0xff);
         const std::uint64_t base = resolved ? static_cast<std::uint64_t>(words[0]) | (hi << 32) : 0;
+        if (gxvk::census() && base) gxvk::census_constant_bound(base, bytes, t_gxvk_call_seq, g.flushes, gx != nullptr);
         int outcome = !base ? kNoBase : (base & 3) || !shape ? kUnaligned : kUnmapped;
         // Past the longest binding the range takes the page table: no one buffer need hold it.
         Located loc;
@@ -13452,6 +13458,8 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
         if (!rs) {
             const std::uint64_t record_va = va - fe.offset;
             std::uint64_t record_bytes = w[2] ? static_cast<std::uint64_t>(w[2]) * stride : fe.offset + bytes;
+            // BBHOST_GXVK_CENSUS: the record by what holds its bytes, and the upload heap's checks.
+            if (gxvk::census()) gxvk::census_binding(gxvk::kUseVertex, o.vtx_obj[fe.slot], record_va, record_bytes, o.call_seq, g.flushes);
             RecordShadow& ns = shadows[n_shadows++];
             ns.w = w;
             ns.whole = {};
@@ -17011,6 +17019,10 @@ static bool draw_impl(const GpuDraw& d) {
     timer.next(kPhaseDraw);
     RenderCostStamp draw_stamp;
     t_token_draw = d.gx_token;
+    struct CallSeq {
+        explicit CallSeq(std::uint64_t v) { t_gxvk_call_seq = v; }
+        ~CallSeq() { t_gxvk_call_seq = 0; }
+    } call_seq(d.gx_objects ? d.gx_objects->call_seq : 0);
     apply_table_masks_locked();
     apply_lean_builds_locked();
     apply_relinks_locked();
@@ -19747,6 +19759,8 @@ static bool draw_impl(const GpuDraw& d) {
             return false;
         }
         note_arena_read(kArenaIndex, d.index_va, static_cast<std::uint64_t>(d.index_count) * (d.index_type == 1 ? 4 : 2));
+        if (gxvk::census())
+            gxvk::census_binding(gxvk::kUseIndex, d.gx_objects ? d.gx_objects->ib_obj : 0, d.index_va, index_bytes, t_gxvk_call_seq, g.flushes);
         if (glitch_watching_draw()) glitch_watch_read_locked(d.index_va, static_cast<std::uint64_t>(d.index_count) * (d.index_type == 1 ? 4 : 2), 1);
         const VkIndexType itype = d.index_type == 1 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
         if (g_recorded.index_buffer != loc.buffer || g_recorded.index_offset != loc.offset || g_recorded.index_type != itype) {

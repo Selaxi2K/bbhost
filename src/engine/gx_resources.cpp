@@ -39,6 +39,7 @@
 #include "hle/hle.h"
 #include "hle/modules.h"
 #include "host/gpu.h"
+#include "host/gxvk.h"
 #include "log.h"
 
 #if !defined(_WIN32)
@@ -73,6 +74,16 @@ constexpr std::uint64_t kCreateRtv = 0x25667a0, kCreateDsv = 0x2566610;
 // Shader-resource views (the T# GX built at +0x10) and samplers
 // (the S# at +0x0), (ctx, object** out, ...).
 constexpr std::uint64_t kCreateSrv = 0x25669a0, kCreateSampler = 0x2565b40;
+// BBHOST_GXVK_CENSUS (host/gxvk.h): the unordered-access view creator (ctx,
+// view** out, holder, description, ...: the shader-resource view's prologue),
+// the block pool's initialisation 0x2aa9b50(pool, allocator, base, bytes) -
+// GX's upload heap, the device's one region (0x256b0f0) - and its aligned
+// hand-out 0x2aa9fa0(pool, bytes, alignment), beside 0x2aa9d50.
+constexpr std::uint64_t kCreateUav = 0x2566b60, kPoolInit = 0x2aa9b50, kPoolAligned = 0x2aa9fa0;
+// push rbp; mov rbp, rsp; push r15, r14, r13, r12, rbx; push rax
+constexpr std::uint8_t kPoolInitPrologue[14] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x50};
+// push rbp; mov rbp, rsp; push r15, r14, r12, rbx; mov rbx, rdx
+constexpr std::uint8_t kPoolAlignedPrologue[14] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x54, 0x53, 0x48, 0x89, 0xd3};
 // push rbp; mov rbp, rsp; push r15; push r14; push rbx; sub rsp, 0x48; mov rbx, rcx
 constexpr std::uint8_t kSamplerPrologue[16] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56,
                                                0x53, 0x48, 0x83, 0xec, 0x48, 0x48, 0x89, 0xcb};
@@ -446,6 +457,12 @@ void register_holder(std::uint64_t key, std::uint64_t holder, Kind kind, bool in
         // BBHOST_GX_TWINS=1: one the GPU writes gets a device-local twin at its first use.
         host_gpu_gx_buffer_made(e.info.memory, e.info.bytes, e.info.usage, bind, e.info.gen);
     }
+    // BBHOST_GXVK_CENSUS: the class word and canaries in the holder's spare
+    // bytes (host/gxvk.h); not a 1D texture's, whose holder GX builds inline.
+    if (!(key & kMemoryKey)) {
+        if (e.info.type == 1) gxvk::census_buffer_made(holder, initial_data);
+        else if (e.info.type == 3 || e.info.type == 4) gxvk::census_texture_made(holder);
+    }
     if (key & kMemoryKey) key = kMemoryKey | e.info.memory;
     register_entry(key, e);
 }
@@ -760,6 +777,7 @@ void note_map(std::uint64_t holder, std::uint64_t type, std::uint64_t mapped_out
     // and its image is no longer what its memory holds - the texture cache,
     // which does not watch a GX resource's memory, is told (host textures).
     if (texture_memory && texture_bytes) host_gpu_texture_written(texture_memory, texture_bytes);
+    if (buffer_bytes) gxvk::census_buffer_mapped(holder, static_cast<std::uint32_t>(type), mapped, buffer_bytes, result == 0 && mapped, own_memory != 0);
 }
 
 // The creators: rsi = holder**, rcx = initial data. The holder exists at the return.
@@ -828,10 +846,19 @@ GUEST_ABI std::int64_t tsharp_hook(std::uint64_t, const std::uint64_t* saved) {
     return 0;
 }
 
-// The upload pool's block source: rsi = bytes, the block comes back in rax.
+// The upload pool's block source: rdi = the pool, rsi = bytes, the block
+// comes back in rax. The pool's aligned hand-out (0x2aa9fa0) has the same
+// first two arguments.
 GUEST_ABI std::int64_t pool_hook(std::uint64_t, const std::uint64_t* saved) {
-    t_pending.push_back({saved[6], kPoolCall, 0, 0, saved[4]});
+    t_pending.push_back({saved[6], kPoolCall, 0, saved[5], saved[4]});
     const_cast<std::uint64_t*>(saved)[6] = reinterpret_cast<std::uint64_t>(&gx_res_ret);
+    return 0;
+}
+
+// The block pool's initialisation (BBHOST_GXVK_CENSUS): rdi = the pool, rdx =
+// its region, rcx = the region's bytes.
+GUEST_ABI std::int64_t pool_init_hook(std::uint64_t, const std::uint64_t* saved) {
+    gxvk::census_heap(saved[5], saved[3], saved[2]);
     return 0;
 }
 
@@ -1143,6 +1170,7 @@ GUEST_ABI std::int64_t ring_hook(std::uint64_t, const std::uint64_t* saved) {
 
 // A texture holder's destructor: rdi = holder.
 GUEST_ABI std::int64_t texture_dtor_hook(std::uint64_t, const std::uint64_t* saved) {
+    gxvk::census_texture_gone(saved[5]);
     unregister_holder(saved[5]);
     return 0;
 }
@@ -1163,6 +1191,7 @@ GUEST_ABI std::int64_t create1d_hook(std::uint64_t, const std::uint64_t* saved) 
 
 // A buffer's resource release: rdi = holder + 0x18.
 GUEST_ABI std::int64_t buffer_release_hook(std::uint64_t, const std::uint64_t* saved) {
+    gxvk::census_buffer_gone(saved[5] - 0x18);
     unregister_holder(saved[5] - 0x18);
     return 0;
 }
@@ -1275,6 +1304,7 @@ extern "C" GUEST_ABI std::uint64_t gx_res_after(std::uint64_t result) {
                 g_ring_bytes.fetch_add(p.ring_bytes, std::memory_order_relaxed);
                 host_gpu_shadow_gx_handed(ptr, p.ring_bytes, 2);
             }
+            if (got) gxvk::census_ring(ptr, p.ring_bytes);
         }
         if (g_trace) trace_map(p);
     } else if (p.kind == kYebisCreate) {
@@ -1316,14 +1346,19 @@ extern "C" GUEST_ABI std::uint64_t gx_res_after(std::uint64_t result) {
         }
     } else if (p.kind == kPoolCall) {
         std::uint64_t block = 0;
-        if (result && p.type && rd(result + 8, &block) && block) {
+        if (g_census && result && p.type && rd(result + 8, &block) && block) {
             g_pool_calls.fetch_add(1, std::memory_order_relaxed);
             g_pool_bytes.fetch_add(p.type, std::memory_order_relaxed);
             host_gpu_shadow_gx_handed(block, p.type, 1);
         }
+        if (result && p.type) gxvk::census_handout(p.holder, result, p.type);
     } else if (p.kind == kObject) {
         std::uint64_t object = 0;
-        if (p.out && rd(p.out, &object) && object) {
+        if (p.type == 5) {
+            // An unordered-access view (BBHOST_GXVK_CENSUS's hook alone): its canaries.
+            if (static_cast<std::uint32_t>(result) == 0 && p.out && rd(p.out, &object) && object) gxvk::census_view_made(object, 5);
+        } else if (p.out && rd(p.out, &object) && object) {
+            if (p.type == 3 && static_cast<std::uint32_t>(result) == 0) gxvk::census_view_made(object, 3);
             std::uint32_t extent = 0;
             std::uint64_t words = 0;
             if (p.type == 1 || p.type == 2) {  // a view
@@ -1463,7 +1498,7 @@ void gx_resources_install(ElfImage* image) {
         const char* e = std::getenv("BBHOST_SHADOW_RING_EXACT");
         return !(e && e[0] == '0');
     }();
-    if (g_trace || g_census || g_ring_exact) hook(kRing, kRingPrologue, sizeof(kRingPrologue), reinterpret_cast<void*>(&ring_hook), 0);
+    if (g_trace || g_census || g_ring_exact || gxvk::census()) hook(kRing, kRingPrologue, sizeof(kRingPrologue), reinterpret_cast<void*>(&ring_hook), 0);
     g_res_yebis = [] {
         const char* e = std::getenv("BBHOST_RES_YEBIS");
         return !(e && e[0] == '0');
@@ -1491,7 +1526,12 @@ void gx_resources_install(ElfImage* image) {
         if (g_res_scaleform)
             hook(kScaleformUnmap, kScaleformUnmapPrologue, sizeof(kScaleformUnmapPrologue), reinterpret_cast<void*>(&scaleform_unmap_hook), 0);
     }
-    if (g_census) hook(kPoolBlock, kPoolBlockPrologue, sizeof(kPoolBlockPrologue), reinterpret_cast<void*>(&pool_hook), 0);
+    if (g_census || gxvk::census()) hook(kPoolBlock, kPoolBlockPrologue, sizeof(kPoolBlockPrologue), reinterpret_cast<void*>(&pool_hook), 0);
+    if (gxvk::census()) {
+        hook(kPoolAligned, kPoolAlignedPrologue, sizeof(kPoolAlignedPrologue), reinterpret_cast<void*>(&pool_hook), 0);
+        hook(kPoolInit, kPoolInitPrologue, sizeof(kPoolInitPrologue), reinterpret_cast<void*>(&pool_init_hook), 0);
+        hook(kCreateUav, kPrologue58, sizeof(kPrologue58), reinterpret_cast<void*>(&view_create_hook), 5);
+    }
     hook(kCreateInputLayout, kInputLayoutPrologue, sizeof(kInputLayoutPrologue), reinterpret_cast<void*>(&object_create_hook), 0);
     hook(kCreateRtv, kPrologue58, sizeof(kPrologue58), reinterpret_cast<void*>(&view_create_hook), 1);
     hook(kCreateDsv, kDsvPrologue, sizeof(kDsvPrologue), reinterpret_cast<void*>(&view_create_hook), 2);
@@ -1932,4 +1972,5 @@ void gx_resources_report() {
             host_log("gx-map:   0x%llx x%llu", static_cast<ull>(caller), static_cast<ull>(n));
         }
     }
+    gxvk::census_report();
 }

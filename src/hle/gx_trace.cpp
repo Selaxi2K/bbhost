@@ -26,6 +26,7 @@
 #include "host/host_lists.h"
 #include "engine/addr.h"
 #include "host/gpu.h"
+#include "host/gxvk.h"
 #include "engine/gx_resources.h"
 #include "engine/gx_state.h"
 #include "log.h"
@@ -1974,6 +1975,7 @@ GxRecordsPtr snapshot_records(const GxRec& r, bool scratch = false) {
                 std::memcpy(s.obj_tex + j * 32, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(view + 0x10)), 32);
                 s.obj_tex_set |= 1ull << j;
                 s.obj_tex_id[j] = g_view_check ? check_object_words(view, s.obj_tex + j * 32, 0) : gx_object_id(view);
+                if (gxvk::census()) gxvk::census_view_bound(view, 3);
             }
         }
         stamp.to(kCostRecTex);
@@ -2055,6 +2057,10 @@ GxRecordsPtr snapshot_records(const GxRec& r, bool scratch = false) {
                                           0x20077fac & 0xc7ffffff};
             std::memcpy(s.obj_cb + cbs[i].j * 16, rec, sizeof(rec));
             s.obj_cb_set |= 1u << cbs[i].j;
+        }
+        // BBHOST_GXVK_CENSUS: each one by what holds its bytes (host/gxvk.h).
+        if (gxvk::census()) {
+            for (int i = 0; i < ncb; ++i) gxvk::census_constant(cbs[i].key - 0x18, cbs[i].addr, ((cbs[i].size + 15) >> 4) * 16);
         }
         stamp.to(kCostRecCb);
         // BBHOST_CB_RECORD_PROOF: each buffer's bytes as they are at the call,
@@ -2197,6 +2203,8 @@ void note_update(const std::uint64_t* f) {
             if (g_update_dst.size() < 4096) ++g_update_dst[addr];
         }
     }
+    // BBHOST_GXVK_CENSUS: a buffer updated (`res` is its holder).
+    if (type == 1) gxvk::census_buffer_updated(res);
     const std::uint64_t watch = g_watch_update;
     if (!watch || type != 1 || watch < addr + lo || watch >= addr + hi) return;
     g_updates_watched.fetch_add(1, std::memory_order_relaxed);
@@ -2324,6 +2332,7 @@ void build_objects(const GxRec& r, GxDrawObjects& o) {
             o.index_type = r.ib_fmt == 0x2a ? 1 : 0;
             o.index_va = r.ib_base + r.ib_off + (start & 0xffffffff) * (o.index_type ? 4 : 2);
             o.index_known = true;
+            o.ib_obj = r.ib;
         }
         o.fetch_va = r.op1 ? rd64(r.op1 + 0x10) : 0;
         o.vtx_ud = r.vtx_ud;
@@ -2341,6 +2350,7 @@ void build_objects(const GxRec& r, GxDrawObjects& o) {
             o.index_type = r.ib_fmt == 0x2a ? 1 : 0;
             o.index_va = r.ib_base + r.ib_off;
             o.index_known = true;
+            o.ib_obj = r.ib;
         }
         o.fetch_va = r.op1 ? rd64(r.op1 + 0x10) : 0;
         o.vtx_ud = r.vtx_ud;
@@ -2348,6 +2358,9 @@ void build_objects(const GxRec& r, GxDrawObjects& o) {
         std::memcpy(o.vtx_rec, r.vtx_rec, sizeof(r.vtx_rec));
         std::memcpy(o.vtx_obj, r.vtx_obj, sizeof(r.vtx_obj));
     }
+    // The GX upload heap's hand-outs so far (BBHOST_GXVK_CENSUS: what the
+    // command processor checks the draw's renamed copies against; 0 without it).
+    o.call_seq = gxvk::handout_seq();
 }
 
 // A slot comes round again only after the whole ring (16,384 draws, ~0.2 s),
@@ -5040,6 +5053,7 @@ bool snapshot_cs_records(std::uint64_t ctx, GxStageRecords& s, CsRecordsMiss* wh
         const int j = __builtin_ctz(m);
         const std::uint64_t uav = rd64(st + 0x2368 + 8 * static_cast<std::uint64_t>(j));
         if (uav && safe_read(uav + 0x10, s.obj_smp + j * 32, 32)) s.obj_smp_set |= 1u << j;
+        if (uav && gxvk::census()) gxvk::census_view_bound(uav, 5);
     }
     for (std::uint32_t m = smp; m; m &= m - 1) {
         const int j = __builtin_ctz(m);
@@ -6668,7 +6682,7 @@ void hle_gx_trace_arm(GuestMemory* mem) {
     auto* c = static_cast<std::uint8_t*>(page);
     int hooked = 0;
     for (std::uint64_t id = 0; id < kKinds; ++id) {
-        if (id == kUpdateSubresource && !g_trace && !g_gx_cost_enabled && !g_watch_update && !g_upload_census) continue;
+        if (id == kUpdateSubresource && !g_trace && !g_gx_cost_enabled && !g_watch_update && !g_upload_census && !gxvk::census()) continue;
         if (id == kEmitDma && (!g_cp_census_hooks || gnm_dma_placed())) continue;  // ours notes its callers itself
         if (id == kCopyStructureCount && !g_count_copies) continue;
         if (id == kYebisDispatch && !g_yebis_dispatch) continue;

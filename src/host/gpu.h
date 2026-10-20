@@ -201,6 +201,11 @@ struct GxDrawObjects {
     std::uint16_t vtx_valid = 0;
     std::uint32_t vtx_rec[16][4] = {};
     std::uint64_t vtx_obj[16] = {};  // the buffer object behind each table slot (its home address at +0x20)
+    // The index buffer's object (its holder, as the pending state names it;
+    // 0: none), and the GX upload heap's hand-outs so far at the call
+    // (host/gxvk.h handout_seq: the census's stamp, 0 without it).
+    std::uint64_t ib_obj = 0;
+    std::uint64_t call_seq = 0;
 };
 
 // One stage's resource records as the GX commit wrote them for a draw, copied

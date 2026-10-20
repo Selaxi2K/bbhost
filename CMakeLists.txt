@@ -149,6 +149,7 @@ add_executable(bbhost
   src/hle/gnm_exec.cpp
   src/host/host_lists.cpp
   src/host/cb_proof.cpp
+  src/host/gxvk_census.cpp
   src/hle/gx_trace.cpp
   src/hle/audio.cpp
   src/hle/net.cpp
