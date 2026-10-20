@@ -15,6 +15,7 @@ int g_sfx_node_mutant = 0;
 #include "decomp/sfx/node_update.cpp"
 
 #include "eboot_kit.h"
+#include "engine/sfx_schedule.h"
 
 #include <cstdio>
 #include <cstring>
@@ -68,7 +69,21 @@ u64 pointer_answer() {
     return g_pointers[(r >> 2) % g_pointers.size()];
 }
 
+// The smooth steps' split: the container stub records the step and the node's times each call saw, and
+// neither records a call nor draws, so the counted parts' calls and answers stay a whole step's.
+bool g_split = false;
+struct Seen {
+    u32 step, t, e;
+    u64 context;
+    bool operator==(const Seen&) const = default;
+};
+std::vector<Seen> g_seen;
+
 GUEST_ABI void stub_container(u64 container, float* step, u64 definition, u64 context) {
+    if (g_split) {
+        g_seen.push_back({bits(*step), load<u32>(container - 0x80 + 0x7c), load<u32>(container - 0x80 + 0xe0), context});
+        return;
+    }
     rec(1, container, bits(*step), definition, context);
     // A container update can mark its node dead (state 3's check): the node update must not look again.
     if ((draw() & 7) == 0) store<u32>(container - 0x80 + 0x78, load<u32>(container - 0x80 + 0x78) | 4u);
@@ -322,6 +337,117 @@ int check(int cases) {
     return bad;
 }
 
+
+// --- the smooth steps' split ------------------------------------------------------
+
+constexpr float kThirtieth = 1.0f / 30.0f;  // the game's 1/30, 0x3d088889
+
+float addss(float x, float y) {
+    __asm__("addss %1, %0" : "+x"(x) : "x"(y));
+    return x;
+}
+float as_float(u32 u) {
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+}
+// A time a container call sees: moved on by the offset, unless the offset is zero or the time is the "no time" value.
+u32 shifted(u32 base, float offset, u32 none) { return offset == 0.0f || base == none ? base : bits(addss(as_float(base), offset)); }
+
+// One node, two ways: the game's function once a whole 1/30 s step for `ticks` steps (a 30 fps world), and
+// the split update every frame of a world at `fps` (0: frames from 1/240 s to 1/20 s at random) through the
+// effects' schedule until as many whole steps have passed. On each whole step: the same answer, the same
+// counted calls in order with the node as each saw it, the same memory - the counted parts are the game's.
+// On each frame between: no counted call, nothing changed, the node kept. On every frame: each container
+// call given the frame's step, the node's time put the part of a step past its whole step the frame began
+// (a plain node's definition time too, and by the part it ends for its second call), nothing moved for a
+// zero offset or the "no time" value. At 30 every frame is a whole step and the calls are the game's own.
+int check_split(int cases, double fps) {
+    const auto game = eboot_kit::fn<NodeUpdate>(0x2c4df80);
+    int bad = 0;
+    g_split = true;
+    for (int k = 0; k < cases; ++k) {
+        const Case c = make_case();
+        const u32 none = c.no_time;
+        if (g_rng.chance(0.1)) store<u32>(c.node + 0x7c, none);  // a node whose time is "no time"
+        const float scale = g_rng.chance(0.5) ? 1.0f : g_rng.uniform(0.25f, 2.0f);
+        const int ticks = g_rng.range(1, 5);
+        const Snapshot before = snap(c);
+        store<u32>(reinterpret_cast<u64>(eboot_kit::at(kNoTime)), none);
+        g_node = c.node;
+        // The 30 fps world.
+        std::vector<u8> a_answer;
+        std::vector<std::vector<Call>> a_calls;
+        std::vector<std::vector<Seen>> a_seen;
+        std::vector<Snapshot> a_after;
+        for (int t = 0; t < ticks; ++t) {
+            g_answers.seed(c.seed + 0x9e3779b97f4a7c15ull * static_cast<u64>(t + 1));
+            g_calls.clear();
+            g_seen.clear();
+            float step = kThirtieth * scale;
+            a_answer.push_back(game(c.node, &step, c.def, c.ctx));
+            a_calls.push_back(g_calls);
+            a_seen.push_back(g_seen);
+            a_after.push_back(snap(c));
+            if (!a_answer.back()) break;
+        }
+        restore(c, before);
+        // The split world.
+        std::mt19937_64 jitter(c.seed);
+        double carry = 0.0;
+        std::size_t t = 0;
+        const char* why = nullptr;
+        for (int frame = 0; t < a_answer.size() && frame < 4000 && !why; ++frame) {
+            const double seconds = fps > 0.0 ? 1.0 / fps : std::uniform_real_distribution<double>(1.0 / 240, 1.0 / 20)(jitter);
+            const sfx_schedule::Frame f = sfx_schedule::next(carry, seconds, 30);
+            const sfx_node::Steps st{f.whole ? f.seconds * scale : 0.0f, f.frame * scale, f.from * scale, f.into * scale, f.whole > 0};
+            const u32 t_entry = load<u32>(c.node + 0x7c), e_entry = load<u32>(c.node + 0xe0);
+            const u32 flags = load<u32>(c.node + 0x78), state = load<u32>(c.node + 0xdc);
+            const Snapshot pre = snap(c);
+            if (st.tick) g_answers.seed(c.seed + 0x9e3779b97f4a7c15ull * static_cast<u64>(t + 1));
+            g_calls.clear();
+            g_seen.clear();
+            const u8 r = sfx_node::update(c.node, st, c.def, c.ctx);
+            // The container calls this frame should have made, and what each should have seen.
+            std::vector<Seen> want;
+            if (!(flags & 4) && (flags & 1)) {
+                const u32 frame_step = bits(st.frame);
+                if (!(flags & 8)) {
+                    bool picked = false;
+                    for (const Call& x : g_calls) picked |= x.what == 5;
+                    const u32 e1 = picked ? none : e_entry;
+                    const u32 e2 = st.tick ? bits(addss(as_float(e1), st.counted)) : e1;
+                    want.push_back({frame_step, shifted(t_entry, st.from, none), shifted(e1, st.from, none), c.ctx});
+                    want.push_back({frame_step, shifted(t_entry, st.from, none), shifted(e2, st.into, none), r ? c.ctx : 0});
+                } else {
+                    const u32 base = st.tick && state == 2 ? none : t_entry;
+                    // a staged node's +0xe0 is its emission count: whatever it holds at the call, never moved
+                    want.push_back({frame_step, shifted(base, st.from, none), g_seen.empty() ? 0u : g_seen.back().e, r ? c.ctx : 0});
+                }
+            }
+            if (!(g_seen == want)) why = "the container calls (their step, the times they saw, their context)";
+            else if (st.tick) {
+                if (r != a_answer[t]) why = "a whole step's answer";
+                else if (!(g_calls == a_calls[t])) why = "a whole step's counted calls";
+                else if (snap(c) != a_after[t]) why = "the node after a whole step";
+                else if (fps == 30.0 && !(g_seen == a_seen[t])) why = "at 30, the container calls against the game's";
+                if (!r) break;
+                ++t;
+            } else {
+                if (r != 1) why = "a frame between whole steps' answer";
+                else if (!g_calls.empty()) why = "a counted call between whole steps";
+                else if (snap(c) != pre) why = "the node changed between whole steps";
+            }
+        }
+        if (why && ++bad <= 6 && !g_quiet)
+            std::printf("split case %d (%s, flags 0x%x, state %u, scale %g, at %g fps): %s differs\n", k,
+                        (load<u32>(before[0].data(), 0x78) & 8) ? "staged" : "plain", load<u32>(before[0].data(), 0x78), load<u32>(before[0].data(), 0xdc),
+                        scale, fps, why);
+    }
+    g_split = false;
+    g_node = 0;
+    return bad;
+}
 }  // namespace
 
 int main() {
@@ -378,13 +504,22 @@ int main() {
         }
         if (unreached) return 1;
     }
-    // Each mutant must make some case differ.
+    // The smooth steps' split at the rates a player picks, a jittered rate and 30 (the game's own calls).
+    constexpr int kSplitCases = 6000;
+    int split_bad = 0;
+    g_rng.specials = false;
+    for (const double fps : {30.0, 60.0, 120.0, 144.0, 0.0}) split_bad += check_split(kSplitCases, fps);
+    g_rng.specials = true;
+    split_bad += check_split(kSplitCases, 0.0);
+    bad += split_bad;
+    // Each mutant must make some case differ: the game's sequence (1-10) and the split (11-17).
     int missed = 0;
     g_quiet = true;
-    for (int m = 1; m <= 10; ++m) {
+    for (int m = 1; m <= 17; ++m) {
         g_sfx_node_mutant = m;
         g_rng.specials = true;
-        if (!check(20000)) {
+        const int found = m <= 10 ? check(20000) : check_split(3000, 120.0) + check_split(3000, 0.0);
+        if (!found) {
             std::printf("decomp_sfx_node_update: mutant %d not caught\n", m);
             ++missed;
         }
@@ -394,7 +529,8 @@ int main() {
         std::printf("decomp_sfx_node_update: %d of %d cases differ, %d mutants missed\n", bad, 2 * kCases + kCases / 4, missed);
         return 1;
     }
-    std::printf("decomp_sfx_node_update: %d nodes as the game's (%d with special values, %d under the host's MXCSR); 10 mutants caught\n",
-                2 * kCases + kCases / 4, kCases, kCases / 4);
+    std::printf("decomp_sfx_node_update: %d nodes as the game's (%d with special values, %d under the host's MXCSR); %d split at 30, 60, 120, "
+                "144 and jittered as the game's whole steps; 17 mutants caught\n",
+                2 * kCases + kCases / 4, kCases, kCases / 4, 6 * kSplitCases);
     return 0;
 }

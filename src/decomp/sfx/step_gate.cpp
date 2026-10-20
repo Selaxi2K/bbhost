@@ -30,6 +30,8 @@
 // 0x56dbd80), is the game's own code through the trampoline.
 #include "decomp/sfx/step_gate.h"
 
+#include "decomp/sfx/node_update.h"
+
 #include "decomp/decomp.h"
 #include "decomp/guest.h"
 
@@ -86,9 +88,11 @@ void* g_game_gx_record = nullptr;
 
 std::atomic<u32> g_between{0};
 std::atomic<u32> g_step_between{0};  // a frame between whole effect steps, the gate on or off (decomp_sfx_step_frame)
-// The frame's own time and the carry after it (decomp_sfx_frame_time), for
-// the smooth steps' frame domain.
-std::atomic<float> g_frame_step{0.0f}, g_frame_into{0.0f};
+// The frame's own time and the carry before and after it (decomp_sfx_frame_time),
+// for the smooth steps' frame domain, and whether those run (decomp_sfx_smooth).
+std::atomic<float> g_frame_step{0.0f}, g_frame_from{0.0f}, g_frame_into{0.0f};
+std::atomic<u32> g_smooth{0};
+std::atomic<u64> g_smooth_updates{0}, g_smooth_kept{0};
 std::atomic<u64> g_frames_between{0}, g_instances_held{0}, g_lights_held{0}, g_motions_held{0}, g_still_frames{0}, g_records_held{0};
 
 // A frame bbhost put between whole steps that is not the game's own still frame.
@@ -139,6 +143,130 @@ inline u8 node_held(u64 node, const float* step, u64 definition, u64 context) {
     return 1;
 }
 
+// --- the smooth steps (effect steps smooth) -----------------------------------------
+//
+// An instance whose every class is on the converted list runs the frame domain:
+// on a frame with a whole step its controllers with that step and its nodes
+// through sfx_node::update with the counted parts given the step and the
+// container calls the frame's; on a frame between, only the container calls,
+// the frame's step, the nodes' times put as far past their whole step as the
+// frame is. The classes: each node's motion (+0x90; a composite's two at +8
+// and +0x10), its modules (+0x98, +0xa0, +0xa8) and the targets of its pending
+// binders (the container's list +0x30: next +0x18, target +0x20) - and a GX
+// binder's type instance (*(target +0x10) +8). An instance with one class off
+// the list stays on the held frames above, the class counted.
+
+constexpr u64 kManagerOf = 0x70;  // SprjSfx +0x70: the effect manager (its time scale +0x5d8, its own still flag +0x5ce)
+
+// The converted classes' vtables, by Binary Ninja address: the classes whose
+// updates the frame domain may give the frame's step (filled class by class as
+// each is read; a test sets its own).
+constexpr u64 kConverted[] = {0};
+const u64* g_converted = kConverted;
+std::size_t g_converted_count = 0;
+
+inline bool converted_class(u64 object) {
+    if (!object) return true;
+    const u64 vt = load<u64>(object);
+    for (std::size_t i = 0; i < g_converted_count; ++i)
+        if (vt == game_address(g_converted[i])) return true;
+    return false;
+}
+
+// The classes that kept an instance on the held frames: their vtables and counts, a small open table
+// (a slot taken once, never given back; past it the overflow count).
+constexpr std::size_t kKeptSlots = 32;
+std::atomic<u64> g_kept_class[kKeptSlots] = {}, g_kept_count[kKeptSlots] = {};
+std::atomic<u64> g_kept_overflow{0};
+void count_kept(u64 vtable) {
+    for (std::size_t i = 0; i < kKeptSlots; ++i) {
+        u64 seen = g_kept_class[i].load(std::memory_order_relaxed);
+        if (!seen && g_kept_class[i].compare_exchange_strong(seen, vtable, std::memory_order_relaxed)) seen = vtable;
+        if (seen == vtable) {
+            g_kept_count[i].fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
+    g_kept_overflow.fetch_add(1, std::memory_order_relaxed);
+}
+
+// A motion is on the list, or a composite (0x570e750: its two parts at +8 and
+// +0x10, run one after the other) whose parts are - never by itself, and four
+// deep at most; else its class, in `kept`.
+constexpr u64 kCompositeMotion = 0x570e750;
+bool motion_converted(u64 motion, int depth, u64& kept) {
+    if (!motion) return true;
+    const u64 vt = load<u64>(motion);
+    if (vt == game_address(kCompositeMotion)) {
+        if (depth < 4)
+            return motion_converted(load<u64>(motion + 8), depth + 1, kept) && motion_converted(load<u64>(motion + 0x10), depth + 1, kept);
+    } else if (converted_class(motion)) {
+        return true;
+    }
+    kept = vt;
+    return false;
+}
+
+// The first class of the instance's off the list (its vtable), or 0 when every one is on it.
+u64 first_unconverted(u64 instance) {
+    const auto next_of = game_function<NextFn>(kNodeNext);
+    for (u64 node = load<u64>(instance + 0x78); node; node = next_of(node)) {
+        u64 kept = 0;
+        if (!motion_converted(load<u64>(node + 0x90), 0, kept)) return kept;
+        for (const u64 slot : {0x98ull, 0xa0ull, 0xa8ull}) {
+            const u64 m = load<u64>(node + slot);
+            if (!converted_class(m)) return load<u64>(m);
+        }
+        for (u64 item = load<u64>(node + 0x80 + 0x30); item; item = load<u64>(item + 0x18)) {
+            const u64 target = load<u64>(item + 0x20);
+            if (!converted_class(target)) return load<u64>(target);
+            // a GX binder's type instance (the GPU particle systems' kinds)
+            if (target && load<u64>(target) == game_address(0x56e3100)) {
+                const u64 holder = load<u64>(target + 0x10);
+                const u64 type = holder ? load<u64>(holder + 8) : 0;
+                if (!converted_class(type)) return load<u64>(type);
+            }
+        }
+    }
+    return 0;
+}
+
+u8 smooth_update(u64 instance, u64 context, float step) {
+    g_smooth_updates.fetch_add(1, std::memory_order_relaxed);
+    const bool tick = !g_between.load(std::memory_order_relaxed) || MUTANT(20);
+    const float scale = load<float>(instance + 8);
+    // The manager's time scale and still flag, as it hands the instances their step (0x26ff340).
+    const u64 manager = load<u64>(load<u64>(game_address(kSprjSfx)) + kManagerOf);
+    const float time_scale = load<float>(manager + 0x5d8);
+    const bool still = load<u8>(manager + 0x5ce) != 0;
+    // The frame's step as the manager would hand it (none while it is still), then the instance's scale
+    // on it, the game's order: at 30 the whole step's bits.
+    sfx_node::Steps st;
+    st.tick = tick;
+    st.counted = step * scale;
+    st.frame = (still ? 0.0f : g_frame_step.load(std::memory_order_relaxed) * time_scale) * scale;
+    if (!still) {
+        st.from = g_frame_from.load(std::memory_order_relaxed) * time_scale * (MUTANT(21) ? 1.0f : scale);
+        st.into = g_frame_into.load(std::memory_order_relaxed) * time_scale * scale;
+    }
+    if (tick) {
+        for (u64 c = load<u64>(instance + 0x80); c; c = load<u64>(c + 0x20)) game_function<ControllerFn>(kControllerUpdate)(c, instance, st.counted);
+    }
+    const u64 definition = load<u64>(instance + 0x38);
+    if (!definition) return 1;
+    const auto next_of = game_function<NextFn>(kNodeNext);
+    for (u64 node = load<u64>(instance + 0x78); node;) {
+        const u64 next = next_of(node);
+        if (!sfx_node::update(node, st, definition, context)) {
+            game_function<NodeFn>(kNodeRelease)(node);
+            game_function<NodeFn>(kNodeClear)(node);
+            game_function<PoolFree>(kPoolFree)(load<u64>(game_address(kNodePool)), node, 0x100, 0x10);
+        }
+        node = next;
+    }
+    return 1;
+}
+
 }  // namespace
 
 // sub_2c4ff30(instance, render context, step): a released instance (+0x88
@@ -148,6 +276,17 @@ inline u8 node_held(u64 node, const float* step, u64 definition, u64 context) {
 // are skipped and each node runs node_held(), which frees none.
 DECOMP_LEAF u8 sfx_instance_update(u64 instance, u64 context, float step) {
     const u32 flags = load<u32>(instance + 0x88);
+    if (g_smooth.load(std::memory_order_relaxed) && !(flags & 4) && (flags & 1)) {
+        const u64 sfx = load<u64>(game_address(kSprjSfx));
+        if (!(sfx && load<u32>(sfx + 0x8c))) {  // the game's own still frame stays the game's
+            if (const u64 kept = first_unconverted(instance)) {
+                g_smooth_kept.fetch_add(1, std::memory_order_relaxed);
+                count_kept(kept);
+            } else {
+                return smooth_update(instance, context, step);
+            }
+        }
+    }
     if (!held() || (flags & 4) || !(flags & 1)) return reinterpret_cast<InstanceUpdate>(g_game_instance)(instance, context, step);
     g_instances_held.fetch_add(1, std::memory_order_relaxed);
     const float s = step * load<float>(instance + 8);
@@ -280,10 +419,13 @@ void decomp_sfx_gate_frame(bool between) {
 
 void decomp_sfx_step_frame(bool between) { g_step_between.store(between ? 1u : 0u, std::memory_order_relaxed); }
 
-void decomp_sfx_frame_time(float frame, float into) {
+void decomp_sfx_frame_time(float frame, float from, float into) {
     g_frame_step.store(frame, std::memory_order_relaxed);
+    g_frame_from.store(from, std::memory_order_relaxed);
     g_frame_into.store(into, std::memory_order_relaxed);
 }
+
+void decomp_sfx_smooth(bool on) { g_smooth.store(on ? 1u : 0u, std::memory_order_relaxed); }
 
 bool decomp_sfx_gate_placed() { return decomp_placed("sub_2c4ff30") == 1 && decomp_placed("sub_131e660") == 1; }
 
@@ -304,6 +446,17 @@ void report() {
              "motion updates held, %llu GPU type 0x2713 items kept at their whole step's time; %llu calls on the game's own still frame left to it",
              static_cast<ull>(g_frames_between.load()), static_cast<ull>(g_instances_held.load()), static_cast<ull>(g_lights_held.load()),
              static_cast<ull>(g_motions_held.load()), static_cast<ull>(g_records_held.load()), static_cast<ull>(g_still_frames.load()));
+    if (!g_smooth.load()) return;
+    host_log("decomp: the smooth effect steps: %llu instance updates took them, %llu stayed on the held frames for a class off the converted "
+             "list (%zu classes on it)",
+             static_cast<ull>(g_smooth_updates.load()), static_cast<ull>(g_smooth_kept.load()), g_converted_count);
+    for (std::size_t i = 0; i < kKeptSlots; ++i) {
+        const u64 vt = g_kept_class[i].load();
+        if (!vt) break;
+        host_log("decomp:   kept by class 0x%llx: %llu instance updates", static_cast<ull>(vt - g_decomp_slide + 0x400000),
+                 static_cast<ull>(g_kept_count[i].load()));
+    }
+    if (const u64 more = g_kept_overflow.load()) host_log("decomp:   kept by classes past the table's %zu: %llu", kKeptSlots, static_cast<ull>(more));
 }
 
 }  // namespace

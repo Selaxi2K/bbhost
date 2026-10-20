@@ -39,6 +39,7 @@ int g_sfx_gate_mutant = 0;
 
 #include "eboot_kit.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -79,7 +80,11 @@ std::size_t count(const std::vector<Call>& v, int what) {
     return n;
 }
 
-GUEST_ABI void stub_container(u64 container, float* step, u64 definition, u64 context) { rec(1, container, definition, context, 0, *step); }
+bool g_times = false;  // the smooth steps' cases: each container call's node time (+0x7c) and definition time (+0xe0) recorded too
+GUEST_ABI void stub_container(u64 container, float* step, u64 definition, u64 context) {
+    const u64 seen = g_times ? (static_cast<u64>(load<u32>(container - 4)) << 32) | load<u32>(container + 0x60) : 0;
+    rec(1, container, definition, context, seen, *step);
+}
 GUEST_ABI u64 stub_controller(u64 controller, u64 instance, float step) {
     rec(2, controller, instance, 0, 0, step);
     store<float>(controller + 8, load<float>(controller + 8) + step);
@@ -364,6 +369,269 @@ int check_instances(int cases, u64 sfx) {
             std::printf("instance case %d (flags 0x%x, %zu nodes, %zu controllers, step %g%s): %s differs\n", c, load<u32>(s.inst + 0x88),
                         s.nodes.size(), s.ctls.size(), step, still ? ", still frame" : "", why);
     }
+    return bad;
+}
+
+// --- the smooth steps ----------------------------------------------------------
+//
+// With effect steps smooth an instance whose classes are all on the converted
+// list (a test list here, of the game's own classes) runs the frame domain.
+// Against the game's instance update with sfx_node_update - the game's node
+// update as ours, which the node update's own test holds to the game's - in
+// its node update's place: at 30 (every frame a whole step, the frame's time
+// the whole step's, nothing carried) the same, every call, every byte, the
+// times the containers see. On a frame between whole steps (a quarter of a
+// step at 120, a quarter in) no controller and nothing counted: each active
+// node's container calls with the frame's step times the manager's time scale
+// times the instance's (none while the manager is still), its times put the
+// frame's start past their whole step - a plain node's definition time its
+// end for the second call - and back after, nothing of the instance's or its
+// nodes' changed. A class off the list (a motion, a module, a binder's
+// target, a GX binder's type, a composite's part or a composite too deep)
+// keeps the instance on the held frames' update, counted under that class; a
+// released or inactive instance, or the game's own still frame, is the game's.
+
+constexpr u64 kOnMotions[] = {0x570e650, 0x570e790};  // the Euler and rotation motions
+constexpr u64 kOnModules[] = {0x56eb2e0, 0x5756e50};  // the children follow, the Sprj module
+constexpr u64 kCpuBinder = 0x56e3090, kGxBinder = 0x56e3100;
+constexpr u64 kOnGxTypes[] = {0x56eb1d0, 0x56eb220};
+constexpr u64 kComposite = 0x570e750;
+constexpr u64 kOffLight = 0x56ebba0, kOffWobble = 0x570e6d0, kOffGxType = 0x56eb030;
+constexpr u64 kTestConverted[] = {0x570e650, 0x570e790, 0x56eb2e0, 0x5756e50, 0x56e3090, 0x56e3100, 0x56eb1d0, 0x56eb220};
+constexpr u64 kNoTimeAt = 0x5ac82e8;
+
+u64 object_of(u64 bn) {
+    const u64 o = block(0x30);
+    store<u64>(o, game_address(bn));
+    return o;
+}
+template <std::size_t N>
+u64 any(const u64 (&from)[N]) {
+    return from[g_rng.range(0, static_cast<int>(N) - 1)];
+}
+// A motion on the list: one of the two, or a composite `levels` deep whose parts all are.
+u64 motion_on(int levels) {
+    if (levels <= 0) return object_of(any(kOnMotions));
+    const u64 m = object_of(kComposite);
+    store<u64>(m + 8, motion_on(levels - 1));
+    store<u64>(m + 0x10, g_rng.chance(0.5) ? motion_on(levels - 1) : object_of(any(kOnMotions)));
+    return m;
+}
+// A pending binder (the container's list +0x30: next +0x18, target +0x20) on a node.
+void pend(u64 node, u64 target) {
+    const u64 item = block(0x28);
+    store<u64>(item + 0x18, load<u64>(node + 0xb0));
+    store<u64>(item + 0x20, target);
+    store<u64>(node + 0xb0, item);
+}
+// A GX binder whose type instance (*(+0x10) +8) is of `type`.
+u64 gx_binder(u64 type) {
+    const u64 b = object_of(kGxBinder), holder = block(0x20);
+    store<u64>(holder + 8, object_of(type));
+    store<u64>(b + 0x10, holder);
+    return b;
+}
+
+// Makes the instance's nodes ones the whole node update can run - controllers
+// (+0xc8), definitions (+0xd0), a plain node's switch object (+0xd8) - with
+// times that are sometimes the "no time" value, and gives them classes: all on
+// the list, or (`off`) one class off it somewhere. The class off it, or 0.
+u64 classes(const Instance& s, bool off, u32 none) {
+    const int at = s.nodes.empty() ? -1 : g_rng.range(0, static_cast<int>(s.nodes.size()) - 1);
+    const int where = g_rng.range(0, 7);
+    u64 kept = 0;
+    for (std::size_t i = 0; i < s.nodes.size(); ++i) {
+        const u64 n = s.nodes[i];
+        store<u64>(n + 0xc8, controller(0, 4));
+        store<u64>(n + 0xd0, definition(4));
+        if (!(load<u32>(n + 0x78) & 8)) {
+            u64 sw = 0;
+            if (g_rng.chance(0.6)) {
+                sw = block(0x20);
+                store<u8>(sw + 0x11, g_rng.chance(0.5) ? 1 : 0);
+            }
+            store<u64>(n + 0xd8, sw);
+        }
+        if (g_rng.chance(0.15)) store<u32>(n + 0xe0, none);
+        if (g_rng.chance(0.1)) store<u32>(n + 0x7c, none);
+        const int mk = g_rng.range(0, 3);
+        store<u64>(n + 0x90, mk == 0 ? 0 : motion_on(mk - 1));
+        store<u64>(n + 0x98, g_rng.chance(0.5) ? object_of(any(kOnModules)) : 0);
+        store<u64>(n + 0xa0, g_rng.chance(0.2) ? object_of(any(kOnModules)) : 0);
+        store<u64>(n + 0xa8, g_rng.chance(0.3) ? object_of(any(kOnModules)) : 0);
+        store<u64>(n + 0xb0, 0);
+        const int pending = g_rng.range(0, 2);
+        for (int k = 0; k < pending; ++k) pend(n, g_rng.chance(0.5) ? object_of(kCpuBinder) : gx_binder(any(kOnGxTypes)));
+        if (!off || static_cast<int>(i) != at) continue;
+        switch (where) {
+        case 0: store<u64>(n + 0x90, object_of(kOffWobble)); kept = kOffWobble; break;
+        case 1: store<u64>(n + 0x98, object_of(kOffLight)); kept = kOffLight; break;
+        case 2: store<u64>(n + 0xa0, object_of(kOffLight)); kept = kOffLight; break;
+        case 3: store<u64>(n + 0xa8, object_of(kOffLight)); kept = kOffLight; break;
+        case 4: pend(n, object_of(kOffLight)); kept = kOffLight; break;
+        case 5: pend(n, gx_binder(kOffGxType)); kept = kOffGxType; break;
+        case 6: {  // a composite with a part off the list
+            const u64 m = object_of(kComposite);
+            store<u64>(m + 8, motion_on(g_rng.range(0, 1)));
+            store<u64>(m + 0x10, object_of(kOffWobble));
+            store<u64>(n + 0x90, m);
+            kept = kOffWobble;
+            break;
+        }
+        default:  // composites five deep: the fifth one is not looked into
+            store<u64>(n + 0x90, motion_on(5));
+            kept = kComposite;
+            break;
+        }
+    }
+    return kept;
+}
+
+GUEST_ABI u8 node_update_as_game(u64 node, float* step, u64 definition, u64 context) { return sfx_node_update(node, step, definition, context); }
+
+u64 kept_count(u64 bn) {
+    for (std::size_t i = 0; i < kKeptSlots; ++i)
+        if (g_kept_class[i].load() == game_address(bn)) return g_kept_count[i].load();
+    return 0;
+}
+u32 addss(u32 x, float y) {
+    float v;
+    std::memcpy(&v, &x, 4);
+    __asm__("addss %1, %0" : "+x"(v) : "x"(y));
+    return bits(v);
+}
+// A time as a container call sees it: moved on by the offset, unless that is zero or the time is "no time".
+u32 shifted(u32 t, float offset, u32 none) { return offset == 0.0f || t == none ? t : addss(t, offset); }
+u64 times(u32 t, u32 e) { return (static_cast<u64>(t) << 32) | e; }
+
+struct SmoothSeen {
+    long took = 0, kept = 0, game = 0, between_calls = 0, shifted_t = 0, shifted_e = 0, controllers_30 = 0;
+    long by_class[4] = {};  // kept by the light, the wobble, the GX type left out, the composite too deep
+} g_seen_smooth;
+
+int check_smooth(int cases, u64 sfx, u64 manager) {
+    const auto game = eboot_kit::fn<InstanceUpdate>(0x2c4ff30);
+    const u32 none = load<u32>(reinterpret_cast<u64>(eboot_kit::at(kNoTimeAt)));
+    eboot_kit::stub(0x2c4df80, reinterpret_cast<const void*>(&node_update_as_game));
+    g_converted = kTestConverted;
+    g_converted_count = sizeof kTestConverted / sizeof kTestConverted[0];
+    decomp_sfx_smooth(true);
+    g_times = true;
+    int bad = 0;
+    for (int c = 0; c < cases; ++c) {
+        g_blocks.clear();
+        const Instance s = make_instance();
+        const u64 kept = classes(s, g_rng.chance(0.35), none);
+        const bool still = g_rng.chance(0.1), manager_still = g_rng.chance(0.1);
+        store<u32>(sfx + 0x8c, still ? 1u : 0u);
+        store<u8>(manager + 0x5ce, manager_still ? 1 : 0);
+        const float time_scale = g_rng.chance(0.6) ? 1.0f : value(0, 2);
+        store<float>(manager + 0x5d8, time_scale);
+        const u32 flags = load<u32>(s.inst + 0x88);
+        const bool live = !still && !(flags & 4) && (flags & 1);  // the smooth steps' to decide
+        const bool takes = live && !kept;
+        const Snapshot before = snap(s);
+        const char* why = nullptr;
+        // At 30, the manager's step: 1/30 times its time scale, none while it is still.
+        {
+            const float step = manager_still ? 0.0f : 1.0f / 30.0f * time_scale;
+            decomp_sfx_gate_frame(false);
+            decomp_sfx_frame_time(1.0f / 30.0f, 0.0f, 0.0f);
+            g_calls.clear();
+            const u8 r1 = game(s.inst, s.ctx, step);
+            const std::vector<Call> c1 = g_calls;
+            const Snapshot a1 = snap(s);
+            restore(s, before);
+            const u64 took = g_smooth_updates.load(), held_back = g_smooth_kept.load(), by_class = kept ? kept_count(kept) : 0;
+            g_calls.clear();
+            const u8 r2 = sfx_instance_update(s.inst, s.ctx, step);
+            const std::vector<Call> c2 = g_calls;
+            const Snapshot a2 = snap(s);
+            restore(s, before);
+            g_seen_smooth.controllers_30 += takes ? static_cast<long>(count(c2, 2)) : 0;
+            if (r1 != r2 || !same_calls(c1, c2) || !same(a1, a2)) why = "at 30, against the game's";
+            else if (g_smooth_updates.load() - took != (takes ? 1u : 0u)) why = "which instances take the smooth steps";
+            else if (g_smooth_kept.load() - held_back != (live && kept ? 1u : 0u)) why = "the count of those a class kept";
+            else if (live && kept && kept_count(kept) != by_class + 1) why = "the class that kept it";
+        }
+        // A frame between whole steps at 120, a quarter of a step in.
+        if (!why) {
+            const float frame = 1.0f / 120.0f, from = 1.0f / 120.0f, into = 2.0f / 120.0f;
+            decomp_sfx_gate_frame(true);
+            decomp_sfx_frame_time(frame, from, into);
+            g_calls.clear();
+            const u8 r = sfx_instance_update(s.inst, s.ctx, 0.0f);
+            const std::vector<Call> calls = g_calls;
+            const Snapshot after = snap(s);
+            restore(s, before);
+            if (takes) {
+                const float scale = load<float>(s.inst + 8);
+                const u32 step = bits((manager_still ? 0.0f : frame * time_scale) * scale);
+                const float from_s = manager_still ? 0.0f : from * time_scale * scale;
+                const float into_s = manager_still ? 0.0f : into * time_scale * scale;
+                const u64 def = load<u64>(s.inst + 0x38);
+                // Each active node's calls, in its own order (the walk's order is the game's next function's).
+                std::vector<Call> want;
+                for (const u64 n : s.nodes) {
+                    const u32 nf = load<u32>(n + 0x78);
+                    if (!def || (nf & 4) || !(nf & 1)) continue;
+                    const u32 t = shifted(load<u32>(n + 0x7c), from_s, none), e = load<u32>(n + 0xe0);
+                    if (!(nf & 8)) {
+                        want.push_back({1, n + 0x80, def, s.ctx, times(t, shifted(e, from_s, none)), step});
+                        want.push_back({1, n + 0x80, def, s.ctx, times(t, shifted(e, into_s, none)), step});
+                    } else {
+                        want.push_back({1, n + 0x80, def, s.ctx, times(t, e), step});
+                    }
+                }
+                auto by_node = [](std::vector<Call> v) {
+                    std::stable_sort(v.begin(), v.end(), [](const Call& x, const Call& y) { return x.a < y.a; });
+                    return v;
+                };
+                if (r != 1 || !same_calls(by_node(calls), by_node(want))) why = "a frame between: the calls";
+                else if (!same(before, after)) why = "a frame between: the instance or a node changed";
+                ++g_seen_smooth.took;
+                g_seen_smooth.between_calls += static_cast<long>(want.size());
+                for (const u64 n : s.nodes) {
+                    const u32 nf = load<u32>(n + 0x78);
+                    if (!def || (nf & 4) || !(nf & 1)) continue;
+                    g_seen_smooth.shifted_t += shifted(load<u32>(n + 0x7c), from_s, none) != load<u32>(n + 0x7c);
+                    g_seen_smooth.shifted_e += !(nf & 8) && shifted(load<u32>(n + 0xe0), into_s, none) != load<u32>(n + 0xe0);
+                }
+            } else if (live) {
+                // a class off the list: the held frames' update, as with the smooth steps off
+                decomp_sfx_smooth(false);
+                g_calls.clear();
+                const u8 r0 = sfx_instance_update(s.inst, s.ctx, 0.0f);
+                const std::vector<Call> c0 = g_calls;
+                const Snapshot a0 = snap(s);
+                restore(s, before);
+                decomp_sfx_smooth(true);
+                if (r != r0 || !same_calls(calls, c0) || !same(after, a0)) why = "a frame between, a class off the list: the held frames'";
+                ++g_seen_smooth.kept;
+                ++g_seen_smooth.by_class[kept == kOffLight ? 0 : kept == kOffWobble ? 1 : kept == kOffGxType ? 2 : 3];
+            } else {
+                // released, inactive or the game's own still frame: the game's
+                g_calls.clear();
+                const u8 r0 = game(s.inst, s.ctx, 0.0f);
+                const std::vector<Call> c0 = g_calls;
+                const Snapshot a0 = snap(s);
+                restore(s, before);
+                if (r != r0 || !same_calls(calls, c0) || !same(after, a0)) why = "a frame between: the game's own update";
+                ++g_seen_smooth.game;
+            }
+            decomp_sfx_gate_frame(false);
+        }
+        if (why && ++bad <= 6 && !g_quiet)
+            std::printf("smooth case %d (flags 0x%x, %zu nodes, %zu controllers, %s%s%s, scales %g/%g): %s differs\n", c, flags, s.nodes.size(),
+                        s.ctls.size(), kept ? "a class off the list" : "all converted", still ? ", the game's still frame" : "",
+                        manager_still ? ", the manager still" : "", time_scale, load<float>(s.inst + 8), why);
+    }
+    store<u32>(sfx + 0x8c, 0);
+    g_times = false;
+    decomp_sfx_smooth(false);
+    g_converted = kConverted;
+    g_converted_count = 0;
+    eboot_kit::stub(0x2c4df80, reinterpret_cast<const void*>(&node_held_as_game));
     return bad;
 }
 
@@ -786,6 +1054,7 @@ int main() {
         }
     }
     g_sfx_gate_mutant = 0;
+    g_quiet = false;
     // The instance update last: the game's node update is node_held's from here.
     eboot_kit::stub(kControllerUpdate, reinterpret_cast<const void*>(&stub_controller));
     eboot_kit::stub(0x2c4df80, reinterpret_cast<const void*>(&node_held_as_game));
@@ -799,6 +1068,28 @@ int main() {
     total += 2 * kCases;
     std::printf("decomp_sfx_step_gate: %d cases (nodes, lights, instances; ordinary values, then special ones), %d differ\n", total, bad);
     if (bad) return 1;
+    // The smooth steps (the effect manager's time scale +0x5d8 and its own still flag +0x5ce, behind SprjSfx +0x70).
+    alignas(64) static u8 manager_mem[0x600];
+    const u64 manager = reinterpret_cast<u64>(manager_mem);
+    store<u64>(sfx + 0x70, manager);
+    g_rng.specials = false;
+    int sbad = check_smooth(kCases / 2, sfx, manager);
+    std::printf("decomp_sfx_step_gate: %d smooth-step instance cases, %d differ - %ld took the smooth steps (%ld container calls between whole "
+                "steps, %ld node times and %ld definition times moved for them; %ld controller calls at 30), %ld kept by a class off the list "
+                "(the light %ld, a wobble %ld, a GX type %ld, a composite too deep %ld), %ld the game's\n",
+                kCases / 2, sbad, g_seen_smooth.took, g_seen_smooth.between_calls, g_seen_smooth.shifted_t, g_seen_smooth.shifted_e,
+                g_seen_smooth.controllers_30, g_seen_smooth.kept, g_seen_smooth.by_class[0], g_seen_smooth.by_class[1], g_seen_smooth.by_class[2],
+                g_seen_smooth.by_class[3], g_seen_smooth.game);
+    if (sbad) return 1;
+    g_quiet = true;
+    for (const int m : {20, 21}) {
+        g_sfx_gate_mutant = m;
+        if (!check_smooth(2000, sfx, manager)) {
+            std::printf("decomp_sfx_step_gate: mutant %d not caught by the smooth steps\n", m);
+            ++missed;
+        }
+    }
+    g_sfx_gate_mutant = 0;
 
     // The rest of the source's mutants caught.
     for (const int m : {1, 4, 5, 6, 7}) {
@@ -861,6 +1152,6 @@ int main() {
         }
     }
     g_sfx_gate_mutant = 0;
-    std::printf("decomp_sfx_step_gate: %d of 18 mutants caught\n", 18 - missed);
+    std::printf("decomp_sfx_step_gate: %d of 20 mutants caught\n", 20 - missed);
     return missed ? 1 : 0;
 }

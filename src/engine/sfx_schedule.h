@@ -11,9 +11,9 @@
 //
 // The smooth steps (effect steps smooth: whole 1/30 s for what the effects
 // count in updates, the frame's own time for what they integrate) also take
-// the frame's time as the schedule took it and the carry after the frame -
-// the part of the next whole step the frame has come into, which put on a
-// node's time at its last whole step gives its time now.
+// the frame's time as the schedule took it and the carry before and after
+// the frame - how far past its last whole step the frame begins and ends,
+// which put on a node's time at that step give its time then.
 
 #include <cmath>
 
@@ -23,6 +23,7 @@ struct Frame {
     int whole = 0;        // whole steps this frame (0: a frame between whole steps)
     float seconds = 0.f;  // their time, the step the effect manager is handed
     float frame = 0.f;    // the frame's time as taken: at most 1/30 s, 0 for none
+    float from = 0.f;     // the carry before the frame, at least +0: how far past its last whole step the frame begins
     float into = 0.f;     // the carry after the frame, at least +0
 };
 
@@ -33,6 +34,7 @@ constexpr int most(int rate) { return rate >= 60 ? 2 : 1; }
 // own step there) and one that is not above 0 (or NaN) as none, so the carry
 // stays under a step and a thirtieth.
 inline Frame next(double& carry, double frame_seconds, int rate) {
+    const float from = carry > 0.0 ? static_cast<float>(carry) : 0.0f;
     if (!(frame_seconds > 0.0)) frame_seconds = 0.0;
     if (frame_seconds > 1.0 / 30.0) frame_seconds = 1.0 / 30.0;
     carry += frame_seconds;
@@ -43,7 +45,7 @@ inline Frame next(double& carry, double frame_seconds, int rate) {
     carry -= static_cast<double>(n) / rate;
     // What the 1e-6 took early leaves the carry up to that much below 0; the
     // frame domain counts it as none.
-    return {n, static_cast<float>(static_cast<double>(n) / rate), static_cast<float>(frame_seconds),
+    return {n, static_cast<float>(static_cast<double>(n) / rate), static_cast<float>(frame_seconds), from,
             carry > 0.0 ? static_cast<float>(carry) : 0.0f};
 }
 

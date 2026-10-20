@@ -64,7 +64,9 @@ void frame_domain(double seconds, int rate, int frames) {
     double carry = 0.0, passed = 0.0;
     long steps = 0;
     for (int i = 0; i < frames; ++i) {
+        const double before = carry;
         const sfx_schedule::Frame f = sfx_schedule::next(carry, seconds, rate);
+        CHECK(bits(f.from) == bits(static_cast<float>(before > 0.0 ? before : 0.0)));
         CHECK(bits(f.frame) == bits(static_cast<float>(taken(seconds))));
         CHECK(f.into >= 0.0f);
         CHECK(bits(f.into) == bits(static_cast<float>(carry > 0.0 ? carry : 0.0)));
@@ -166,6 +168,7 @@ int main() {
             CHECK(f.whole == 1);
             CHECK(bits(f.frame) == 0x3d088889u && bits(f.frame) == bits(f.seconds));
             CHECK(bits(f.into) == 0u);  // +0, so a tick time plus the carry times a scale is the tick time's bits
+            CHECK(bits(f.from) == 0u);
         }
     }
     // At 120 the carry comes a quarter of a step further each frame and goes
@@ -178,6 +181,9 @@ int main() {
             CHECK(f.whole == (i % 4 == 3 ? 1 : 0));
             CHECK(bits(f.frame) == bits(static_cast<float>(1.0 / 120)));
             CHECK(std::fabs(static_cast<double>(f.into) - want[i]) < 1e-7);
+            CHECK(std::fabs(static_cast<double>(f.from) - (i % 4 == 0 ? 0.0 : want[i - 1])) < 1e-7);
+            // A frame ends where the next begins.
+            if (i) CHECK(std::fabs(static_cast<double>(f.from) - want[i - 1]) < 1e-7 || i % 4 == 0);
         }
     }
     // A slow frame (lavapipe's): the frame domain takes 1/30 s, as the game steps.

@@ -95,39 +95,72 @@ inline u64 record_offset(u64 node) {
 
 void* g_game_node = nullptr;
 
+// A container call of the smooth steps' frame domain: the frame's step, and the
+// node's time (+0x7c) - and a plain node's definition time (+0xe0) - moved on
+// by an offset for the call (the part of a whole step the frame is past) and
+// put back after it, unless the call changed them; an offset of zero (either
+// sign) or a time that is the "no time" value is left alone, so a call with
+// no offsets is the game's.
+inline void call_container(u64 node, float step, u64 definition, u64 context, float node_offset, float definition_offset) {
+    const u32 none = load<u32>(game_address(kNoTime));
+    const u32 t = load<u32>(node + 0x7c), e = load<u32>(node + 0xe0);
+    const bool shift_t = node_offset != 0.0f && (t != none || MUTANT(16));
+    const bool shift_e = definition_offset != 0.0f && (e != none || MUTANT(16));
+    u32 t_shifted = t, e_shifted = e;
+    if (shift_t) {
+        store<float>(node + 0x7c, add(load<float>(node + 0x7c), node_offset));
+        t_shifted = load<u32>(node + 0x7c);
+    }
+    if (shift_e) {
+        store<float>(node + 0xe0, add(load<float>(node + 0xe0), definition_offset));
+        e_shifted = load<u32>(node + 0xe0);
+    }
+    float s = step;
+    game_function<ContainerFn>(kContainerUpdate)(node + 0x80, &s, definition, context);
+    if (shift_t && load<u32>(node + 0x7c) == t_shifted && !MUTANT(12)) store<u32>(node + 0x7c, t);
+    if (shift_e && load<u32>(node + 0xe0) == e_shifted) store<u32>(node + 0xe0, e);
+}
+
 }  // namespace
 
-DECOMP_LEAF u8 sfx_node_update(u64 node, float* step, u64 definition, u64 context) {
+namespace sfx_node {
+
+// The node update with its two kinds of step apart (decomp/sfx/node_update.h).
+DECOMP_LEAF u8 update(u64 node, const Steps& st, u64 definition, u64 context) {
+    const bool counts = st.tick || MUTANT(11);  // the counted parts run
+    const float container_step = MUTANT(13) ? st.counted : st.frame;
     const u32 flags = load<u32>(node + 0x78);
-    if (flags & 4) return 0;
+    if (flags & 4) return st.tick || MUTANT(14) ? 0 : 1;  // a dead node: freed by a whole step, kept between them
     u8 keep = 1;
     if (!(flags & 1)) return keep;
-    const auto container = game_function<ContainerFn>(kContainerUpdate);
-    if (!(flags & 8)) {
+    const bool plain = !(flags & 8);
+    if (plain) {
         // A plain node: its definition's switch and pick, its first container call.
-        const u64 ctl = load<u64>(node + 0xc8);
-        const u8 holds = game_function<StateHoldsFn>(kStateHolds)(ctl, game_function<StateOfFn>(kStateOf)(ctl));
-        const u64 inst = load<u64>(node + 0x58);
-        u8 ending = 1;
-        if (holds) ending = static_cast<u8>((load<u8>(inst + 0x88) & 8) >> 3);
-        if (load<u64>(node + 0x60) == load<u64>(inst + 0x78) && ending) {
-            const u64 sw = load<u64>(node + 0xd8);
-            if (!sw || load<u8>(sw + 0x11) || MUTANT(10)) {
-                kill(node);
-                keep = 0;
+        if (counts) {
+            const u64 ctl = load<u64>(node + 0xc8);
+            const u8 holds = game_function<StateHoldsFn>(kStateHolds)(ctl, game_function<StateOfFn>(kStateOf)(ctl));
+            const u64 inst = load<u64>(node + 0x58);
+            u8 ending = 1;
+            if (holds) ending = static_cast<u8>((load<u8>(inst + 0x88) & 8) >> 3);
+            if (load<u64>(node + 0x60) == load<u64>(inst + 0x78) && ending) {
+                const u64 sw = load<u64>(node + 0xd8);
+                if (!sw || load<u8>(sw + 0x11) || MUTANT(10)) {
+                    kill(node);
+                    keep = 0;
+                }
+            }
+            const u64 current = (load<u8>(node + 0x78) & 8) ? 0 : load<u64>(node + 0xd0);
+            if (const u64 picked = game_function<PickFn>(kPick)(current, definition, node)) {
+                store<float>(node + 0xe0, load<float>(game_address(kNoTime)));
+                store<u64>(node + 0xd0, picked);
+                game_function<ApplyFn>(kApply)(picked, definition, node);
             }
         }
-        const u64 current = (load<u8>(node + 0x78) & 8) ? 0 : load<u64>(node + 0xd0);
-        if (const u64 picked = game_function<PickFn>(kPick)(current, definition, node)) {
-            store<float>(node + 0xe0, load<float>(game_address(kNoTime)));
-            store<u64>(node + 0xd0, picked);
-            game_function<ApplyFn>(kApply)(picked, definition, node);
-        }
-        float s = *step;
-        container(node + 0x80, &s, definition, context);
-        store<float>(node + 0xe0, MUTANT(1) ? load<float>(node + 0xe0) : add(load<float>(node + 0xe0), *step));
-    } else {
-        // A staged node: its state machine against its time on entry.
+        call_container(node, container_step, definition, context, st.from, st.from);
+        if (counts) store<float>(node + 0xe0, MUTANT(1) ? load<float>(node + 0xe0) : add(load<float>(node + 0xe0), st.counted));
+    } else if (counts) {
+
+        // A staged node on a whole step: its state machine against its time on entry.
         const float t = load<float>(node + 0x7c);
         const u32 state = load<u32>(node + 0xdc);
         u32 next = state;
@@ -226,9 +259,8 @@ DECOMP_LEAF u8 sfx_node_update(u64 node, float* step, u64 definition, u64 contex
             if (next == 9) {
                 kill(node);
                 keep = 0;
-                float s = *step;
-                container(node + 0x80, &s, definition, 0);
-                store<float>(node + 0x7c, add(load<float>(node + 0x7c), *step));
+                call_container(node, container_step, definition, 0, st.from, 0.0f);
+                store<float>(node + 0x7c, add(load<float>(node + 0x7c), st.counted));
                 return keep;
             }
         }
@@ -279,10 +311,19 @@ DECOMP_LEAF u8 sfx_node_update(u64 node, float* step, u64 definition, u64 contex
         }
     }
     // Every active node: its container once more, and its time.
-    float s = *step;
-    container(node + 0x80, &s, definition, keep && !MUTANT(5) ? context : 0);
-    store<float>(node + 0x7c, MUTANT(6) ? add(*step, load<float>(node + 0x7c)) : add(load<float>(node + 0x7c), *step));
+    call_container(node, container_step, definition, keep && !MUTANT(5) ? context : 0, st.from,
+                   plain ? (MUTANT(15) ? st.from : st.into) : 0.0f);
+    if (st.tick || MUTANT(17))
+        store<float>(node + 0x7c, MUTANT(6) ? add(st.counted, load<float>(node + 0x7c)) : add(load<float>(node + 0x7c), st.counted));
     return keep;
+}
+
+}  // namespace sfx_node
+
+// sub_2c4df80 itself: the game's sequence, one step for both kinds and no offsets.
+DECOMP_LEAF u8 sfx_node_update(u64 node, float* step, u64 definition, u64 context) {
+    const float s = *step;
+    return sfx_node::update(node, {s, s, 0.0f, 0.0f, true}, definition, context);
 }
 
 namespace {
