@@ -158,7 +158,8 @@ Class class_of(std::uint64_t holder, std::uint64_t va, std::uint64_t bytes, Use 
         }
         return kUntagged;
     }
-    if (rd(holder + kHolderSpareA, &a)) {
+    // (With GX buffers by handle, +0x14 holds the handle: no canary there.)
+    if (g_flags.mode == Buffers::kOff && rd(holder + kHolderSpareA, &a)) {
         g_spare_checked[kSpareBufA].fetch_add(1, std::memory_order_relaxed);
         if (a != canary(holder, 0x14)) {
             g_spare_broken[kSpareBufA].fetch_add(1, std::memory_order_relaxed);
@@ -224,7 +225,7 @@ void census_buffer_made(std::uint64_t holder, bool initial_data) {
     const std::uint32_t word = kMagic | (usage & kUsage) | (initial_data ? kData : 0u) | (static_cast<std::uint32_t>(cpu & 3) << kCpuShift) |
                                (static_cast<std::uint32_t>(bind) << kBindShift);
     wr32(holder + kHolderSpareB, word);
-    wr32(holder + kHolderSpareA, canary(holder, 0x14));
+    if (g_flags.mode == Buffers::kOff) wr32(holder + kHolderSpareA, canary(holder, 0x14));
     g_buffers_made.fetch_add(1, std::memory_order_relaxed);
     const std::uint32_t key = (static_cast<std::uint32_t>(usage & 3) << 16) | (initial_data ? 0x8000u : 0u) |
                               (static_cast<std::uint32_t>(cpu & 3) << 8) | bind;
@@ -269,7 +270,7 @@ void census_buffer_gone(std::uint64_t holder) {
     if (!g_flags.census || !holder) return;
     g_gone_buffers.fetch_add(1, std::memory_order_relaxed);
     std::uint32_t a = 0, b = 0;
-    if (rd(holder + kHolderSpareA, &a)) {
+    if (g_flags.mode == Buffers::kOff && rd(holder + kHolderSpareA, &a)) {
         g_spare_checked[kSpareBufA].fetch_add(1, std::memory_order_relaxed);
         if (a != canary(holder, 0x14)) g_spare_broken[kSpareBufA].fetch_add(1, std::memory_order_relaxed);
     }

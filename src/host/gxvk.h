@@ -102,4 +102,50 @@ void census_constant_bound(std::uint64_t va, std::uint64_t bytes, std::uint64_t 
 // The exit report (gx_resources_report calls it).
 void census_report();
 
+// --- GX buffers by handle (BBHOST_GXVK_BUFFERS=1; 2 compares) ---
+//
+// A GX buffer the host can keep - immutable, or default with initial data;
+// no CPU access; bound as vertex or index data, and as nothing the GPU
+// writes - gets an entry in the host's table when GX makes it, and the
+// entry's handle in the holder's +0x14 (kHolderSpareA). The GX thread copies
+// the handle into the draw's record beside the holder, and the command
+// processor binds the entry's device-local copy - made from the buffer's
+// memory in the uploads of the first recording that binds it - instead of
+// resolving the record's address. A write the host hears of after the
+// creation (UpdateSubresource, a Map, a GPU copy into its memory), the
+// holder's death or its memory's unmap retires the entry: its bindings take
+// today's path again. With 2 every binding takes today's path, and the
+// handle's is checked against it (gxvk_vk.cpp).
+bool buffers_on();
+// The handle in a holder's +0x14: the tag in the top four bits, the entry's
+// generation, its index (host/gxvk_table.h). Any other value is no handle.
+constexpr std::uint32_t kHandleTag = 0xa0000000u, kHandleTagMask = 0xf0000000u;
+inline bool is_handle(std::uint32_t word) { return (word & kHandleTagMask) == kHandleTag; }
+// Why an entry was retired (the exit report counts them).
+enum Retire : int {
+    kRetireUpdate,    // UpdateSubresource of it
+    kRetireMap,       // a Map of it
+    kRetireCopy,      // a GPU copy into its memory
+    kRetireGone,      // its holder's release
+    kRetireUnmap,     // its memory unmapped
+    kRetireReplaced,  // its holder or memory given to a new buffer before the host heard of its end
+    kRetireCompare,   // a compare run's check disagreed
+    kRetireNoRoom,    // no memory for its copy
+    kRetireNoSource,  // its bytes could not be reached for the copy
+    kRetires,
+};
+// The registry's (engine/gx_resources.cpp), on the thread that made or
+// changed the buffer: GX made one (its holder, memory, size and description
+// as the holder holds them); its holder was released; something wrote it;
+// a GPU copy wrote [va, va + bytes); the kernel unmapped [va, va + bytes).
+void buffer_made(std::uint64_t holder, std::uint64_t memory, std::uint32_t bytes, std::uint8_t usage, std::uint8_t cpu, std::uint8_t bind,
+                 std::uint32_t misc, bool initial_data);
+void buffer_gone(std::uint64_t holder);
+void buffer_written(std::uint64_t holder, Retire why);
+void memory_written(std::uint64_t va, std::uint64_t bytes, Retire why);
+void memory_released(std::uint64_t va, std::uint64_t bytes);
+// The exit report's lines for the table (gx_resources_report calls it; the
+// command processor's side reports with the GPU's).
+void buffers_report();
+
 }  // namespace gxvk

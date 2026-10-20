@@ -3811,6 +3811,7 @@ void begin_recording_locked() {
         ++g.record_serial;  // dynamic state recorded so far is gone
         g.recording = true;
         twins_arm_wanted_locked();  // BBHOST_PARTICLE_TWINS: from this recording's first use of each
+        gxvk_begin_recording_locked();  // GX buffers by handle: retired entries taken back
         busy_begin_locked(g.slots[g.slot]);
         gpu_checkpoint(kGpuMarkSubmission, g.flushes * 4 + 1);
         glitch_begin_recording_locked();
@@ -6068,6 +6069,7 @@ void retire_slot_locked(int k) {
     }
     sl.garbage.clear();
     untile_checks_run_locked(sl.untile_checks);  // before their staging is reused
+    gxvk_slot_retired_locked(k);  // BBHOST_GXVK_BUFFERS=2: the copies this slot's uploads made, read back
     for (const DevBuffer& b : sl.staging_chunks) {
         const auto it = g.staging_users.find(b.buffer);
         if (it == g.staging_users.end() || --it->second) continue;
@@ -10688,6 +10690,12 @@ void host_gpu_report() {
                      static_cast<ull>(g_copy_src_staged.load()), static_cast<ull>(g_copy_src_staged_bytes.load() >> 20));
         }
         if (const std::string tw = twins_report(); !tw.empty()) host_log("%s", tw.c_str());
+        // GX buffers by handle (host/gxvk.h): one line each.
+        for (std::string gx = gxvk_report(); !gx.empty();) {
+            const std::size_t nl = gx.find('\n');
+            host_log("%s", gx.substr(0, nl).c_str());
+            gx = nl == std::string::npos ? std::string() : gx.substr(nl + 1);
+        }
     }
     {
         // Before the census lock: compute_lift_report takes g.mu, and a

@@ -6,7 +6,10 @@
 //             0x2566300 CreateTexture3D - (ctx, holder** out, desc*,
 //             initial data*, ...). The holder exists only when the method
 //             returns, so the hook swaps the return address for gx_res_ret,
-//             which reads *out and registers it.
+//             which reads *out and registers it. CreateBuffer is on the
+//             decomp list (decomp/gx/resources.cpp): ours tells the registry
+//             itself (buffer_made_entry), and the hook goes on only when
+//             ours is not in place (gx_resources_install_late).
 //   Map       0x2569c30 (ctx, ?, holder, subresource, type, mapped*): a CPU
 //             write is coming. Type 1/2 return the memory itself after a GPU
 //             wait; for a buffer, 3 hands out a new renamed copy from the
@@ -33,6 +36,8 @@
 #include "core/elf.h"
 #include "core/portable.h"
 #include "core/write_watch.h"
+#include "decomp/decomp.h"
+#include "decomp/gx/resources.h"
 #include "engine/addr.h"
 #include "engine/graphics_patch.h"
 #include "guest_abi.h"
@@ -457,11 +462,21 @@ void register_holder(std::uint64_t key, std::uint64_t holder, Kind kind, bool in
         // BBHOST_GX_TWINS=1: one the GPU writes gets a device-local twin at its first use.
         host_gpu_gx_buffer_made(e.info.memory, e.info.bytes, e.info.usage, bind, e.info.gen);
     }
-    // BBHOST_GXVK_CENSUS: the class word and canaries in the holder's spare
-    // bytes (host/gxvk.h); not a 1D texture's, whose holder GX builds inline.
+    // GX on Vulkan (host/gxvk.h): a buffer the host keeps gets its entry and
+    // its handle at +0x14; BBHOST_GXVK_CENSUS: the class word and canaries in
+    // the holder's spare bytes. Not a 1D texture's, whose holder GX builds
+    // inline.
     if (!(key & kMemoryKey)) {
-        if (e.info.type == 1) gxvk::census_buffer_made(holder, initial_data);
-        else if (e.info.type == 3 || e.info.type == 4) gxvk::census_texture_made(holder);
+        if (e.info.type == 1) {
+            std::uint8_t cpu = 0;
+            std::uint32_t misc = 0;
+            rd(holder + 0x3a, &cpu);
+            rd(holder + 0x3c, &misc);
+            gxvk::buffer_made(holder, e.info.memory, e.info.bytes, e.info.usage, cpu, e.info.bind, misc, initial_data);
+            gxvk::census_buffer_made(holder, initial_data);
+        } else if (e.info.type == 3 || e.info.type == 4) {
+            gxvk::census_texture_made(holder);
+        }
     }
     if (key & kMemoryKey) key = kMemoryKey | e.info.memory;
     register_entry(key, e);
@@ -658,6 +673,7 @@ void unregister_holder(std::uint64_t holder) {
         host_gpu_shadow_gx_write(buffer_memory, buffer_bytes);
         host_gpu_gx_buffer_gone(buffer_memory, buffer_gen);
     }
+    if (buffer_memory) gxvk::buffer_gone(holder);
 }
 
 // A Map on the holder: the resource is about to be written by the CPU. Its
@@ -778,6 +794,8 @@ void note_map(std::uint64_t holder, std::uint64_t type, std::uint64_t mapped_out
     // which does not watch a GX resource's memory, is told (host textures).
     if (texture_memory && texture_bytes) host_gpu_texture_written(texture_memory, texture_bytes);
     if (buffer_bytes) gxvk::census_buffer_mapped(holder, static_cast<std::uint32_t>(type), mapped, buffer_bytes, result == 0 && mapped, own_memory != 0);
+    // A buffer the CPU writes is not one the host keeps a copy of (host/gxvk.h).
+    if (buffer_bytes) gxvk::buffer_written(holder, gxvk::kRetireMap);
 }
 
 // The creators: rsi = holder**, rcx = initial data. The holder exists at the return.
@@ -785,6 +803,21 @@ GUEST_ABI std::int64_t create_hook(std::uint64_t id, const std::uint64_t* saved)
     t_pending.push_back({saved[6], static_cast<Kind>(id), saved[4], saved[3], saved[2]});
     const_cast<std::uint64_t*>(saved)[6] = reinterpret_cast<std::uint64_t>(&gx_res_ret);
     return 0;
+}
+
+// GX's CreateBuffer as ours (decomp/gx/resources.cpp) tells the registry
+// what it made or why it made nothing: what gx_res_after does at the hooked
+// creator's return (the failure counted - the first eight logged with the
+// description's first two words, as there - and a new holder registered).
+GUEST_ABI void buffer_made_entry(std::uint64_t holder, std::uint64_t desc, std::uint64_t initial_data, std::uint64_t result) {
+    if (static_cast<std::uint32_t>(result) != 0) {
+        const std::uint64_t n = g_create_failures.fetch_add(1, std::memory_order_relaxed);
+        std::uint32_t wh[2] = {0, 0};
+        if (n < 8 && desc && rd(desc, &wh))
+            host_log("gx-resources: a buffer of %ux%u was not made (error %u)", wh[0], wh[1], static_cast<std::uint32_t>(result));
+        return;
+    }
+    if (holder) register_holder(holder, holder, kBuffer, initial_data != 0);
 }
 
 // A render-target or depth-stencil view just made: its 2D texture's extent at
@@ -1452,7 +1485,6 @@ void gx_resources_install(ElfImage* image) {
             host_log("gx-resources: 0x%llx is not the prologue expected; not hooked", static_cast<unsigned long long>(va));
         }
     };
-    hook(kCreateBuffer, kPrologue58, sizeof(kPrologue58), reinterpret_cast<void*>(&create_hook), kBuffer);
     hook(kCreateTexture, kPrologue58, sizeof(kPrologue58), reinterpret_cast<void*>(&create_hook), kTexture);
     hook(kCreateTexture3D, kPrologue58, sizeof(kPrologue58), reinterpret_cast<void*>(&create_hook), kTexture3D);
     hook(kMap, kPrologue58, sizeof(kPrologue58), reinterpret_cast<void*>(&map_hook), 0);
@@ -1539,6 +1571,23 @@ void gx_resources_install(ElfImage* image) {
     hook(kCreateSampler, kSamplerPrologue, sizeof(kSamplerPrologue), reinterpret_cast<void*>(&view_create_hook), 4);
     host_log("gx-resources: registry on: %d hooks (creators, Map, destructors)%s%s", hooked, refused ? ", some refused" : "",
              g_trace ? "; Map and ring callers logged" : "");
+}
+
+// After the decomp list is placed: GX's CreateBuffer is ours (it calls the
+// registry's entry itself), the compare run's stand-in (which calls the
+// entry's host function), or the game's - hooked at its prologue as the
+// other creators are.
+void gx_resources_install_late(ElfImage* image) {
+    if (!g_gx_res_after_thunk) return;
+    const int placed = decomp_placed("gx_create_buffer");
+    if (placed) {
+        decomp_gx::g_buffer_made_host = reinterpret_cast<void*>(&buffer_made_entry);
+        decomp_gx::g_buffer_made_entry = hle_wrap_fn(reinterpret_cast<void*>(&buffer_made_entry));
+        return;
+    }
+    const std::uint64_t at = image->mem.slide + (kCreateBuffer - kPreferredGuestSlide);
+    if (!engine_prologue_hook(image, at, kPrologue58, sizeof(kPrologue58), reinterpret_cast<void*>(&create_hook), kBuffer))
+        host_log("gx-resources: 0x%llx is not the prologue expected; not hooked", static_cast<unsigned long long>(kCreateBuffer));
 }
 
 std::uint64_t gx_guest_to_bn(std::uint64_t va) { return g_slide ? bn(va) : va; }
@@ -1683,6 +1732,7 @@ void gx_resources_memory_released(std::uint64_t va, std::size_t len) {
         }
     }
     retire_memory(va, static_cast<std::uint32_t>(std::min<std::size_t>(len, 0xffffffffu)), 0);
+    if (n) gxvk::memory_released(va, len);
     // The mirrors keep pages by their physical memory, which this range no
     // longer names: they hear of it as a write, and a range their map of the
     // guest's mappings no longer has copies every told page again.
@@ -1973,4 +2023,5 @@ void gx_resources_report() {
         }
     }
     gxvk::census_report();
+    gxvk::buffers_report();
 }

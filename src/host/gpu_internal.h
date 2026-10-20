@@ -865,6 +865,35 @@ Located locate_guest(std::uint64_t va, std::uint64_t bytes);
 // range overlaps a live twin, whose guest bytes are stale - no CPU copy of
 // them. twins_release_locked: a reader of guest memory (`why` 0 a page-table
 // walk, 1 a texture) reaches them - copied back and let go.
+// GX on Vulkan, stage 1 (host/gxvk.h, gxvk_vk.cpp): GX buffers bound by
+// handle. gxvk_resolve_locked: where a vertex record's element or an index
+// range [va, va + bytes) of the GX buffer whose holder carried `handle` at
+// the call lies in that buffer's device-local copy (placed and filled in this
+// recording's uploads at its first binding) - gxvk::kFalls with `out` the
+// copy's range, else why not (gxvk::Fallback). gxvk_count_locked counts a
+// binding's outcome (kFalls: by handle). gxvk_buffers_bind_mode: whether
+// draws bind the copies (BBHOST_GXVK_BUFFERS=1) rather than only check them
+// beside today's path (2): gxvk_disagree_locked counts what such a check
+// found, and retires the entry.
+bool gxvk_buffers_bind_mode();
+int gxvk_resolve_locked(int use, std::uint32_t handle, std::uint64_t holder, std::uint64_t va, std::uint64_t bytes, Located& out);
+void gxvk_count_locked(int use, int result);
+enum GxvkDisagree : int {
+    gxvk_kCopyVersion,   // today's path finds a copy version over the bytes
+    gxvk_kWindow,        // ... the bytes in one of the draw's CPU-written windows
+    gxvk_kSnapshot,      // ... the bytes on a page the game rewrites (a snapshot)
+    gxvk_kLayout,        // the vertex input planned from the handles is not today's
+    gxvk_kGuestChanged,  // the buffer's bytes no longer hash as they did when copied
+    gxvk_kDeviceCopy,    // the device copy, read back, is not those bytes
+    gxvk_kDisagrees,
+};
+void gxvk_disagree_locked(int kind, std::uint32_t handle);
+// At a recording's start: retired entries taken back (their ranges free once
+// the work recorded with them has run). At a slot's retirement: the compare
+// run's read-backs of the copies its uploads made, checked.
+void gxvk_begin_recording_locked();
+void gxvk_slot_retired_locked(int slot);
+std::string gxvk_report();
 bool twins_on();
 bool import_census_on();  // BBHOST_IMPORT_CENSUS=1: the exit report's census of guest memory in place
 // BBHOST_GX_TWINS: 0 off, 1 the buffers shaders write, 2 also those GPU copies

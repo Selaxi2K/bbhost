@@ -18,6 +18,7 @@
 
 #include "host/cb_proof.h"
 #include "host/gxvk.h"
+#include "host/gxvk_table.h"
 #include "host/draw_capture.h"
 #include "gcn/container.h"
 #include "gcn/lift.h"
@@ -1136,6 +1137,17 @@ thread_local bool t_snapshot_cbs = false;
 // draw_impl for the draw it resolves, 0 otherwise - dispatches, the census
 // off).
 thread_local std::uint64_t t_gxvk_call_seq = 0;
+// GX on Vulkan: plan_vertex_input planning a draw again without handles (a
+// binding the plan would share between two buffers' copies).
+thread_local bool t_gxvk_no_handles = false;
+// Where a vertex element bound by handle sits in the plan: its 1 GiB of
+// guest address space as one buffer and its address as the offset, as the
+// mirrors and the import place guest memory (one buffer a direct-memory
+// chunk, the address's offset in it) - so the bindings, the attributes and
+// the pipeline are what today's path plans. Never a real buffer.
+constexpr std::uint64_t kGxvkPlanTag = 0xfffe000000000000ull;
+VkBuffer gxvk_plan_buffer(std::uint64_t va) { return reinterpret_cast<VkBuffer>(kGxvkPlanTag | (va >> 30)); }
+bool gxvk_plan_buffer_is(VkBuffer b) { return (reinterpret_cast<std::uint64_t>(b) & 0xffff000000000000ull) == kGxvkPlanTag; }
 std::atomic<std::uint64_t> g_sf_cb_snapshots{0};
 thread_local char t_draw_origin[160] = "";             // and where it came from
 void clear_image_locked(RtImage& r, const float rgba[4], std::uint32_t first_layer, std::uint32_t layer_count, bool barrier = true);  // below, outside the unnamed namespace
@@ -13342,6 +13354,20 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
         std::uint64_t va;
     } placed[16];
     p.elements.clear();
+    // GX on Vulkan (host/gxvk.h): an element of a record in a GX buffer the
+    // host keeps is bound from the buffer's device-local copy by the handle
+    // its call read from the holder - no copy version, mirror, snapshot or
+    // import to find. It is planned where the guest address puts it
+    // (gxvk_plan_buffer), and each binding then takes the copy's range. With
+    // BBHOST_GXVK_BUFFERS=2 every element takes today's path and the
+    // handle's is checked beside it. A record's outcome is counted once, the
+    // first of its elements' that is not "by handle".
+    const bool handles = gxvk::buffers_on() && !t_gxvk_no_handles;
+    const bool handles_bind = handles && gxvk_buffers_bind_mode();
+    Located by_handle[16];
+    bool handle_el[16] = {};
+    std::int8_t slot_result[16];
+    std::memset(slot_result, -1, sizeof slot_result);
     // The device-local copy of each vertex record, once per record: its
     // elements share it (buffer_shadow.cpp).
     struct RecordShadow {
@@ -13385,6 +13411,25 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
         const std::uint64_t va = (static_cast<std::uint64_t>(w[0]) | (static_cast<std::uint64_t>(w[1] & 0xff) << 32)) + fe.offset;
         const std::uint64_t need = w[2] ? static_cast<std::uint64_t>(w[2] - 1) * stride + bytes : bytes;
         std::uint64_t placed_need = need;  // what loc must hold (less than need only where a twin's edge cut it, below)
+        if (handles) {
+            const std::uint64_t holder = o.vtx_obj[fe.slot];
+            const std::uint32_t h = o.vtx_handle[fe.slot];
+            const int r = !holder ? gxvk::kFallNoObject
+                          : !h    ? gxvk::kFallNoHandle
+                                  : gxvk_resolve_locked(gxvk::kUseVertex, h, holder, va, need, by_handle[e]);
+            if (slot_result[fe.slot] < 0 || slot_result[fe.slot] == gxvk::kFalls) slot_result[fe.slot] = static_cast<std::int8_t>(r);
+            handle_el[e] = r == gxvk::kFalls;
+            if (handle_el[e] && handles_bind) {
+                gcn::VertexElement ve;
+                ve.location = static_cast<std::uint32_t>(e);
+                ve.vdata = fe.vdata;
+                ve.count = fe.count;
+                ve.w3 = w[3];
+                p.elements.push_back(ve);
+                placed[e] = {gxvk_plan_buffer(va), va, stride, fmt, va};
+                continue;
+            }
+        }
         Located loc;
         const int version = copy_version_lookup_locked(va, need, &loc);
         if (version == kCopyVersionStraddles) copy_versions_put_in_place_locked(kCvStraddle);
@@ -13552,6 +13597,14 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
             loc.buffer = rs->whole.buffer;
             loc.offset = rs->whole.offset + fe.offset;
         }
+        // BBHOST_GXVK_BUFFERS=2: today's path must find the bytes of an
+        // element the handle serves in guest memory as it stands.
+        if (handle_el[e]) {
+            const std::uint32_t h = o.vtx_handle[fe.slot];
+            if (version == kCopyVersionInside) gxvk_disagree_locked(gxvk_kCopyVersion, h);
+            else if (windowed) gxvk_disagree_locked(gxvk_kWindow, h);
+            else if (snapped || rs->snapped) gxvk_disagree_locked(gxvk_kSnapshot, h);
+        }
         gcn::VertexElement ve;
         ve.location = static_cast<std::uint32_t>(e);
         ve.vdata = fe.vdata;
@@ -13565,34 +13618,83 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
     // as attribute offsets, as a D3D11 stream holds its elements at
     // AlignedByteOffset. Offsets past what every device allows (2047) get
     // their own bindings.
-    auto bind = [&](bool per_element) {
-        p.bindings.clear();
-        p.attributes.clear();
-        std::uint32_t binding_of[16];
+    std::uint32_t binding_of[16];
+    auto bind = [&](VertexInputPlan& q, const Placed* pl, bool per_element) {
+        q.bindings.clear();
+        q.attributes.clear();
         for (std::size_t e = 0; e < n; ++e) {
             binding_of[e] = UINT32_MAX;
-            for (std::uint32_t k = 0; !per_element && k < p.bindings.size(); ++k) {
-                if (p.buffer[k] == placed[e].buffer && p.bindings[k].stride == placed[e].stride) binding_of[e] = k;
+            for (std::uint32_t k = 0; !per_element && k < q.bindings.size(); ++k) {
+                if (q.buffer[k] == pl[e].buffer && q.bindings[k].stride == pl[e].stride) binding_of[e] = k;
             }
             if (binding_of[e] == UINT32_MAX) {
-                binding_of[e] = static_cast<std::uint32_t>(p.bindings.size());
-                p.bindings.push_back({binding_of[e], placed[e].stride, VK_VERTEX_INPUT_RATE_VERTEX});
-                p.buffer[binding_of[e]] = placed[e].buffer;
-                p.offset[binding_of[e]] = placed[e].offset;
-                p.va[binding_of[e]] = placed[e].va;
-            } else if (placed[e].offset < p.offset[binding_of[e]]) {
-                p.offset[binding_of[e]] = placed[e].offset;
-                p.va[binding_of[e]] = placed[e].va;
+                binding_of[e] = static_cast<std::uint32_t>(q.bindings.size());
+                q.bindings.push_back({binding_of[e], pl[e].stride, VK_VERTEX_INPUT_RATE_VERTEX});
+                q.buffer[binding_of[e]] = pl[e].buffer;
+                q.offset[binding_of[e]] = pl[e].offset;
+                q.va[binding_of[e]] = pl[e].va;
+            } else if (pl[e].offset < q.offset[binding_of[e]]) {
+                q.offset[binding_of[e]] = pl[e].offset;
+                q.va[binding_of[e]] = pl[e].va;
             }
         }
         for (std::size_t e = 0; e < n; ++e) {
-            const VkDeviceSize rel = placed[e].offset - p.offset[binding_of[e]];
+            const VkDeviceSize rel = pl[e].offset - q.offset[binding_of[e]];
             if (rel > 2047) return false;
-            p.attributes.push_back({static_cast<std::uint32_t>(e), binding_of[e], placed[e].format, static_cast<std::uint32_t>(rel)});
+            q.attributes.push_back({static_cast<std::uint32_t>(e), binding_of[e], pl[e].format, static_cast<std::uint32_t>(rel)});
         }
         return true;
     };
-    if (!bind(g_vertex_input == 2)) bind(true);
+    if (!bind(p, placed, g_vertex_input == 2)) bind(p, placed, true);
+    if (handles) {
+        bool mixed = false;
+        std::uint32_t first_handle = 0;
+        for (std::size_t e = 0; e < n && !first_handle; ++e)
+            if (handle_el[e]) first_handle = o.vtx_handle[els[e].slot];
+        if (handles_bind) {
+            // Each binding planned at a guest address takes its copy's range:
+            // the copy of its lowest element, which every element of the
+            // binding shares - or, a binding of two buffers' elements, the
+            // draw is planned again without handles.
+            for (std::uint32_t k = 0; k < p.bindings.size() && !mixed; ++k) {
+                if (!gxvk_plan_buffer_is(p.buffer[k])) continue;
+                std::size_t lo = n;
+                std::uint64_t holder = 0;
+                for (std::size_t e = 0; e < n; ++e) {
+                    if (binding_of[e] != k) continue;
+                    const std::uint64_t h = o.vtx_obj[els[e].slot];
+                    if (!handle_el[e] || (holder && h != holder)) mixed = true;
+                    holder = h;
+                    if (placed[e].offset == p.offset[k] && lo == n) lo = e;
+                }
+                if (lo == n) mixed = true;
+                if (mixed) break;
+                p.buffer[k] = by_handle[lo].buffer;
+                p.offset[k] = by_handle[lo].offset;
+            }
+        } else if (first_handle) {
+            // BBHOST_GXVK_BUFFERS=2: the plan from the handles is today's.
+            Placed pv[16];
+            for (std::size_t e = 0; e < n; ++e) {
+                pv[e] = placed[e];
+                if (handle_el[e]) pv[e].buffer = gxvk_plan_buffer(placed[e].va), pv[e].offset = placed[e].va;
+            }
+            VertexInputPlan qv;
+            qv.elements = p.elements;
+            if (!bind(qv, pv, g_vertex_input == 2)) bind(qv, pv, true);
+            if (vertex_plan_hash(qv) != vertex_plan_hash(p)) gxvk_disagree_locked(gxvk_kLayout, first_handle);
+        }
+        for (std::uint32_t slot = 0; slot < 16; ++slot) {
+            if (slot_result[slot] < 0) continue;
+            gxvk_count_locked(gxvk::kUseVertex, mixed && slot_result[slot] == gxvk::kFalls ? gxvk::kFallMixed : slot_result[slot]);
+        }
+        if (mixed) {
+            t_gxvk_no_handles = true;
+            const bool ok = plan_vertex_input(fetch_words, fetch_hash, o, p, memo);
+            t_gxvk_no_handles = false;
+            return ok;
+        }
+    }
     p.hash = vertex_plan_hash(p);
     return true;
 }
@@ -19745,9 +19847,32 @@ static bool draw_impl(const GpuDraw& d) {
         if (g_import_audit && d.indirect_va) audit_range(d.index_va, static_cast<std::uint64_t>(d.index_count) * (d.index_type == 1 ? 4 : 2), kUseIndex);
         const std::uint64_t index_bytes = static_cast<std::uint64_t>(d.index_count) * (d.index_type == 1 ? 4 : 2);
         Located loc;
-        const int version = copy_version_lookup_locked(d.index_va, index_bytes, &loc);  // a straddle ended the pass above
+        // GX on Vulkan (host/gxvk.h): the indices from the index buffer's
+        // device-local copy, by the handle its call read from the holder;
+        // BBHOST_GXVK_BUFFERS=2 takes today's path and checks the handle's.
+        bool by_handle = false;
+        std::uint32_t index_handle = 0;
+        if (gxvk::buffers_on()) {
+            const GxDrawObjects* go = d.gx_objects;
+            Located hl;
+            const int r = !go || !go->ib_obj ? gxvk::kFallNoObject
+                          : !go->ib_handle  ? gxvk::kFallNoHandle
+                          : d.indirect_va   ? gxvk::kFallIndirect
+                                            : gxvk_resolve_locked(gxvk::kUseIndex, go->ib_handle, go->ib_obj, d.index_va, index_bytes, hl);
+            gxvk_count_locked(gxvk::kUseIndex, r);
+            if (r == gxvk::kFalls) {
+                index_handle = go->ib_handle;
+                if (gxvk_buffers_bind_mode()) {
+                    loc = hl;
+                    by_handle = true;
+                }
+            }
+        }
+        const int version = by_handle ? kCopyVersionNone : copy_version_lookup_locked(d.index_va, index_bytes, &loc);  // a straddle ended the pass above
+        if (index_handle && !by_handle && version == kCopyVersionInside) gxvk_disagree_locked(gxvk_kCopyVersion, index_handle);
         // (Window imports: the mirror first, so the indices need no import.)
-        if (version != kCopyVersionInside && (imports_whole() || d.indirect_va || !shadow_mirror_locked(d.index_va, index_bytes, loc))) {
+        if (!by_handle && version != kCopyVersionInside &&
+            (imports_whole() || d.indirect_va || !shadow_mirror_locked(d.index_va, index_bytes, loc))) {
             const ImportSite site("an index buffer");
             loc = locate(d.index_va, index_bytes);
             if (!d.indirect_va) shadow_locate_locked(d.index_va, index_bytes, loc);

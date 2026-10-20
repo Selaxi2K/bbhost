@@ -206,6 +206,10 @@ struct GxDrawObjects {
     // (host/gxvk.h handout_seq: the census's stamp, 0 without it).
     std::uint64_t ib_obj = 0;
     std::uint64_t call_seq = 0;
+    // GX on Vulkan (host/gxvk.h): the handle of each vertex slot's buffer and
+    // of the index buffer, as their holders carried it at the call (0: none).
+    std::uint32_t vtx_handle[16] = {};
+    std::uint32_t ib_handle = 0;
 };
 
 // One stage's resource records as the GX commit wrote them for a draw, copied
