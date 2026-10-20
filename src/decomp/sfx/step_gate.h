@@ -8,5 +8,9 @@ void decomp_sfx_gate_frame(bool between);
 // Whether the frame is between whole effect steps at all, the gate on or off:
 // what GPU particle type 0x2713's record keeps its whole step's time on.
 void decomp_sfx_step_frame(bool between);
+// The same frame's own time and the carry after it (engine/sfx_schedule.h's
+// frame and into): what the smooth steps' frame domain steps the effects by
+// and puts on their nodes' times at the last whole step.
+void decomp_sfx_frame_time(float frame, float into);
 // Whether the gate's functions took the game's place.
 bool decomp_sfx_gate_placed();

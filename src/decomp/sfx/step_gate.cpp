@@ -86,6 +86,9 @@ void* g_game_gx_record = nullptr;
 
 std::atomic<u32> g_between{0};
 std::atomic<u32> g_step_between{0};  // a frame between whole effect steps, the gate on or off (decomp_sfx_step_frame)
+// The frame's own time and the carry after it (decomp_sfx_frame_time), for
+// the smooth steps' frame domain.
+std::atomic<float> g_frame_step{0.0f}, g_frame_into{0.0f};
 std::atomic<u64> g_frames_between{0}, g_instances_held{0}, g_lights_held{0}, g_motions_held{0}, g_still_frames{0}, g_records_held{0};
 
 // A frame bbhost put between whole steps that is not the game's own still frame.
@@ -276,6 +279,11 @@ void decomp_sfx_gate_frame(bool between) {
 }
 
 void decomp_sfx_step_frame(bool between) { g_step_between.store(between ? 1u : 0u, std::memory_order_relaxed); }
+
+void decomp_sfx_frame_time(float frame, float into) {
+    g_frame_step.store(frame, std::memory_order_relaxed);
+    g_frame_into.store(into, std::memory_order_relaxed);
+}
 
 bool decomp_sfx_gate_placed() { return decomp_placed("sub_2c4ff30") == 1 && decomp_placed("sub_131e660") == 1; }
 

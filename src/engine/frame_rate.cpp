@@ -1419,6 +1419,7 @@ void each_frame(const SprjFlipper* f) {
             put<float>(g_sfx_step_va, sf.seconds);
             decomp_sfx_gate_frame(g_sfx_gate && sf.whole == 0);
             decomp_sfx_step_frame(sf.whole == 0);
+            decomp_sfx_frame_time(sf.frame, sf.into);
         }
     }
     const float floor_s = g_dt_unfloored ? kShortestFrame : std::max(f->target_frame_seconds, 1.0f / static_cast<float>(kUncappedMaxFps));
