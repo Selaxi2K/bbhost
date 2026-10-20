@@ -159,11 +159,32 @@ inline u8 node_held(u64 node, const float* step, u64 definition, u64 context) {
 constexpr u64 kManagerOf = 0x70;  // SprjSfx +0x70: the effect manager (its time scale +0x5d8, its own still flag +0x5ce)
 
 // The converted classes' vtables, by Binary Ninja address: the classes whose
-// updates the frame domain may give the frame's step (filled class by class as
-// each is read; a test sets its own).
-constexpr u64 kConverted[] = {0};
+// updates do with their step only what time does, each read in Binary Ninja -
+// the motions, the modules, the binders and the StandardParticle and Spark
+// simulations also held to the game's own code by
+// tests/decomp/sfx_classes_test.cpp (one whole step against the frame domain's
+// frames). Off the list, and so on the held frames as with 30: the FFX light 0x56ebba0 and the wobble motions 0x570e6d0,
+// 0x570e690 and 0x570e8d0 (they count their updates), the module 0x5760f20,
+// and the GPU particle types 0x2712 (0x56eb030: whole grid passes of elapsed x
+// 30), 0x2713 (0x56eb0d0: its parameters are curves read at the elapsed time),
+// 0x283c (0x56eadf0) and 0x283d (0x56eac40), not read through yet.
+constexpr u64 kConverted[] = {
+    0x570e650,  // motion: velocity along itself by step x speed curve x +0x24, position by step x velocity, facing the move
+    0x570e790,  // motion: turned by step x its rates (or three curves)
+    0x570e710,  // motion: a transform; never reads its step
+    0x56eb2e0,  // module: the children follow; never reads the parameters the step is in
+    0x5756e50,  // module (Sprj): its model advanced by step x +0xc4
+    0x56e3090,  // binder: CPU particles; time += step, ended by it, the item's count born at it
+    0x56e3100,  // binder: a GPU particle system's record; prev = cur, cur += step, its type handed the difference
+    0x56eb1d0,  // GPU particle type 0x2710 StandardParticle: simulation time, emission timers by the elapsed time
+    0x56eb120,  // GPU particle type 0x2718 Spark: the same
+    0x56eb220,  // GPU particle type 0x2711 WanderingVision: the elapsed time handed to its simulation
+    0x56ea9b0,  // GPU particle type 0x283e: a volume from the record's matrix; no time
+    0x56eaa90,  // GPU particle type 0x27d8: no time
+    0x56eb290,  // GPU particle type 0x2968: constant bounds
+};
 const u64* g_converted = kConverted;
-std::size_t g_converted_count = 0;
+std::size_t g_converted_count = sizeof kConverted / sizeof kConverted[0];
 
 inline bool converted_class(u64 object) {
     if (!object) return true;

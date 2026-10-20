@@ -630,7 +630,7 @@ int check_smooth(int cases, u64 sfx, u64 manager) {
     g_times = false;
     decomp_sfx_smooth(false);
     g_converted = kConverted;
-    g_converted_count = 0;
+    g_converted_count = sizeof kConverted / sizeof kConverted[0];
     eboot_kit::stub(0x2c4df80, reinterpret_cast<const void*>(&node_held_as_game));
     return bad;
 }
@@ -1068,6 +1068,14 @@ int main() {
     total += 2 * kCases;
     std::printf("decomp_sfx_step_gate: %d cases (nodes, lights, instances; ordinary values, then special ones), %d differ\n", total, bad);
     if (bad) return 1;
+    // The build's converted list: never the composite motion (it is its parts), nor a class that counts its
+    // updates (the light, the wobbles) or the grid simulation.
+    for (const u64 vt : kConverted)
+        for (const u64 off : {0x570e750ull, 0x56ebba0ull, 0x570e6d0ull, 0x570e690ull, 0x570e8d0ull, 0x56eb030ull})
+            if (vt == off) {
+                std::printf("decomp_sfx_step_gate: 0x%llx is on the converted list\n", static_cast<unsigned long long>(vt));
+                return 1;
+            }
     // The smooth steps (the effect manager's time scale +0x5d8 and its own still flag +0x5ce, behind SprjSfx +0x70).
     alignas(64) static u8 manager_mem[0x600];
     const u64 manager = reinterpret_cast<u64>(manager_mem);
