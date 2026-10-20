@@ -106,7 +106,8 @@ std::atomic<std::uint64_t> g_gone_buffers{0}, g_gone_textures{0};
 
 // The upload heap: the first block pool's region. Two stamps per 16-byte
 // granule (the pool's alignment, so no two hand-outs share one): the last
-// hand-out's sequence and the last submission that bound it (+1).
+// hand-out's sequence, and the last submission that bound it (+1) with what
+// bound it (bound_stamp: the use in the low two bits).
 struct Heap {
     std::uint64_t pool = 0, base = 0, bytes = 0;
     std::atomic<std::uint32_t>* handed = nullptr;
@@ -120,15 +121,22 @@ std::atomic<std::uint32_t> g_seq{0};
 std::atomic<std::uint64_t> g_handouts{0}, g_handout_bytes{0}, g_handouts_other_pool{0}, g_handouts_outside{0};
 std::atomic<std::uint64_t> g_min_free{~0ull}, g_max_in_use{0};
 std::atomic<std::uint64_t> g_ring_allocs{0}, g_ring_in_heap{0};
-// The release proof: (i) hand-outs over a granule a submission still running
-// had bound, and those within one submission of the count (a count that
-// lagged rather than a reuse); (ii) bindings of a range handed out again
-// after their call; and the heap bindings that carried no call stamp.
-std::atomic<std::uint64_t> g_proof_i{0}, g_proof_i_near{0}, g_proof_ii{0}, g_heap_bindings{0}, g_heap_unstamped{0};
+// The release proof, by what bound the range (Use): (i) hand-outs over a
+// granule a submission still running had bound, and those within one
+// submission of the count (a count that lagged rather than a reuse); (ii)
+// bindings of a range handed out again after their call; and the heap
+// bindings, and those that carried no call stamp. A vertex record's range is
+// what its draw reads (to its last vertex), not its V#'s extent, which
+// counts records from the buffer's start and runs on past a renamed copy.
+std::atomic<std::uint64_t> g_proof_i[kUses] = {}, g_proof_i_near[kUses] = {}, g_proof_ii[kUses] = {}, g_heap_bindings[kUses] = {},
+                           g_heap_unstamped[kUses] = {};
 std::atomic<std::uint64_t> g_heap_granules_checked{0};
 std::atomic<int> g_proof_logged{0};
 
 constexpr std::uint64_t kGranule = 16;
+inline std::uint32_t bound_stamp(std::uint64_t serial, Use use) { return static_cast<std::uint32_t>(((serial + 1) << 2) | static_cast<unsigned>(use)); }
+inline std::uint64_t stamp_serial(std::uint32_t stamp) { return (stamp >> 2) - 1; }  // the submission (stamp != 0)
+inline Use stamp_use(std::uint32_t stamp) { return static_cast<Use>(stamp & 3); }
 
 bool in_heap(std::uint64_t va, std::uint64_t bytes) {
     return g_heap_ready.load(std::memory_order_acquire) && va >= g_heap.base && va - g_heap.base < g_heap.bytes &&
@@ -195,20 +203,20 @@ void count(Use use, Class c, std::uint64_t bytes) {
 }
 
 // The heap's two checks for a binding in it, and its stamps.
-void heap_bound(std::uint64_t va, std::uint64_t bytes, std::uint64_t call_seq, std::uint64_t serial) {
-    g_heap_bindings.fetch_add(1, std::memory_order_relaxed);
+void heap_bound(Use use, std::uint64_t va, std::uint64_t bytes, std::uint64_t call_seq, std::uint64_t serial) {
+    g_heap_bindings[use].fetch_add(1, std::memory_order_relaxed);
     const std::uint64_t g0 = (va - g_heap.base) / kGranule, g1 = (va + std::max<std::uint64_t>(bytes, 1) - 1 - g_heap.base) / kGranule;
-    if (!call_seq) g_heap_unstamped.fetch_add(1, std::memory_order_relaxed);
+    if (!call_seq) g_heap_unstamped[use].fetch_add(1, std::memory_order_relaxed);
     bool reused = false;
     for (std::uint64_t g = g0; g <= g1 && g < g_heap.granules; ++g) {
         if (call_seq && g_heap.handed[g].load(std::memory_order_relaxed) > static_cast<std::uint32_t>(call_seq)) reused = true;
-        g_heap.bound[g].store(static_cast<std::uint32_t>(serial + 1), std::memory_order_relaxed);
+        g_heap.bound[g].store(bound_stamp(serial, use), std::memory_order_relaxed);
     }
     if (reused) {
-        g_proof_ii.fetch_add(1, std::memory_order_relaxed);
+        g_proof_ii[use].fetch_add(1, std::memory_order_relaxed);
         if (g_proof_logged.fetch_add(1, std::memory_order_relaxed) < 12)
-            host_log("gxvk census: release proof (ii): [0x%llx, +%llu) bound in submission %llu was handed out again after its call (stamp %llu)",
-                     static_cast<ull>(va), static_cast<ull>(bytes), static_cast<ull>(serial), static_cast<ull>(call_seq));
+            host_log("gxvk census: release proof (ii): %s [0x%llx, +%llu) bound in submission %llu was handed out again after its call (stamp %llu)",
+                     kUseName[use], static_cast<ull>(va), static_cast<ull>(bytes), static_cast<ull>(serial), static_cast<ull>(call_seq));
     }
 }
 
@@ -357,20 +365,22 @@ void census_handout(std::uint64_t pool, std::uint64_t node, std::uint64_t bytes)
     const std::uint32_t seq = g_seq.fetch_add(1, std::memory_order_relaxed) + 1;
     const std::uint64_t done = done_submissions();
     const std::uint64_t g0 = (start - g_heap.base) / kGranule, g1 = (start + size - 1 - g_heap.base) / kGranule;
-    std::uint64_t worst = 0;
+    std::uint32_t worst = 0;  // the latest still-running binding's stamp
     for (std::uint64_t g = g0; g <= g1 && g < g_heap.granules; ++g) {
         const std::uint32_t b = g_heap.bound[g].load(std::memory_order_relaxed);
-        if (b && b - 1 >= done) worst = std::max<std::uint64_t>(worst, b);
+        if (b && stamp_serial(b) >= done && (!worst || stamp_serial(b) > stamp_serial(worst))) worst = b;
         g_heap.handed[g].store(seq, std::memory_order_relaxed);
     }
     g_heap_granules_checked.fetch_add(g1 - g0 + 1, std::memory_order_relaxed);
     if (worst) {
-        // (worst - 1) is the submission that bound it; done counts those run.
-        const bool near = worst - 1 == done;
-        (near ? g_proof_i_near : g_proof_i).fetch_add(1, std::memory_order_relaxed);
+        // done counts the submissions run; the binding's was not.
+        const Use use = stamp_use(worst);
+        const bool near = stamp_serial(worst) == done;
+        (near ? g_proof_i_near : g_proof_i)[use].fetch_add(1, std::memory_order_relaxed);
         if (g_proof_logged.fetch_add(1, std::memory_order_relaxed) < 12)
-            host_log("gxvk census: release proof (i): [0x%llx, +%llu) handed out while submission %llu that bound it had not run (%llu done)",
-                     static_cast<ull>(start), static_cast<ull>(size), static_cast<ull>(worst - 1), static_cast<ull>(done));
+            host_log("gxvk census: release proof (i): [0x%llx, +%llu) handed out while submission %llu, which bound it as %s, had not run (%llu "
+                     "done)",
+                     static_cast<ull>(start), static_cast<ull>(size), static_cast<ull>(stamp_serial(worst)), kUseName[use], static_cast<ull>(done));
     }
 }
 
@@ -431,13 +441,13 @@ void census_view_bound(std::uint64_t view, int kind) {
 void census_binding(Use use, std::uint64_t holder, std::uint64_t va, std::uint64_t bytes, std::uint64_t call_seq, std::uint64_t serial) {
     if (!g_flags.census) return;
     count(use, class_of(holder, va, bytes, use), bytes);
-    if (in_heap(va, bytes)) heap_bound(va, bytes, call_seq, serial);
+    if (in_heap(va, bytes)) heap_bound(use, va, bytes, call_seq, serial);
 }
 
 void census_constant_bound(std::uint64_t va, std::uint64_t bytes, std::uint64_t call_seq, std::uint64_t serial, bool gx_records) {
     if (!g_flags.census) return;
     if (!gx_records) count(kUseConstant, kNoObject, bytes);
-    if (va && in_heap(va, bytes)) heap_bound(va, bytes, call_seq, serial);
+    if (va && in_heap(va, bytes)) heap_bound(kUseConstant, va, bytes, call_seq, serial);
 }
 
 void census_report() {
@@ -494,10 +504,13 @@ void census_report() {
                  static_cast<ull>(min_free != ~0ull ? (g_heap.bytes - std::min(min_free, g_heap.bytes)) >> 10 : 0), static_cast<ull>(g_heap.bytes >> 10),
                  static_cast<ull>(min_free != ~0ull ? min_free >> 10 : 0), v(g_max_in_use), v(g_handouts_outside), v(g_handouts_other_pool),
                  v(g_ring_allocs), v(g_ring_in_heap));
-        host_log("gxvk census: release proof: (i) %llu hand-outs over a range a submission still running had bound (%llu more within one "
-                 "submission of the count); (ii) %llu bindings of a range handed out again after their call; %llu bindings in the heap checked "
-                 "(%llu without a call stamp), %llu granules handed out",
-                 v(g_proof_i), v(g_proof_i_near), v(g_proof_ii), v(g_heap_bindings), v(g_heap_unstamped), v(g_heap_granules_checked));
+        for (int u = 0; u < kUses; ++u) {
+            host_log("gxvk census: release proof, %s: (i) %llu hand-outs over a range a submission still running had bound (%llu more within "
+                     "one submission of the count); (ii) %llu bindings of a range handed out again after their call; %llu bindings in the heap "
+                     "checked (%llu without a call stamp)",
+                     kUseName[u], v(g_proof_i[u]), v(g_proof_i_near[u]), v(g_proof_ii[u]), v(g_heap_bindings[u]), v(g_heap_unstamped[u]));
+        }
+        host_log("gxvk census: release proof: %llu granules handed out", v(g_heap_granules_checked));
     } else {
         host_log("gxvk census: GX's upload heap was never seen made");
     }

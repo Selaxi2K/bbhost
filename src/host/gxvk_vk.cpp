@@ -254,6 +254,11 @@ bool fill_locked(BufferEntry& e, std::uint32_t handle) {
             vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
             const VkBufferCopy back{e.vk_offset, 0, e.bytes};
             vkCmdCopyBuffer(cmd, dst, rb.buf.buffer, 1, &back);
+            // The read-back made available to the host, which reads it once
+            // the slot's fence has signalled (the fence alone does not).
+            mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
             rb.hash = e.hash;
             rb.bytes = e.bytes;
             rb.handle = handle;

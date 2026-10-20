@@ -13504,8 +13504,6 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
         if (!rs) {
             const std::uint64_t record_va = va - fe.offset;
             std::uint64_t record_bytes = w[2] ? static_cast<std::uint64_t>(w[2]) * stride : fe.offset + bytes;
-            // BBHOST_GXVK_CENSUS: the record by what holds its bytes, and the upload heap's checks.
-            if (gxvk::census()) gxvk::census_binding(gxvk::kUseVertex, o.vtx_obj[fe.slot], record_va, record_bytes, o.call_seq, g.flushes);
             RecordShadow& ns = shadows[n_shadows++];
             ns.w = w;
             ns.whole = {};
@@ -13524,6 +13522,10 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
                 read_bytes_memo = draw_read_bytes(w, stride, record_bytes);
                 return read_bytes_memo;
             };
+            // BBHOST_GXVK_CENSUS: the record by what holds its bytes, and the
+            // upload heap's checks over what the draw reads of it.
+            if (gxvk::census())
+                gxvk::census_binding(gxvk::kUseVertex, o.vtx_obj[fe.slot], record_va, draw_read_bytes(w, stride, record_bytes), o.call_seq, g.flushes);
             bool in_place = false;
             if (mirrored) {
                 ns.whole = {loc.buffer, loc.offset - fe.offset, record_bytes};  // the mirror already (window imports)
