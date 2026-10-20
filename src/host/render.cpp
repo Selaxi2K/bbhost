@@ -7,6 +7,7 @@
 #include "core/portable.h"
 #include "engine/gx_resources.h"
 #include "engine/gx_state.h"
+#include "host/clip_control.h"
 #include "host/gpu_internal.h"
 #include "host/masked_blend.h"
 #include "host/shader_bundles.h"
@@ -311,6 +312,10 @@ struct GfxPipeline {
     std::uint32_t relink_vertex_formats[16] = {};
     VkPolygonMode relink_polygon = VK_POLYGON_MODE_FILL;
     bool relink_clamp = false;
+    bool relink_discard = false;
+    // Made with rasterizer discard dynamic (GfxFixedState::rasterizer_discard):
+    // a draw sets it on after binding the pipeline.
+    bool raster_discard = false;
     // The indexed loads' V# words 3 (StageParams::cb_w3, by stage and buffer)
     // the relink was specialized with, and once it is adopted the fast-linked
     // pipeline, which a draw whose words differ binds instead.
@@ -2471,6 +2476,77 @@ struct DrawState {
     std::uint64_t program_fp = 0;  // GpuDrawInputs::program_fp: stands for vte_cntl and the PS/VS fields below it
 };
 
+// BBHOST_CLIP_CONTROL (host/clip_control.h), on unless 0: PA_CL_CLIP_CNTL's
+// CLIP_DISABLE, ZCLIP_NEAR_DISABLE and ZCLIP_FAR_DISABLE as depth clamp on the
+// register path and DX_RASTERIZATION_KILL as rasterizer discard on both; 0
+// keeps depth clamp from CLIP_DISABLE alone and rasterizes every draw.
+const bool g_clip_control = [] {
+    const char* e = std::getenv("BBHOST_CLIP_CONTROL");
+    return !(e && e[0] == '0');
+}();
+// The draws the decode touches, for the exit report. On the register path (no
+// GX rasterizer description): those with CLIP_DISABLE, ZCLIP_NEAR_DISABLE or
+// ZCLIP_FAR_DISABLE, those whose depth clamp the decode changes (a z bit
+// without CLIP_DISABLE), and those with GL's clip space (DX_CLIP_SPACE_DEF
+// clear) or user clip planes (UCP_ENA_0-5), which nothing reads. On both
+// paths: those with DX_RASTERIZATION_KILL. The first pipelines of the changed
+// and the killed ones by name. A draw with none of these bits counts nothing.
+struct ClipCensus {
+    std::atomic<std::uint64_t> clip_disable{0}, near_off{0}, far_off{0}, clamp_changed{0}, gl_space{0}, ucp{0}, kill{0}, gx_kill{0};
+    std::atomic<bool> names_full{false};
+    std::mutex mu;
+    std::set<std::string> clamp_names, kill_names;  // under mu
+} g_clip_census;
+void clip_control_census(const DrawState& s, const std::string& name) {
+    const std::uint32_t c = s.clip_cntl;
+    const auto note = [&name](std::set<std::string>& names) {
+        if (g_clip_census.names_full.load(std::memory_order_relaxed)) return;
+        std::lock_guard<std::mutex> lk(g_clip_census.mu);
+        if (names.size() < 12) names.insert(name);
+        if (g_clip_census.clamp_names.size() >= 12 && g_clip_census.kill_names.size() >= 12) g_clip_census.names_full = true;
+    };
+    if (s.gx_raster && s.gx_depth) {
+        if (c & kDxRasterizationKill) {
+            g_clip_census.gx_kill.fetch_add(1, std::memory_order_relaxed);
+            note(g_clip_census.kill_names);
+        }
+        return;
+    }
+    if (!(c & (kClipDisable | kZclipNearDisable | kZclipFarDisable | kDxRasterizationKill | 0x3fu)) && (c & kDxClipSpaceDef)) return;
+    if (c & kClipDisable) g_clip_census.clip_disable.fetch_add(1, std::memory_order_relaxed);
+    if (c & kZclipNearDisable) g_clip_census.near_off.fetch_add(1, std::memory_order_relaxed);
+    if (c & kZclipFarDisable) g_clip_census.far_off.fetch_add(1, std::memory_order_relaxed);
+    if (!(c & kDxClipSpaceDef)) g_clip_census.gl_space.fetch_add(1, std::memory_order_relaxed);
+    if (c & 0x3fu) g_clip_census.ucp.fetch_add(1, std::memory_order_relaxed);
+    if (c & kDxRasterizationKill) {
+        g_clip_census.kill.fetch_add(1, std::memory_order_relaxed);
+        note(g_clip_census.kill_names);
+    }
+    if ((c & (kZclipNearDisable | kZclipFarDisable)) && !(c & kClipDisable)) {
+        g_clip_census.clamp_changed.fetch_add(1, std::memory_order_relaxed);
+        note(g_clip_census.clamp_names);
+    }
+}
+std::string clip_control_report() {
+    const ClipCensus& c = g_clip_census;
+    const auto n = [](const std::atomic<std::uint64_t>& v) { return static_cast<unsigned long long>(v.load()); };
+    if (!n(c.clip_disable) && !n(c.near_off) && !n(c.far_off) && !n(c.gl_space) && !n(c.ucp) && !n(c.kill) && !n(c.gx_kill)) return {};
+    std::string clamp, kill;
+    {
+        std::lock_guard<std::mutex> lk(g_clip_census.mu);
+        for (const std::string& name : g_clip_census.clamp_names) clamp += " " + name;
+        for (const std::string& name : g_clip_census.kill_names) kill += " " + name;
+    }
+    char buf[640];
+    std::snprintf(buf, sizeof(buf),
+                  "clip control (PA_CL_CLIP_CNTL; BBHOST_CLIP_CONTROL %s): register-path draws with CLIP_DISABLE %llu, ZCLIP_NEAR_DISABLE %llu, "
+                  "ZCLIP_FAR_DISABLE %llu, DX_RASTERIZATION_KILL %llu, GL clip space %llu, user clip planes %llu (the last two not read); depth clamp "
+                  "changed by the z bits %llu; GX-described draws with DX_RASTERIZATION_KILL %llu. Clamp changed for:%s; killed:%s",
+                  g_clip_control ? "on" : "off", n(c.clip_disable), n(c.near_off), n(c.far_off), n(c.kill), n(c.gl_space), n(c.ucp),
+                  n(c.clamp_changed), n(c.gx_kill), clamp.empty() ? " none" : clamp.c_str(), kill.empty() ? " none" : kill.c_str());
+    return buf;
+}
+
 // Everything a graphics pipeline is made from, hashed once as one packed
 // record (it was some thirty-five calls, each over a field or two). The
 // image dimensions and sampler modes join it in draw_impl.
@@ -2535,6 +2611,8 @@ std::uint64_t pipeline_key(const DrawState& s, std::uint64_t vs_hash, std::uint6
     }
     if (s.gx_blend) {
         std::memcpy(k.state, s.gx_ids, sizeof(s.gx_ids));  // the state objects stand for the registers they were encoded into
+        // ...except DX_RASTERIZATION_KILL, which fixed_raster_depth reads from the register on both paths (0 where clear: the key as before).
+        if (g_clip_control) k.state[11] = s.clip_cntl & kDxRasterizationKill;
     } else {
         k.state[0] = s.depth_control;
         k.state[1] = s.stencil_control;
@@ -2668,6 +2746,8 @@ bool format_blends(VkFormat format) {
 
 void fixed_raster_depth(const DrawState& s, GfxFixedState& f) {
     f.topology = s.topo;
+    const ClipControlState clip = clip_control_state(s.clip_cntl, g_clip_control);
+    f.rasterizer_discard = clip.rasterizer_discard;
     // BBHOST_DEBUG_NO_CULL=1 / BBHOST_DEBUG_NO_DEPTH=1: draw everything
     // (is geometry reaching the target at all?).
     static const bool no_cull = [] { const char* e = std::getenv("BBHOST_DEBUG_NO_CULL"); return e && e[0] == '1'; }();
@@ -2706,7 +2786,9 @@ void fixed_raster_depth(const DrawState& s, GfxFixedState& f) {
     f.cull_mode = no_cull ? 0u : ((mode & 1) ? VK_CULL_MODE_FRONT_BIT : 0) | ((mode & 2) ? VK_CULL_MODE_BACK_BIT : 0);
     f.front_face = (mode & 4) ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
     if ((mode & 0x10) && ((mode >> 5) & 7) == 1) f.polygon_mode = VK_POLYGON_MODE_LINE;  // POLY_MODE with LINES
-    f.depth_clamp = (s.clip_cntl & (1u << 16)) != 0;  // ZCLIP_NEAR_DISABLE approximated
+    // PA_CL_CLIP_CNTL: z not clipped (CLIP_DISABLE, ZCLIP_NEAR_DISABLE or
+    // ZCLIP_FAR_DISABLE) is depth clamp (host/clip_control.h).
+    f.depth_clamp = clip.depth_clamp;
     const std::uint32_t dc = s.depth_control;
     f.depth_test = (dc & 2) && s.depth && !no_depth;
     f.depth_write = (dc & 4) && s.depth;
@@ -4501,7 +4583,7 @@ std::uint64_t pipeline_content_key(const GfxPipeline& pl, const DrawState& s, co
                                    bool linked) {
     struct Head {
         std::uint64_t vs, ps, vi;
-        std::uint32_t linked, gs, topology, polygon, clamp, lean, layout_only, formats_from_params, clip_discard, pad;
+        std::uint32_t linked, gs, topology, polygon, clamp, lean, layout_only, formats_from_params, clip_discard, raster_discard;
     } h{};
     h.vs = pl.vs_key;
     h.ps = pl.ps.module ? pl.ps_key : 0;
@@ -4515,6 +4597,7 @@ std::uint64_t pipeline_content_key(const GfxPipeline& pl, const DrawState& s, co
     h.layout_only = pl.layout_only ? 1u : 0u;
     h.formats_from_params = pl.vs_formats_from_params ? 1u : 0u;
     h.clip_discard = pl.clip_discard;
+    h.raster_discard = f.rasterizer_discard ? 1u : 0u;
     std::uint64_t k = fnv1a(&h, sizeof(h), 0x9b9e7ac0ffee0001ull);
     k = fnv1a(f.blends.data(), f.blends.size() * sizeof(VkPipelineColorBlendAttachmentState), k);
     k = fnv1a(f.color_formats.data(), f.color_formats.size() * sizeof(VkFormat), k);
@@ -4803,6 +4886,8 @@ bool take_prebuilt(GfxPipeline& pl, std::uint64_t key) {
     std::copy(pre->relink_vertex_formats, pre->relink_vertex_formats + 16, pl.relink_vertex_formats);
     pl.relink_polygon = pre->relink_polygon;
     pl.relink_clamp = pre->relink_clamp;
+    pl.relink_discard = pre->relink_discard;
+    pl.raster_discard = pre->raster_discard;
     pl.relink_pending = pre->relink_pending;
     pl.prebuilt = true;
     if (recipe) {
@@ -6141,9 +6226,12 @@ struct TessLibraryStages {
 // (gcn::kVertexFormatSpecId), 16 indexed loads' words 3 (gcn::kCbW3SpecId),
 // then their 16 strides (gcn::kCbStrideSpecId), 0 where the default (read the
 // params) stays; null keeps every default.
+// `discard`: rasterizer discard as a dynamic state, which the draw sets on
+// (GfxFixedState::rasterizer_discard); the libraries of every other pipeline
+// are made as before.
 VkPipeline pre_raster_library(const ShaderStage& vs, const ShaderStage& gs, VkPolygonMode polygon_mode, bool draw_clamp, VkPipelineLayout layout,
                               const VkDescriptorSetLayout set_layouts[2], const TessLibraryStages* tess = nullptr,
-                              const std::uint32_t* vertex_formats = nullptr, bool keep = true) {
+                              const std::uint32_t* vertex_formats = nullptr, bool keep = true, bool discard = false) {
     const bool depth_clamp = draw_clamp && !g.dynamic_depth_clamp;  // else the draw sets it (DrawLibraryState)
     if (!vertex_formats && keep) {
         const std::uint64_t vs_hash = fnv1a(vs.meta().spirv.data(), vs.meta().spirv.size() * 4);
@@ -6173,6 +6261,10 @@ VkPipeline pre_raster_library(const ShaderStage& vs, const ShaderStage& gs, VkPo
         key = fnv1a(t, sizeof(t), key ^ 0x7e55000000000000ull);
     }
     if (vertex_formats) key = fnv1a(vertex_formats, 48 * sizeof(std::uint32_t), key ^ 0x5bec000000000000ull);
+    if (discard) {
+        const std::uint32_t d = 1;
+        key = fnv1a(&d, sizeof(d), key ^ 0xd15c000000000000ull);
+    }
     return pipeline_library(kLibPreRaster, key, "pre-rasterization", vs.meta().spirv.size(), [&] {
         std::vector<VkPipelineShaderStageCreateInfo> stages;
         const auto stage = [&](VkShaderStageFlagBits bit, VkShaderModule m) {
@@ -6211,10 +6303,13 @@ VkPipeline pre_raster_library(const ShaderStage& vs, const ShaderStage& gs, VkPo
         // Depth bias on with dynamic values (DrawLibraryState), 0 0 0 for a
         // state without one - which is no bias - as D3D11 drivers treat it.
         rs.depthBiasEnable = VK_TRUE;
-        const VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_CULL_MODE,
-                                      VK_DYNAMIC_STATE_FRONT_FACE, VK_DYNAMIC_STATE_DEPTH_BIAS, VK_DYNAMIC_STATE_DEPTH_CLAMP_ENABLE_EXT};
+        VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_CULL_MODE,
+                                VK_DYNAMIC_STATE_FRONT_FACE, VK_DYNAMIC_STATE_DEPTH_BIAS, VK_DYNAMIC_STATE_DEPTH_CLAMP_ENABLE_EXT,
+                                VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE};
+        std::uint32_t ndyn = g.dynamic_depth_clamp ? 6 : 5;
+        if (discard) dyn[ndyn++] = VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE;
         VkPipelineDynamicStateCreateInfo dsi{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-        dsi.dynamicStateCount = g.dynamic_depth_clamp ? 6 : 5;
+        dsi.dynamicStateCount = ndyn;
         dsi.pDynamicStates = dyn;
         VkGraphicsPipelineCreateInfo gpci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
         gpci.stageCount = static_cast<std::uint32_t>(stages.size());
@@ -6418,6 +6513,7 @@ struct PrecompileJob {
     std::uint32_t vertex_formats[16] = {};
     VkPolygonMode polygon_mode = VK_POLYGON_MODE_FILL;
     bool depth_clamp = false;
+    bool raster_discard = false;
     // And its indexed loads' words 3 and strides as its first draw had them
     // (by stage).
     std::uint32_t w3[2][16] = {};
@@ -6728,6 +6824,7 @@ void queue_library_relink(GfxPipeline& pl, const gcn::StageParams params[2]) {
     std::copy(pl.relink_vertex_formats, pl.relink_vertex_formats + 16, job.vertex_formats);
     job.polygon_mode = pl.relink_polygon;
     job.depth_clamp = pl.relink_clamp;
+    job.raster_discard = pl.relink_discard;
     if (g_relink_w3 && !pl.tess_hw && pl.lean) {
         for (int st = 0; st < 2; ++st) {
             const gcn::TranslateResult& meta = st ? pl.ps.meta() : pl.vs.meta();
@@ -6785,7 +6882,8 @@ VkPipeline relink_build(Precompiler& w, const PrecompileJob& job) {
         if (job.specialize_formats) std::copy(job.vertex_formats, job.vertex_formats + 16, words);
         std::copy(job.w3[0], job.w3[0] + 16, words + 16);
         std::copy(job.stride[0], job.stride[0] + 16, words + 32);
-        if (const VkPipeline pr = pre_raster_library(pl.vs, pl.gs, job.polygon_mode, job.depth_clamp, job.layout, pl.set_layouts, nullptr, words)) {
+        if (const VkPipeline pr = pre_raster_library(pl.vs, pl.gs, job.polygon_mode, job.depth_clamp, job.layout, pl.set_layouts, nullptr, words, true,
+                                                     job.raster_discard)) {
             libraries[1] = pr;
             if (job.specialize_formats) w.relinks_specialized.fetch_add(1, std::memory_order_relaxed);
         } else {
@@ -6951,6 +7049,7 @@ void replay_recipe(Precompiler& w, const std::shared_ptr<const PipelineRecipe>& 
         std::copy(pl->relink_vertex_formats, pl->relink_vertex_formats + 16, job.vertex_formats);
         job.polygon_mode = pl->relink_polygon;
         job.depth_clamp = pl->relink_clamp;
+        job.raster_discard = pl->relink_discard;
         std::memcpy(job.w3, r.spec_w3, sizeof(job.w3));
         std::memcpy(job.stride, r.spec_stride, sizeof(job.stride));
         std::memcpy(job.w3_mask, r.spec_w3_mask, sizeof(job.w3_mask));
@@ -8664,7 +8763,8 @@ bool link_gfx_pipeline(GfxPipeline& pl, const GfxFixedState& f, const VertexInpu
         tess.control = pl.tess_tcs;
         tess.control_points = pl.tess_control_points;
     }
-    const VkPipeline pr = pre_raster_library(pl.vs, pl.gs, f.polygon_mode, f.depth_clamp, pl.layout, pl.set_layouts, pl.tess_hw ? &tess : nullptr);
+    const VkPipeline pr = pre_raster_library(pl.vs, pl.gs, f.polygon_mode, f.depth_clamp, pl.layout, pl.set_layouts, pl.tess_hw ? &tess : nullptr,
+                                             nullptr, true, f.rasterizer_discard);
 
     const VkPipeline fs = fragment_library(pl.ps.meta(), pl.ps.module, pl.set_layouts[1], pl.layout);
 
@@ -8710,6 +8810,7 @@ bool link_gfx_pipeline(GfxPipeline& pl, const GfxFixedState& f, const VertexInpu
         }
         pl.relink_polygon = f.polygon_mode;
         pl.relink_clamp = f.depth_clamp;
+        pl.relink_discard = f.rasterizer_discard;
         pl.relink_pending = true;
     }
     return ok;
@@ -8909,11 +9010,13 @@ bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputP
     VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     cb.attachmentCount = static_cast<std::uint32_t>(f.blends.size());
     cb.pAttachments = f.blends.data();
-    const VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_STENCIL_REFERENCE,
-                                  VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
-                                  VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_DEPTH_BOUNDS};
+    VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_STENCIL_REFERENCE,
+                            VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
+                            VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_DEPTH_BOUNDS, VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE};
+    std::uint32_t ndyn = g.has_depth_bounds ? 7 : 6;
+    if (f.rasterizer_discard) dyn[ndyn++] = VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE;  // the draw sets it on
     VkPipelineDynamicStateCreateInfo dsi{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-    dsi.dynamicStateCount = g.has_depth_bounds ? 7 : 6;
+    dsi.dynamicStateCount = ndyn;
     dsi.pDynamicStates = dyn;
     VkPipelineRenderingCreateInfo ri{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
     ri.colorAttachmentCount = static_cast<std::uint32_t>(f.color_formats.size());
@@ -8990,6 +9093,7 @@ bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputP
         return false;
     }
     if (content_key && !t_replaying) recipe_note_created(pl, content_key);
+    pl.raster_discard = f.rasterizer_discard;
     vk_debug_name(VK_OBJECT_TYPE_PIPELINE, reinterpret_cast<std::uint64_t>(pl.pipeline), pl.name.c_str());  // the layer's draw messages name it
     const auto ms_ = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (!t_pipeline_worker) g_pl_create_us.fetch_add(pl_us_since(t0), std::memory_order_relaxed);
@@ -14339,6 +14443,7 @@ std::string host_gpu_clear_view_report() {
                  static_cast<unsigned long long>(g_cv_stencil_by_htile), static_cast<unsigned long long>(g_cv_depth_by_htile),
                  static_cast<unsigned long long>(g_cv_stencil_kept));
     }
+    if (const std::string r = clip_control_report(); !r.empty()) host_log("render: %s", r.c_str());
     if (g_masked_blend_pipelines.load()) {
         host_log("render: %llu pipelines built with a blend state for a colour target they write no channel of, zeroed (%llu of them "
                  "blending into it; BBHOST_MASKED_BLEND=0 keeps the game's)",
@@ -17514,6 +17619,7 @@ static bool draw_impl(const GpuDraw& d) {
         std::lock_guard<std::mutex> lk(g_pmanifest.mu);
         if (pl.recipe && recipe_attach_ls_pass(*pl.recipe)) g_pmanifest.dirty = true;
     }
+    clip_control_census(s, pl.name);
     if (pl.failed) {
         draw_failed(kFailPipeline);
         // Which pipelines, once each: the exit report only counts them.
@@ -19295,7 +19401,7 @@ static bool draw_impl(const GpuDraw& d) {
         }
     }
     if (g_recorded.pipeline != bind_vk) {
-        cmds.bind_pipeline(bind_vk);
+        cmds.bind_pipeline(bind_vk, bind_pl->raster_discard);
         g_recorded.pipeline = bind_vk;
         // A pipeline with this state static (the host tessellator's are built
         // whole) leaves the dynamic values invalid: the next library draw sets

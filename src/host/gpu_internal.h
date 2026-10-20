@@ -1023,6 +1023,9 @@ struct GfxFixedState {
     VkCullModeFlags cull_mode = 0;
     VkFrontFace front_face = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     bool depth_clamp = false;
+    // PA_CL_CLIP_CNTL's DX_RASTERIZATION_KILL (host/clip_control.h): the pipeline
+    // takes rasterizer discard as a dynamic state and the draw sets it.
+    bool rasterizer_discard = false;
     bool depth_test = false, depth_write = false, depth_bounds_test = false, stencil_test = false;
     VkCompareOp depth_compare = VK_COMPARE_OP_NEVER;
     VkStencilOpState front{}, back{};
@@ -1896,7 +1899,9 @@ public:
     // caller's `writes` and `images` hold nothing it wrote.
     void take_sets(std::vector<VkWriteDescriptorSet>& writes, std::vector<VkDescriptorImageInfo>& images,
                    const std::vector<VkDescriptorBufferInfo>& buffers, const VkDescriptorBufferInfo* extra, std::size_t n_extra);
-    void bind_pipeline(VkPipeline pipeline);
+    // `discard`: the pipeline takes rasterizer discard as a dynamic state, set
+    // on after it is bound (a draw PA_CL_CLIP_CNTL's DX_RASTERIZATION_KILL kills).
+    void bind_pipeline(VkPipeline pipeline, bool discard = false);
     void library_state(const DrawLibraryState& s, bool has_depth_bounds);
     // `dynamic`: the params blocks' offsets (set_cache_on()), else null.
     // `bindless`: the pipeline's stages read the global set, bound as set 3.

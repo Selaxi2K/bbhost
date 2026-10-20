@@ -612,6 +612,10 @@ if(UNIX)
   add_executable(masked_blend_test tests/masked_blend_test.cpp)
   target_include_directories(masked_blend_test PRIVATE src)
   add_test(NAME masked_blend_test COMMAND masked_blend_test)
+  # PA_CL_CLIP_CNTL as depth clamp and rasterizer discard (tests/clip_control_test.cpp).
+  add_executable(clip_control_test tests/clip_control_test.cpp)
+  target_include_directories(clip_control_test PRIVATE src)
+  add_test(NAME clip_control_test COMMAND clip_control_test)
   # The constant-buffer proof's copies and compares without the game (tests/cb_proof_test.cpp).
   add_executable(cb_proof_test tests/cb_proof_test.cpp)
   target_include_directories(cb_proof_test PRIVATE src include)

@@ -266,6 +266,16 @@ target is undefined and Vulkan writes nothing through an empty mask, so the
 state is dead where a driver honours the mask; a driver may blend the undefined
 output in anyway, and with the state zeroed there is nothing to blend
 (`BBHOST_MASKED_BLEND=0` keeps the game's blend state).
+A draw whose rasterizer state comes from the registers rather than a GX
+description takes its depth clamp from PA_CL_CLIP_CNTL: with CLIP_DISABLE,
+ZCLIP_NEAR_DISABLE or ZCLIP_FAR_DISABLE set z is not clipped, and the depth
+block clamps depth to the viewport's range, which is Vulkan's depth clamp.
+GX's rasterizer builder sets both z bits from D3D11's DepthClipEnable, so this
+is exact for its states; Vulkan has no switch per plane, and a register with one
+alone clamps the other plane's geometry onto it instead of clipping it.
+DX_RASTERIZATION_KILL is rasterizer discard, a dynamic state only the pipelines
+of such draws take (`BBHOST_CLIP_CONTROL=0` keeps depth clamp from CLIP_DISABLE
+alone and rasterizes every draw).
 
 **Native passes.** Several parts of the frame no longer run the game's GPU
 path at all:
