@@ -223,6 +223,52 @@ static uint32_t id_from(uint64_t inst, int o1, int o2, int o3) {
     if (w == 0x00525846 || r32(p + 0x30) == 0x85) return r32(p + 0x38);  /* the file: "FXR\0", the root at +0x30 */
     return 0;
 }
+/* An instance's id from its creation: every effect made by id goes through sub_2c53020 (system, id, ...), whose new
+ * instance (+0x38 the system) is handed to sub_2c505f0 before its nodes are built - the id is kept from the first call
+ * (per thread) and put on the instance at the second. */
+#define CMAP 65536
+static uint64_t cmap_inst[CMAP];
+static uint32_t cmap_id[CMAP];
+static pthread_mutex_t cmu = PTHREAD_MUTEX_INITIALIZER;
+static __thread uint64_t pend_sys;
+static __thread uint32_t pend_id;
+static uint64_t created_named;
+static int use_def_path = 1;
+static int h_create(BbHookCtx* ctx, void* user) {
+    (void)user;
+    const uint32_t id = (uint32_t)ctx->arg[1];
+    if (id && id != 0xfffffffeu) pend_sys = ctx->arg[0], pend_id = id;
+    return 0;
+}
+static int h_created(BbHookCtx* ctx, void* user) {
+    (void)user;
+    const uint64_t inst = ctx->arg[0];
+    const uint32_t id = pend_id;
+    const uint64_t sys = pend_sys;
+    pend_id = 0;
+    if (!id || !heap_ptr(inst) || r64(inst + 0x38) != sys) return 0;
+    pthread_mutex_lock(&cmu);
+    uint32_t h = (uint32_t)((inst >> 4) * 2654435761u) & (CMAP - 1);
+    for (int k = 0; k < 256; ++k, h = (h + 1) & (CMAP - 1))
+        if (!cmap_inst[h] || cmap_inst[h] == inst) {
+            cmap_inst[h] = inst, cmap_id[h] = id;
+            ++created_named;
+            break;
+        }
+    pthread_mutex_unlock(&cmu);
+    return 0;
+}
+static uint32_t created_id(uint64_t inst) {
+    uint32_t id = 0;
+    pthread_mutex_lock(&cmu);
+    uint32_t h = (uint32_t)((inst >> 4) * 2654435761u) & (CMAP - 1);
+    for (int k = 0; k < 256; ++k, h = (h + 1) & (CMAP - 1)) {
+        if (cmap_inst[h] == inst) { id = cmap_id[h]; break; }
+        if (!cmap_inst[h]) break;
+    }
+    pthread_mutex_unlock(&cmu);
+    return id;
+}
 /* An instance's id from the request that holds it (+0x88), for when its definition gives none: the requests' effects
  * only - the ones a manager makes directly have no request. */
 static uint32_t req_id_of_inst(uint64_t inst) {
@@ -259,6 +305,7 @@ static void calibrate_ids(void) {
                     if (m > best) best = m, b1 = o1, b2 = o2, b3 = o3;
                 }
     if (best > 0) id_o1 = b1, id_o2 = b2, id_o3 = b3;
+    else use_def_path = 0;  /* the ids from the instances' creation (and their requests) only */
     api->log("fxp: f%llu effect ids from instances: the pointer at +0x%x, then %d, then %d (-1: none); %d of %d of the place's requests agree%s",
              (unsigned long long)frames, id_o1, id_o2, id_o3, best, n, best > 0 ? "" : " - NO PATH FOUND, ids unread");
 }
@@ -617,7 +664,8 @@ static void instances_frame(void) {
         const uint64_t def = r64(r->inst + (uint64_t)id_o1);
         if (r->shot == -2) {  /* new: its id, the shot it is part of, or the place's own */
             r->def = def;
-            r->id = id_of_inst(r->inst);
+            r->id = use_def_path ? id_of_inst(r->inst) : 0;
+            if (!r->id) r->id = created_id(r->inst);
             static int from_req;
             if (!r->id && shot_cur >= 0 && (r->id = req_id_of_inst(r->inst)) && from_req++ < 4)
                 api->log("fxp: f%llu instance %llx: its id %u from its request (its definition gives none)", (unsigned long long)frames,
@@ -1017,9 +1065,10 @@ static void on_frame(void* user) {
         dump_words();
         pthread_mutex_unlock(&mu);
         api->log("fxp: f%llu done: %d shots made, %llu frames with a whole step, %llu between, %llu instances not tracked, %llu word snapshots lost; "
-                 "ids checked against requests %llu, differing %llu",
+                 "ids checked against requests %llu, differing %llu; instances named at their creation %llu",
                  (unsigned long long)frames, shot_index, (unsigned long long)frames_whole, (unsigned long long)frames_between,
-                 (unsigned long long)lost_insts, (unsigned long long)wlost, (unsigned long long)id_checked, (unsigned long long)id_differ);
+                 (unsigned long long)lost_insts, (unsigned long long)wlost, (unsigned long long)id_checked, (unsigned long long)id_differ,
+                 (unsigned long long)created_named);
         stage = DONE;
         if (env_i("FXP_EXIT", 0)) request("exit\n");
     }
@@ -1063,6 +1112,13 @@ BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* a) {
     /* push rbp; mov rbp, rsp; push r15, r14, r13, r12, rbx; sub rsp, 0x128: the container update's own first bytes */
     static const uint8_t p_cont[20] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x81, 0xec, 0x28, 0x01, 0x00, 0x00};
     const int hk = a->hook2(0x2c4c8c0, p_cont, sizeof p_cont, h_container, 0);
+    /* the instance's creation by id (sub_2c53020: the same first bytes, sub rsp 0x98) and the call that gets the new
+     * instance (sub_2c505f0: push rbp; mov rbp, rsp; push r15, r14, r12, rbx; mov rbx, rsi; mov r14, rdi) */
+    static const uint8_t p_create[20] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x81, 0xec, 0x98, 0x00, 0x00, 0x00};
+    static const uint8_t p_created[17] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x54, 0x53, 0x48, 0x89, 0xf3, 0x49, 0x89, 0xfe};
+    const int hc = a->hook2(0x2c53020, p_create, sizeof p_create, h_create, 0);
+    const int hd = a->hook2(0x2c505f0, p_created, sizeof p_created, h_created, 0);
+    a->log("fxp: creation hooks %d %d (0 in)", hc, hd);
     a->on_frame(on_frame, 0);
     a->log("fxp: %d shots (FXP_PLAN), %.0f frames a game second, block %08x; container hook %d (0 in); the step slot %s; word bytes 0x%x; %d dumps a shot",
            nshots, fps, want_block, hk, step_slot ? "found" : "NOT found", word_bytes, ndump);
