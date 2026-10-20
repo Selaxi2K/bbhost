@@ -870,13 +870,21 @@ Located locate_guest(std::uint64_t va, std::uint64_t bytes);
 // range [va, va + bytes) of the GX buffer whose holder carried `handle` at
 // the call lies in that buffer's device-local copy (placed and filled in this
 // recording's uploads at its first binding) - gxvk::kFalls with `out` the
-// copy's range, else why not (gxvk::Fallback). gxvk_count_locked counts a
+// copy's range, else why not (gxvk::Fallback). A vertex record may count on
+// past its buffer's end (its V# counts from the buffer's start, its base an
+// offset into it): it is bound all the same, out.avail what the copy holds
+// from va - the draw reads only its vertices, inside the buffer (the compare
+// mode checks that). gxvk_count_locked counts a
 // binding's outcome (kFalls: by handle). gxvk_buffers_bind_mode: whether
 // draws bind the copies (BBHOST_GXVK_BUFFERS=1) rather than only check them
 // beside today's path (2): gxvk_disagree_locked counts what such a check
 // found, and retires the entry.
 bool gxvk_buffers_bind_mode();
 int gxvk_resolve_locked(int use, std::uint32_t handle, std::uint64_t holder, std::uint64_t va, std::uint64_t bytes, Located& out);
+// Whether the last resolve bound a buffer after its end (its holder released,
+// its memory unmapped or reused): the copy holds what the draw recorded
+// before the end reads, and guest memory may not any more.
+bool gxvk_last_resolve_ended();
 void gxvk_count_locked(int use, int result);
 enum GxvkDisagree : int {
     gxvk_kCopyVersion,   // today's path finds a copy version over the bytes
@@ -885,6 +893,7 @@ enum GxvkDisagree : int {
     gxvk_kLayout,        // the vertex input planned from the handles is not today's
     gxvk_kGuestChanged,  // the buffer's bytes no longer hash as they did when copied
     gxvk_kDeviceCopy,    // the device copy, read back, is not those bytes
+    gxvk_kPastEnd,       // a draw reads a record past its buffer's end (its V# counted from the buffer's start)
     gxvk_kDisagrees,
 };
 void gxvk_disagree_locked(int kind, std::uint32_t handle);

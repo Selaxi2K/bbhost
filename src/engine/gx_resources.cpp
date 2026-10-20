@@ -478,6 +478,8 @@ void register_holder(std::uint64_t key, std::uint64_t holder, Kind kind, bool in
             gxvk::census_texture_made(holder);
         }
     }
+    // A texture made over a kept buffer's memory: the buffer's end, unseen.
+    if (e.info.type >= 2 && e.info.type <= 4 && e.info.memory && e.info.bytes) gxvk::memory_written(e.info.memory, e.info.bytes, gxvk::kRetireReplaced);
     if (key & kMemoryKey) key = kMemoryKey | e.info.memory;
     register_entry(key, e);
 }

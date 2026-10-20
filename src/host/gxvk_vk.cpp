@@ -26,6 +26,8 @@
 #include "hle/modules.h"
 #include "log.h"
 
+#include <utility>
+
 #include <algorithm>
 #include <cstring>
 #include <deque>
@@ -66,9 +68,15 @@ std::uint64_t g_barrier_serial = ~0ull;  // the recording whose uploads have the
 
 const char* const kDisagreeName[gxvk_kDisagrees] = {"a copy version over the bytes", "the bytes in a draw window", "the bytes snapshotted",
                                                     "another vertex input", "the guest bytes changed since the copy",
-                                                    "the device copy differs"};
-const char* const kFallName[gxvk::kFalls] = {"no GX object", "not kept", "stale handle", "retired", "past the buffer's end",
-                                             "no memory", "bytes out of reach", "indirect", "a binding shared with another buffer"};
+                                                    "the device copy differs", "a draw reading past the buffer's end"};
+std::atomic<std::uint64_t> g_overrun{0};  // vertex records whose V# counts past the buffer's end, bound to its copy's end
+const char* const kFallName[gxvk::kFalls] = {"no GX object", "not kept", "a handle of no entry", "taken back since the call",
+                                             "retired by a write", "past the buffer's end", "no memory", "bytes out of reach",
+                                             "indirect", "a binding shared with another buffer"};
+// Entries retired by their end, kept bindable for the draws recorded before
+// it, until the flip given (8 on from the retirement's taking).
+constexpr std::uint64_t kEndFlips = 8;
+std::deque<std::pair<std::uint32_t, std::uint64_t>> g_ending;  // under g.mu: index, the flip it is taken back at
 
 std::uint64_t hash_bytes(const void* p, std::size_t n) {
     const auto* b = static_cast<const std::uint8_t*>(p);
@@ -282,6 +290,10 @@ int place_locked(BufferEntry& e, std::uint32_t handle) {
     return gxvk::kFalls;
 }
 
+// A compare run's disagreement: counted, the first logged, and the entry
+// retired - but for another vertex input, which binds the same bytes
+// through other bindings (today's path put two records in one buffer: a
+// staging chunk, a snapshot ring) and costs only a pipeline of its own.
 void disagree_locked(int kind, std::uint32_t handle, const BufferEntry* e) {
     g_disagree[kind].fetch_add(1, std::memory_order_relaxed);
     if (g_disagree_logged.fetch_add(1, std::memory_order_relaxed) < 12) {
@@ -289,29 +301,46 @@ void disagree_locked(int kind, std::uint32_t handle, const BufferEntry* e) {
                  static_cast<ull>(e ? e->holder : 0), static_cast<ull>(e ? e->memory : 0), e ? e->bytes : 0u, e ? e->usage : 0u,
                  e ? e->bind : 0u);
     }
-    gxvk::retire(gxvk::handle_index(handle), gxvk::handle_gen(handle), gxvk::kRetireCompare);
+    if (kind != gxvk_kLayout) gxvk::retire(gxvk::handle_index(handle), gxvk::handle_gen(handle), gxvk::kRetireCompare);
 }
 
 }  // namespace
 
 bool gxvk_buffers_bind_mode() { return gxvk::buffers_mode() == gxvk::Buffers::kOn; }
 
+namespace {
+bool g_last_ended = false;  // the last resolve bound an entry retired by its end (the command processor's)
+}  // namespace
+bool gxvk_last_resolve_ended() { return g_last_ended; }
+
 int gxvk_resolve_locked(int use, std::uint32_t handle, std::uint64_t holder, std::uint64_t va, std::uint64_t bytes, Located& out) {
-    (void)use;
+    g_last_ended = false;
     BufferEntry* e = gxvk::entry_at(gxvk::handle_index(handle));
     if (!e) return gxvk::kFallStale;
     const std::uint32_t w = e->word.load(std::memory_order_acquire);
-    if (gxvk::entry_gen(w) != gxvk::handle_gen(handle) || e->holder != holder) return gxvk::kFallStale;
+    if (gxvk::entry_gen(w) != gxvk::handle_gen(handle)) return gxvk::kFallRecycled;
+    if (e->holder != holder) return gxvk::kFallStale;
     const std::uint32_t st = gxvk::entry_state(w);
-    if (st == gxvk::kEntryRetired) return gxvk::kFallRetired;
-    if (st != gxvk::kEntryMade && st != gxvk::kEntryPlaced) return gxvk::kFallStale;
-    if (va < e->memory || va - e->memory > e->bytes || bytes > e->bytes - (va - e->memory)) return gxvk::kFallRange;
+    // Retired by its end: the copy, if there is one, is what the draw reads.
+    const bool ended = st == gxvk::kEntryRetired && gxvk::retired_by_end(e->retired_why.load(std::memory_order_relaxed)) && e->vk_buffer;
+    if (st == gxvk::kEntryRetired && !ended) return gxvk::kFallRetired;
+    if (st != gxvk::kEntryMade && st != gxvk::kEntryPlaced && !ended) return gxvk::kFallStale;
+    if (va < e->memory || va - e->memory >= e->bytes) return gxvk::kFallRange;
+    if (bytes > e->bytes - (va - e->memory)) {
+        if (use != gxvk::kUseVertex) return gxvk::kFallRange;
+        bump(g_overrun);
+    }
     if (st == gxvk::kEntryMade) {
         if (const int r = place_locked(*e, handle); r != gxvk::kFalls) return r;
     }
     out.buffer = reinterpret_cast<VkBuffer>(e->vk_buffer);
     out.offset = e->vk_offset + (va - e->memory);
     out.avail = e->bytes - (va - e->memory);
+    if (ended) {
+        g_last_ended = true;
+        bump(gxvk::g_bound_after_end[use]);
+        return gxvk::kFalls;  // its memory may hold another's bytes by now: no hash check
+    }
     if (compare_mode()) {
         // The buffer's bytes as they were copied: the first bindings, then one in 64.
         const std::uint32_t n = e->binds++;
@@ -338,15 +367,30 @@ void gxvk_disagree_locked(int kind, std::uint32_t handle) {
 
 void gxvk_begin_recording_locked() {
     if (!gxvk::buffers_on()) return;
+    const std::uint64_t flip = hle_video_flip_count();
+    const auto take_back = [](std::uint32_t index) {
+        if (BufferEntry* e = gxvk::entry_at(index)) let_go_locked(*e);
+        gxvk::recycle(index);
+        g_taken_back.fetch_add(1, std::memory_order_relaxed);
+    };
     std::uint32_t taken[256];
     for (;;) {
         const std::size_t n = gxvk::take_retired(taken, 256);
         for (std::size_t k = 0; k < n; ++k) {
-            if (BufferEntry* e = gxvk::entry_at(taken[k])) let_go_locked(*e);
-            gxvk::recycle(taken[k]);
+            BufferEntry* e = gxvk::entry_at(taken[k]);
+            // One retired by its end, copied: bound for the draws before its
+            // end that are still to come, taken back some flips on.
+            if (e && e->vk_buffer && gxvk::retired_by_end(e->retired_why.load(std::memory_order_relaxed))) {
+                g_ending.emplace_back(taken[k], flip + kEndFlips);
+            } else {
+                take_back(taken[k]);
+            }
         }
-        g_taken_back.fetch_add(n, std::memory_order_relaxed);
         if (n < 256) break;
+    }
+    while (!g_ending.empty() && g_ending.front().second <= flip) {
+        take_back(g_ending.front().first);
+        g_ending.pop_front();
     }
     reclaim_locked();
 }
@@ -377,10 +421,13 @@ std::string gxvk_report() {
     };
     for (int use = gxvk::kUseVertex; use <= gxvk::kUseIndex; ++use) {
         const std::uint64_t by = bound(use), all = by + falls(use, false), gx = by + falls(use, true);
-        std::snprintf(b, sizeof b, "%sgxvk buffers: %s by handle %llu (%.1f%% of all, %.1f%% of those with a GX object); today's path:",
+        std::snprintf(b, sizeof b,
+                      "%sgxvk buffers: %s by handle %llu (%.1f%% of all, %.1f%% of those with a GX object; %llu after their buffer's end); "
+                      "today's path:",
                       s.empty() ? "" : "\n", use == gxvk::kUseVertex ? "vertex records" : "index ranges", static_cast<ull>(by),
                       all ? 100.0 * static_cast<double>(by) / static_cast<double>(all) : 0.0,
-                      gx ? 100.0 * static_cast<double>(by) / static_cast<double>(gx) : 0.0);
+                      gx ? 100.0 * static_cast<double>(by) / static_cast<double>(gx) : 0.0,
+                      static_cast<ull>(gxvk::g_bound_after_end[use].load()));
         s += b;
         bool any = false;
         for (int k = 0; k < gxvk::kFalls; ++k) {
@@ -394,12 +441,13 @@ std::string gxvk_report() {
     }
     std::snprintf(b, sizeof b,
                   "\ngxvk buffers: copies placed %llu in video memory (%llu MiB), %llu in host memory (%llu MiB); pool blocks made %llu + %llu, "
-                  "holding %llu + %llu MiB now; %llu uploads (%llu MiB, %llu through staging); ranges freed %llu, entries taken back %llu",
+                  "holding %llu + %llu MiB now; %llu uploads (%llu MiB, %llu through staging); ranges freed %llu, entries taken back %llu; "
+                  "vertex bindings whose V# counts past the buffer's end %llu",
                   static_cast<ull>(g_placed[0].load()), static_cast<ull>(g_placed_bytes[0].load() >> 20), static_cast<ull>(g_placed[1].load()),
                   static_cast<ull>(g_placed_bytes[1].load() >> 20), static_cast<ull>(g_blocks_made[0].load()), static_cast<ull>(g_blocks_made[1].load()),
                   static_cast<ull>(g_block_bytes[0].load() >> 20), static_cast<ull>(g_block_bytes[1].load() >> 20), static_cast<ull>(g_uploads.load()),
                   static_cast<ull>(g_upload_bytes.load() >> 20), static_cast<ull>(g_staged.load()), static_cast<ull>(g_ranges_freed.load()),
-                  static_cast<ull>(g_taken_back.load()));
+                  static_cast<ull>(g_taken_back.load()), static_cast<ull>(g_overrun.load()));
     s += b;
     if (compare_mode()) {
         std::uint64_t total = 0;

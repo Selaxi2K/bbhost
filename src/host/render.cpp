@@ -13365,7 +13365,7 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
     const bool handles = gxvk::buffers_on() && !t_gxvk_no_handles;
     const bool handles_bind = handles && gxvk_buffers_bind_mode();
     Located by_handle[16];
-    bool handle_el[16] = {};
+    bool handle_el[16] = {}, ended_el[16] = {};
     std::int8_t slot_result[16];
     std::memset(slot_result, -1, sizeof slot_result);
     // The device-local copy of each vertex record, once per record: its
@@ -13419,6 +13419,7 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
                                   : gxvk_resolve_locked(gxvk::kUseVertex, h, holder, va, need, by_handle[e]);
             if (slot_result[fe.slot] < 0 || slot_result[fe.slot] == gxvk::kFalls) slot_result[fe.slot] = static_cast<std::int8_t>(r);
             handle_el[e] = r == gxvk::kFalls;
+            ended_el[e] = handle_el[e] && gxvk_last_resolve_ended();
             if (handle_el[e] && handles_bind) {
                 gcn::VertexElement ve;
                 ve.location = static_cast<std::uint32_t>(e);
@@ -13598,12 +13599,17 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
             loc.offset = rs->whole.offset + fe.offset;
         }
         // BBHOST_GXVK_BUFFERS=2: today's path must find the bytes of an
-        // element the handle serves in guest memory as it stands.
-        if (handle_el[e]) {
+        // element the handle serves in guest memory as it stands (not for a
+        // buffer bound after its end, whose memory may be another's now).
+        if (handle_el[e] && !ended_el[e]) {
             const std::uint32_t h = o.vtx_handle[fe.slot];
+            std::int64_t last = 0;
             if (version == kCopyVersionInside) gxvk_disagree_locked(gxvk_kCopyVersion, h);
             else if (windowed) gxvk_disagree_locked(gxvk_kWindow, h);
             else if (snapped || rs->snapped) gxvk_disagree_locked(gxvk_kSnapshot, h);
+            else if (by_handle[e].avail < need && draw_last_vertex(last) && last >= 0 &&
+                     static_cast<std::uint64_t>(last) * stride + bytes > by_handle[e].avail)
+                gxvk_disagree_locked(gxvk_kPastEnd, h);
         }
         gcn::VertexElement ve;
         ve.location = static_cast<std::uint32_t>(e);

@@ -16,7 +16,7 @@
 
 namespace gxvk {
 
-std::atomic<std::uint64_t> g_bound[kUses] = {}, g_fallback[kUses][kFalls] = {};
+std::atomic<std::uint64_t> g_bound[kUses] = {}, g_fallback[kUses][kFalls] = {}, g_bound_after_end[kUses] = {};
 std::atomic<std::uint64_t> g_made[2] = {}, g_not_kept[8] = {}, g_retired[kRetires] = {};
 
 namespace {
@@ -153,10 +153,10 @@ void buffer_made(std::uint64_t holder, std::uint64_t memory, std::uint32_t bytes
     std::uint32_t handle = 0;
     {
         std::lock_guard<std::mutex> lk(g_mu);
-        // A holder or a memory the table still has as live: GX gave it to
-        // this buffer without the host hearing of the old one's end.
+        // A holder or memory the table still has as live: GX gave it to this
+        // buffer without the host hearing of the old one's end.
         if (auto h = g_by_holder.find(holder); h != g_by_holder.end()) retire_live_locked(h->second, kRetireReplaced);
-        if (auto m = g_by_memory.find(memory); memory && m != g_by_memory.end()) retire_live_locked(m->second, kRetireReplaced);
+        if (memory && bytes) retire_overlapping_locked(memory, bytes, kRetireReplaced);
         std::uint32_t index = 0;
         if (why < 0 && !take_index(index)) why = 7;
         if (why >= 0) {

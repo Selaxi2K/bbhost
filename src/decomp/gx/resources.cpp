@@ -248,6 +248,7 @@ GUEST_ABI u32 compare_create_buffer(u64 device, u64 out, u64 desc, u64 initial_d
 }
 
 void report() {
+    if (!g_made.load() && !g_refused_desc.load() && !g_refused_resource.load() && !g_refused_holder.load()) return;  // the compare run's
     host_log("decomp: gx_create_buffer made %llu buffers; refused %llu descriptions, %llu for the resource, %llu for the holder",
              static_cast<ull>(g_made.load()), static_cast<ull>(g_refused_desc.load()), static_cast<ull>(g_refused_resource.load()),
              static_cast<ull>(g_refused_holder.load()));

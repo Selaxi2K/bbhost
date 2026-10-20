@@ -59,6 +59,12 @@ BufferEntry* entry_at(std::uint32_t index);
 // generation, its index reusable).
 std::size_t take_retired(std::uint32_t* out, std::size_t cap);
 void recycle(std::uint32_t index);
+// An entry retired by its buffer's end - the holder released, the memory
+// unmapped or given to a new resource - rather than by a write: its copy
+// still holds what every draw recorded before the end reads, and no later
+// draw carries its handle (a new buffer in that holder or memory has a new
+// one). The command processor binds it until it takes it back, some flips on.
+inline bool retired_by_end(std::uint32_t why) { return why == kRetireGone || why == kRetireUnmap || why == kRetireReplaced; }
 // Retires an entry from any thread (from made or placed; a no-op for one
 // retired or free already, or of another generation): counted by `why`, and
 // queued for the command processor to take back.
@@ -68,8 +74,9 @@ bool retire(std::uint32_t index, std::uint32_t gen, Retire why);
 enum Fallback : int {
     kFallNoObject,     // no GX object behind the binding (Scaleform, YEBIS, a table the game binds itself)
     kFallNoHandle,     // a GX buffer the host does not keep (dynamic, a constant buffer, written by the GPU, made before the switch)
-    kFallStale,        // a handle that names no live entry of that holder (an older generation, a clobbered dword)
-    kFallRetired,      // its entry retired: written since, its holder dead, its memory unmapped
+    kFallStale,        // a handle that names no entry of that holder (a clobbered dword)
+    kFallRecycled,     // its entry taken back since the call (its buffer ended long before the draw ran)
+    kFallRetired,      // its entry retired by a write since (UpdateSubresource, a Map, a GPU copy), or ended before it was copied
     kFallRange,        // the range bound runs past the buffer's end
     kFallNoRoom,       // no device memory and no host memory for the copy
     kFallNoSource,     // the buffer's bytes could not be reached for the copy
@@ -78,6 +85,7 @@ enum Fallback : int {
     kFalls,
 };
 extern std::atomic<std::uint64_t> g_bound[kUses], g_fallback[kUses][kFalls];
+extern std::atomic<std::uint64_t> g_bound_after_end[kUses];  // of g_bound: by an entry retired by its end
 extern std::atomic<std::uint64_t> g_made[2], g_not_kept[8], g_retired[kRetires];
 
 }  // namespace gxvk
