@@ -385,6 +385,7 @@ set(BBHOST_DECOMP_SOURCES
   src/decomp/memory/ez_copy.cpp
   src/decomp/sfx/ribbons.cpp
   src/decomp/sfx/step_gate.cpp
+  src/decomp/sfx/node_update.cpp
   src/decomp/sync/adaptive_mutex.cpp
   src/decomp/sync/ez_work.cpp
 )
@@ -583,6 +584,7 @@ if(UNIX)
   bbhost_decomp_test(follow_camera SOURCES src/decomp/camera/follow_camera.cpp src/engine/mouse_camera_stubs.cpp ARGS 2000)
   bbhost_decomp_test(sfx_ribbons SOURCES src/core/write_watch.cpp)
   bbhost_decomp_test(sfx_step_gate)
+  bbhost_decomp_test(sfx_node_update)
   bbhost_decomp_test(adaptive_mutex)
   bbhost_decomp_test(ez_work)
   bbhost_decomp_test(ez_node_cache)
