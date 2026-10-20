@@ -346,6 +346,9 @@ struct Pass {
     std::uint64_t targets[9] = {};  // its attachments' bases (lazy pass barriers)
     int ntargets = 0;
     bool profiled = false;  // BBHOST_GPU_PROFILE=3: a timestamp pair is open around it
+    // Its attachments a draw of it has written so far: bit t colour slot t, bit
+    // 8 depth or stencil (the feedback census, note_feedback_loops).
+    std::uint32_t written = 0;
 };
 Pass g_pass;
 const std::string* g_pass_profile_name = nullptr;  // the profile name of the draw beginning the next pass (BBHOST_GPU_PROFILE=3)
@@ -9421,6 +9424,109 @@ bool queue_gs_pipeline(std::uint64_t key, const DrawState& s, const std::vector<
 }
 
 // ---- pass management ------------------------------------------------------------
+// Depth targets whose first pass loads them as nothing made them - no clear,
+// copy or carry before it (a new colour target starts zeroed, BBHOST_RT_ZERO; a
+// depth target does not): whatever the image heap held, on every GPU, and on
+// AMD's its depth metadata set up over those bytes. By whether the draw that
+// begins the pass tests depth or stencil against them ([0], the first named) or
+// only writes or ignores them ([1]), for the exit report (cross_vendor_report).
+std::atomic<std::uint64_t> g_depth_first_unmade[2] = {};
+void note_depth_first_pass(const RtImage& r, const DrawState& s) {
+    GfxFixedState f;
+    fixed_raster_depth(s, f);
+    const bool reads = (f.depth_test && f.depth_compare != VK_COMPARE_OP_ALWAYS) || f.stencil_test || f.depth_bounds_test;
+    g_depth_first_unmade[reads ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<int> logs{0};
+    if (reads && logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+        host_log("render: depth target 0x%llx %ux%u format %d: its first pass %s against bytes nothing wrote (flip %llu)",
+                 static_cast<unsigned long long>(r.base), r.width, r.height, static_cast<int>(r.format),
+                 f.depth_test && f.depth_compare != VK_COMPARE_OP_ALWAYS ? "depth-tests" : f.stencil_test ? "stencil-tests" : "bounds-tests",
+                 static_cast<unsigned long long>(hle_video_flip_count()));
+    }
+}
+
+// Feedback loops: a draw that samples an image its own pass draws into (a T#
+// at an attachment's base) - undefined in Vulkan unless nothing in the pass
+// writes it as an attachment (VUID-vkCmdDraw-None-06538/06539), and out of the
+// validation layer's sight through the bindless set. Without a barrier between
+// the write and the read, what the read sees is the driver's (a compressed
+// target's texels read through metadata not written back yet, on some).
+// Draws counted by the worst of what they read: [0] an attachment the
+// draw itself writes, [1] one an earlier draw of the pass wrote, [2] one
+// nothing in the pass has written so far (allowed); the first of [0] and [1]
+// named. BBHOST_FEEDBACK_CENSUS=1, or with the validation layer on: a few
+// compares a draw, skipped otherwise.
+std::atomic<std::uint64_t> g_feedback_draws[3] = {};
+bool feedback_census_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_FEEDBACK_CENSUS");
+        return (e && e[0] == '1') || validation_on();
+    }();
+    return on;
+}
+void note_feedback_loops(const DrawState& s, const StageImages* stages, int nstages, const std::string& pipeline) {
+    std::uint32_t mine = 0;  // the attachments this draw writes, as Pass::written
+    for (int t = 0; t < 8; ++t) {
+        if (s.color[t] && s.color_mask[t]) mine |= 1u << t;
+    }
+    if (s.depth) {
+        GfxFixedState f;
+        fixed_raster_depth(s, f);
+        const auto writes = [](const VkStencilOpState& o) {
+            return o.failOp != VK_STENCIL_OP_KEEP || o.passOp != VK_STENCIL_OP_KEEP || o.depthFailOp != VK_STENCIL_OP_KEEP;
+        };
+        if (f.depth_write || (f.stencil_test && (writes(f.front) || writes(f.back)))) mine |= 1u << 8;
+    }
+    int worst = 3;
+    for (int st = 0; st < nstages; ++st) {
+        for (const StageImages::Image& im : stages[st].images) {
+            if (!im.resolved) continue;
+            const std::uint64_t base = tsharp_base(im.w);
+            // The layers the T# reads (BASE_ARRAY .. LAST_ARRAY): another layer
+            // of a layered target than the one drawn is no loop.
+            const std::uint32_t first_layer = im.w[5] & 0x1fff, last_layer = std::max(first_layer, (im.w[5] >> 13) & 0x1fff);
+            for (int t = 0; t <= 8; ++t) {
+                const RtImage* r = t < 8 ? s.color[t] : s.depth;
+                if (!r || r->base != base) continue;
+                const std::uint32_t layer = t < 8 ? s.color_layer[t] : s.depth_layer;
+                if (r->layers > 1 && (layer < first_layer || layer > last_layer)) continue;
+                const int kind = (mine >> t) & 1 ? 0 : (g_pass.written >> t) & 1 ? 1 : 2;
+                if (kind < 2) {
+                    static std::atomic<int> logs{0};
+                    if (logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+                        host_log("render: pipeline %s: its %s stage samples 0x%llx, its pass's %s%s, which %s (flip %llu)", pipeline.c_str(),
+                                 st ? "pixel" : "vertex", static_cast<unsigned long long>(base), t < 8 ? "colour target " : "depth target",
+                                 t < 8 ? std::to_string(t).c_str() : "", kind == 0 ? "the draw writes" : "an earlier draw of the pass wrote",
+                                 static_cast<unsigned long long>(hle_video_flip_count()));
+                    }
+                }
+                worst = std::min(worst, kind);
+            }
+        }
+    }
+    if (worst < 3) g_feedback_draws[worst].fetch_add(1, std::memory_order_relaxed);
+    g_pass.written |= mine;
+}
+
+// Draws the PS4 rasterizes nothing for (PA_CL_CLIP_CNTL.DX_RASTERIZATION_KILL,
+// bit 22), which ours rasterize; and point-list draws whose last vertex stage
+// writes no PointSize - Vulkan leaves their size undefined (the validation
+// layer's topology-08773, flagged on whole pipelines only), where GCN takes
+// PA_SU_POINT_SIZE. Counted, [0] killed, [1] unsized points, the first named.
+std::atomic<std::uint64_t> g_raster_census[2] = {};
+void note_raster_census(const DrawState& s, const GfxPipeline& pl) {
+    const bool kill = ((s.clip_cntl >> 22) & 1) != 0;
+    const bool unsized = s.topo == VK_PRIMITIVE_TOPOLOGY_POINT_LIST && !s.gs && !s.tess_hw && !s.domain_level && !pl.vs.meta().vs_point_size;
+    if (kill) g_raster_census[0].fetch_add(1, std::memory_order_relaxed);
+    if (unsized) g_raster_census[1].fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<int> logs{0};
+    if ((kill || unsized) && logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+        host_log("render: pipeline %s: a draw %s%s%s (PA_CL_CLIP_CNTL %08x, flip %llu)", pl.name.c_str(), kill ? "the PS4 rasterizes nothing for" : "",
+                 kill && unsized ? ", and " : "", unsized ? "of points whose vertex stage writes no PointSize" : "", s.clip_cntl,
+                 static_cast<unsigned long long>(hle_video_flip_count()));
+    }
+}
+
 // The barrier a pass ended between draws still owes, paid now (no pass open).
 void pay_pass_barrier_locked() {
     if (g_hazards.owed) {
@@ -9505,6 +9611,7 @@ void begin_pass(const DrawState& s, std::uint64_t key, bool hazard = false) {
     VkRenderingAttachmentInfo depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
     VkRenderingAttachmentInfo stencil{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
     if (s.depth) {
+        if (!s.depth->initialised && !(s.depth->view_clear && s.depth->view_clear_load)) note_depth_first_pass(*s.depth, s);
         ensure_initialised(*s.depth);
         depth.imageView = attachment_view(*s.depth, s.depth_layer);
         depth.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -9552,6 +9659,7 @@ void begin_pass(const DrawState& s, std::uint64_t key, bool hazard = false) {
     g_pass.key = key;
     g_pass.extent = extent;
     g_pass.ntargets = 0;
+    g_pass.written = 0;
     for (int t = 0; t < 8; ++t) {
         if (s.color[t]) g_pass.targets[g_pass.ntargets++] = s.color[t]->base;
     }
@@ -10645,6 +10753,17 @@ void cross_vendor_report() {
              static_cast<ull>(g_compare_guarded.load()));
     host_log("render: pipelines whose pixel shader discards by clip distances at entry (built for draws or from the manifest): %llu",
              static_cast<ull>(g_clip_discard_pipelines.load()));
+    host_log("render: draws the PS4 rasterizes nothing for (DX_RASTERIZATION_KILL) %llu, point-list draws whose vertex stage writes no "
+             "PointSize %llu",
+             static_cast<ull>(g_raster_census[0].load()), static_cast<ull>(g_raster_census[1].load()));
+    host_log("render: depth targets whose first pass loads bytes nothing wrote: %llu test depth or stencil against them, %llu do not",
+             static_cast<ull>(g_depth_first_unmade[0].load()), static_cast<ull>(g_depth_first_unmade[1].load()));
+    if (feedback_census_on()) {
+        host_log("render: draws sampling an attachment of their own pass (BBHOST_FEEDBACK_CENSUS): %llu one the draw writes, %llu one an "
+                 "earlier draw of the pass wrote, %llu one nothing in the pass has written",
+                 static_cast<ull>(g_feedback_draws[0].load()), static_cast<ull>(g_feedback_draws[1].load()),
+                 static_cast<ull>(g_feedback_draws[2].load()));
+    }
     host_log("render: cross-vendor switches: PS input defaults %s (BBHOST_PS_INPUT_DEFAULTS), subgroup stages 0x%x (BBHOST_SUBGROUP_GATE), "
              "barrier masks %s (BBHOST_BARRIER_MASKS), layout fixes %s (BBHOST_LAYOUT_FIXES; copies into a target never made GENERAL %llu), "
              "sampler fixes %s (BBHOST_SAMPLER_FIXES)",
@@ -19301,6 +19420,7 @@ static bool draw_impl(const GpuDraw& d) {
     }
     g_pass_profile_name = &bind_pl->profile_name;
     begin_pass(s, pass_key(s), sample_hazard);
+    if (feedback_census_on()) note_feedback_loops(s, stage_images, 2, bind_pl->name);
     draw_stamp.to(kRenderCostPass);
     // Drivers finalise a pipeline's ISA on first use, so a pathological
     // translated shader shows up as a hang in vkCmdBindPipeline rather than in
@@ -19671,6 +19791,7 @@ static bool draw_impl(const GpuDraw& d) {
     bump(g.draws);  // the one writer, under g.mu: no locked add
     bump(g.draws_ps[draw_ps_kind(*bind_pl)]);
     if (bind_pl->clip_discard) bump(g.draws_clip_discard);
+    if (((s.clip_cntl >> 22) & 1) || s.topo == VK_PRIMITIVE_TOPOLOGY_POINT_LIST) note_raster_census(s, *bind_pl);
     const int vs_kind = draw_vs_kind(*bind_pl, use_vertex_input, fetch_words.empty() && !s.tess_hw && !s.domain_level);
     bump(g.draws_vs[vs_kind]);
     if (bind_pl->tess_hw) {
