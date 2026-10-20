@@ -33,6 +33,7 @@ struct BufferEntry {
     std::uint32_t bytes = 0;
     std::uint8_t usage = 0, bind = 0;
     std::atomic<std::uint8_t> retired_why{0};
+    std::int8_t watch_slot = -1;  // a default buffer's slot in the copy watch (gxvk_buffers.cpp), under the table's lock
     // The command processor's alone (under its lock): the placed copy.
     std::uint64_t vk_buffer = 0, vk_offset = 0;
     std::int32_t block = -1;
@@ -86,6 +87,6 @@ enum Fallback : int {
 };
 extern std::atomic<std::uint64_t> g_bound[kUses], g_fallback[kUses][kFalls];
 extern std::atomic<std::uint64_t> g_bound_after_end[kUses];  // of g_bound: by an entry retired by its end
-extern std::atomic<std::uint64_t> g_made[2], g_not_kept[8], g_retired[kRetires];
+extern std::atomic<std::uint64_t> g_made[2], g_not_kept[9], g_retired[kRetires];
 
 }  // namespace gxvk

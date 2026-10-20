@@ -2843,18 +2843,24 @@ std::atomic<std::uint64_t> g_copy_calls{0}, g_copy_tokens{0}, g_copy_ranges{0}, 
 // shaders copy size >> 2 whole dwords.
 std::uint64_t native_copy(Kind kind, const std::uint64_t* f) {
     // A GX buffer the host keeps a copy of is immutable, which no copy may
-    // write: the compare mode retires (and counts) one a copy writes all the
-    // same (host/gxvk.h).
-    if (gxvk::watch_writes()) {
+    // write, or default, which one may: a copy into a kept buffer retires it
+    // (host/gxvk.h) - the compare mode looks every destination up under the
+    // table's lock, as a check; the handles test it against the default ones'
+    // ranges without one.
+    if (gxvk::buffers_on()) {
+        const bool all = gxvk::watch_writes();
         if (kind == kCopyBuffers) {
             const std::uint64_t entries = f[2];
             const std::uint32_t count = static_cast<std::uint32_t>(f[1]);
             for (std::uint32_t i = 0; entries && i < count; ++i) {
                 const std::uint64_t e = entries + 0x18ull * i;
-                gxvk::memory_written(rd64(e), rd32(e + 0x10), gxvk::kRetireCopy);
+                if (all) gxvk::memory_written(rd64(e), rd32(e + 0x10), gxvk::kRetireCopy);
+                else gxvk::copy_written(rd64(e), rd32(e + 0x10));
             }
-        } else {
+        } else if (all) {
             gxvk::memory_written(f[4], f[0] & 0xffffffffull, gxvk::kRetireCopy);
+        } else {
+            gxvk::copy_written(f[4], f[0] & 0xffffffffull);
         }
     }
     // The sources are renamed copies GX writes back (or CopyResource's

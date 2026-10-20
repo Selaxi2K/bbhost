@@ -142,6 +142,11 @@ constexpr std::uint8_t kCreate1DPrologue[20] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x
 #define BB_PUSH6 0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53
 constexpr std::uint8_t kPrologue58[17] = {BB_PUSH6, 0x48, 0x83, 0xec, 0x58};  // the three creators and Map
 constexpr std::uint8_t kRingPrologue[17] = {BB_PUSH6, 0x48, 0x83, 0xec, 0x28};
+// GX's UpdateSubresource of a buffer that is not a constant buffer starts its
+// compute copy here (ctx, resource = holder + 0x18, data, offset, bytes); a
+// constant buffer's update never reaches it (0x2568a20 renames those).
+constexpr std::uint64_t kStaticBufferUpdate = 0x2ab3560;
+constexpr std::uint8_t kStaticUpdatePrologue[17] = {BB_PUSH6, 0x48, 0x83, 0xec, 0x18};
 constexpr std::uint8_t kDsvPrologue[17] = {BB_PUSH6, 0x48, 0x83, 0xec, 0x68};  // the render-target view creator's is kPrologue58
 // YEBIS's own D3D11-shaped device and context (vtables 0x5708810 / 0x570a380),
 // which keep its textures and buffers out of GX: CreateTexture2D (slot 5 ->
@@ -806,6 +811,13 @@ void note_map(std::uint64_t holder, std::uint64_t type, std::uint64_t mapped_out
 GUEST_ABI std::int64_t create_hook(std::uint64_t id, const std::uint64_t* saved) {
     t_pending.push_back({saved[6], static_cast<Kind>(id), saved[4], saved[3], saved[2]});
     const_cast<std::uint64_t*>(saved)[6] = reinterpret_cast<std::uint64_t>(&gx_res_ret);
+    return 0;
+}
+
+// GX on Vulkan (host/gxvk.h): a buffer's update by a GPU copy - a kept
+// default buffer's entry is retired (a lock only for a holder with a handle).
+GUEST_ABI std::int64_t static_update_hook(std::uint64_t, const std::uint64_t* saved) {
+    if (saved[4]) gxvk::buffer_written(saved[4] - 0x18, gxvk::kRetireUpdate);
     return 0;
 }
 
@@ -1490,6 +1502,8 @@ void gx_resources_install(ElfImage* image) {
         }
     };
     hook(kCreateTexture, kPrologue58, sizeof(kPrologue58), reinterpret_cast<void*>(&create_hook), kTexture);
+    if (gxvk::buffers_on())
+        hook(kStaticBufferUpdate, kStaticUpdatePrologue, sizeof(kStaticUpdatePrologue), reinterpret_cast<void*>(&static_update_hook), 0);
     hook(kCreateTexture3D, kPrologue58, sizeof(kPrologue58), reinterpret_cast<void*>(&create_hook), kTexture3D);
     hook(kMap, kPrologue58, sizeof(kPrologue58), reinterpret_cast<void*>(&map_hook), 0);
     if (g_tex_ahead) hook(kTsharpBuild, kTsharpBuildPrologue, sizeof(kTsharpBuildPrologue), reinterpret_cast<void*>(&tsharp_hook), 0);

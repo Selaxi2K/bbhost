@@ -17,16 +17,16 @@
 namespace gxvk {
 
 std::atomic<std::uint64_t> g_bound[kUses] = {}, g_fallback[kUses][kFalls] = {}, g_bound_after_end[kUses] = {};
-std::atomic<std::uint64_t> g_made[2] = {}, g_not_kept[8] = {}, g_retired[kRetires] = {};
+std::atomic<std::uint64_t> g_made[2] = {}, g_not_kept[9] = {}, g_retired[kRetires] = {};
 
 namespace {
 
 using ull = unsigned long long;
 
 // Why a buffer is not kept, by the not-kept counts' index.
-const char* const kNotKept[8] = {"dynamic or staging", "default (UpdateSubresource and GPU copies may write it)", "CPU access", "a constant buffer",
+const char* const kNotKept[9] = {"dynamic or staging", "default without initial data", "CPU access", "a constant buffer",
                                  "a bind the GPU writes (unordered access, stream output)", "no vertex or index bind",
-                                 "CPU-only memory (misc 0x4000)", "the table full"};
+                                 "CPU-only memory (misc 0x4000)", "the table full", "default, past the copy watch's slots"};
 const char* const kRetireName[kRetires] = {"updated", "mapped", "a GPU copy's destination", "its holder released", "its memory unmapped",
                                            "replaced", "a compare disagreed", "no memory for its copy", "its bytes out of reach"};
 
@@ -41,15 +41,45 @@ std::vector<std::uint32_t> g_free, g_retired_q;
 std::unordered_map<std::uint64_t, std::uint32_t> g_by_holder;
 std::map<std::uint64_t, std::uint32_t> g_by_memory;
 
-// Only immutable buffers are kept: Direct3D 11 - and GX after it - lets
-// nothing write one after its creation (no Map, no UpdateSubresource, no copy
-// into it), so nothing on GX's threads has to tell the table of a write.
-// (The 1a census found no UpdateSubresource of any buffer but constant
-// buffers; default buffers with data were 7-13 a session.)
+// The copy watch: the kept default buffers' ranges, which a GPU copy may
+// write. A slot is [lo, hi) with lo 0 when free; set and cleared under the
+// table's lock, read without it by every copy (copy_written).
+constexpr int kWatchSlots = 64;
+std::atomic<std::uint64_t> g_watch_lo[kWatchSlots] = {}, g_watch_hi[kWatchSlots] = {};
+std::atomic<int> g_watch_used{0};
+
+int watch_add_locked(std::uint64_t lo, std::uint64_t hi) {
+    for (int i = 0; i < kWatchSlots; ++i) {
+        if (g_watch_lo[i].load(std::memory_order_relaxed)) continue;
+        g_watch_hi[i].store(hi, std::memory_order_relaxed);
+        g_watch_lo[i].store(lo, std::memory_order_release);
+        g_watch_used.fetch_add(1, std::memory_order_relaxed);
+        return i;
+    }
+    return -1;
+}
+
+void watch_remove_locked(BufferEntry& e) {
+    if (e.watch_slot < 0) return;
+    g_watch_lo[e.watch_slot].store(0, std::memory_order_release);
+    g_watch_used.fetch_sub(1, std::memory_order_relaxed);
+    e.watch_slot = -1;
+}
+
+
+// Kept: immutable buffers, which Direct3D 11 - and GX after it - lets nothing
+// write after their creation (no Map, no UpdateSubresource, no copy into
+// them), and default ones made with data, which only an UpdateSubresource or
+// a GPU copy may write: GX's update of a buffer that is not a constant
+// buffer is hooked where it starts its copy (0x2ab3560, which no constant
+// buffer's update reaches; engine/gx_resources.cpp), and every copy's
+// destination is tested against the default ones' ranges without a lock
+// (copy_written). Nothing on GX's threads takes the table's lock for a
+// buffer it does not keep. (The 1a census: 7-13 default buffers with data a
+// session, and some of the most bound - a shared index buffer among them.)
 int not_kept(std::uint8_t usage, std::uint8_t cpu, std::uint8_t bind, std::uint32_t misc, bool initial_data) {
-    (void)initial_data;  // an immutable buffer always has it (the creator refuses one without)
     if (usage >= 2) return 0;
-    if (usage == 0) return 1;
+    if (usage == 0 && !initial_data) return 1;
     if (cpu) return 2;
     if (bind & 4) return 3;
     if (bind & 0x90) return 4;
@@ -90,6 +120,7 @@ bool retire_locked(std::uint32_t index, std::uint32_t gen, Retire why) {
     }
     e->retired_why.store(static_cast<std::uint8_t>(why), std::memory_order_relaxed);
     g_retired[why].fetch_add(1, std::memory_order_relaxed);
+    watch_remove_locked(*e);
     forget_locked(index, *e);
     g_retired_q.push_back(index);
     return true;
@@ -186,7 +217,13 @@ void buffer_made(std::uint64_t holder, std::uint64_t memory, std::uint32_t bytes
         if (auto h = g_by_holder.find(holder); h != g_by_holder.end()) retire_live_locked(h->second, kRetireReplaced);
         if (memory && bytes) retire_overlapping_locked(memory, bytes, kRetireReplaced);
         std::uint32_t index = 0;
+        int slot = -1;
+        if (why < 0 && usage == 0 && (slot = watch_add_locked(memory, memory + bytes)) < 0) why = 8;
         if (why < 0 && !take_index(index)) why = 7;
+        if (why >= 0 && slot >= 0) {
+            g_watch_lo[slot].store(0, std::memory_order_release);
+            g_watch_used.fetch_sub(1, std::memory_order_relaxed);
+        }
         if (why >= 0) {
             g_not_kept[why].fetch_add(1, std::memory_order_relaxed);
         } else {
@@ -203,6 +240,7 @@ void buffer_made(std::uint64_t holder, std::uint64_t memory, std::uint32_t bytes
             e.placed_serial = 0;
             e.hash = 0;
             e.binds = 0;
+            e.watch_slot = static_cast<std::int8_t>(slot);
             const std::uint32_t gen = entry_gen(e.word.load(std::memory_order_relaxed));
             e.word.store((gen << 8) | kEntryMade, std::memory_order_release);
             g_by_holder[holder] = index;
@@ -238,6 +276,17 @@ void buffer_written(std::uint64_t holder, Retire why) {
     if (auto h = g_by_holder.find(holder); h != g_by_holder.end()) retire_live_locked(h->second, why);
 }
 
+void copy_written(std::uint64_t va, std::uint64_t bytes) {
+    if (!bytes || !g_watch_used.load(std::memory_order_relaxed)) return;
+    for (int i = 0; i < kWatchSlots; ++i) {
+        const std::uint64_t lo = g_watch_lo[i].load(std::memory_order_acquire);
+        if (!lo || va >= g_watch_hi[i].load(std::memory_order_relaxed) || va + bytes <= lo) continue;
+        std::lock_guard<std::mutex> lk(g_mu);
+        retire_overlapping_locked(va, bytes, kRetireCopy);
+        return;
+    }
+}
+
 void memory_written(std::uint64_t va, std::uint64_t bytes, Retire why) {
     if (!buffers_on() || !bytes) return;
     std::lock_guard<std::mutex> lk(g_mu);
@@ -254,7 +303,7 @@ void buffers_report() {
     if (!buffers_on()) return;
     const char* const mode = buffers_mode() == Buffers::kCompare ? "compared (BBHOST_GXVK_BUFFERS=2)" : "bound by handle (BBHOST_GXVK_BUFFERS=1)";
     std::string nk;
-    for (int k = 0; k < 8; ++k) {
+    for (int k = 0; k < 9; ++k) {
         const std::uint64_t n = g_not_kept[k].load();
         if (!n) continue;
         char b[96];
