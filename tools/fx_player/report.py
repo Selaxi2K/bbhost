@@ -186,8 +186,11 @@ def fmt(v, f='%.2f'):
     return '-' if v is None else f % v
 
 
-def report(text, words, fams, base=None, name='', converted=None):
-    """base: a (log text, words) pair or a list of them; converted: the classes (default: by the build's count)."""
+def report(text, words, fams, base=None, name='', converted=None, off=None):
+    """base: a (log text, words) pair or a list of them; converted: the classes (default: by the build's count); off: a
+    (log text, words) pair of the same rate with the smooth steps off - with it, a family passes when none of its frames was
+    kept and what its effects count (lives, edges, emissions) is what they count with the steps off, and the base is shown
+    beside it (a rate's own difference from 30, which the steps off have too)."""
     bases = [] if base is None else (list(base) if isinstance(base, list) else [base])
     run = parse(text)
     if converted is None:
@@ -200,7 +203,7 @@ def report(text, words, fams, base=None, name='', converted=None):
     if run['done']:
         lines.append('  %d shots made; frames with a whole effect step %d, between %d' % run['done'])
         if run['ids_checked']:
-            lines.append('  effect ids read from the instances\' definitions, checked against their requests\' ids: %d checks, %d differ' % run['ids_checked'])
+            lines.append('  effect ids (named at their creation) checked against their requests\' ids: %d checks, %d differ' % run['ids_checked'])
     else:
         lines.append('  THE PLAN DID NOT FINISH (no "done" line): %d shots made' % len(run['shots']))
     lines.append('  the converted list: %d classes%s' % (len(converted), ' (the build names %d)' % run['converted_count'] if run['converted_count'] else ''))
@@ -234,6 +237,11 @@ def report(text, words, fams, base=None, name='', converted=None):
             bids_, _ = by_id(brun)
             for i, ends in bids_.items():
                 bstats[i].append(id_stats(ends, brun['fps'] or 30))
+    ostats = None
+    if off is not None:
+        orun = parse(off[0])
+        oids, _ = by_id(orun)
+        ostats = {i: [id_stats(e, orun['fps'] or 30)] for i, e in oids.items()}
     lines.append('')
     lines.append('per family and effect id (lives and rates: medians; frames: summed over the lives; words: per class, '
                  'frame words W / moving on the frames between M / held there H):')
@@ -290,41 +298,45 @@ def report(text, words, fams, base=None, name='', converted=None):
                 verdict.append('no frame between steps (every frame a whole step)')
             if st['f_whole'] + between:
                 fam_measured += 1
-            if run['smooth'] and between and (st['f_kept'] or conv_held):
+            if run['smooth'] and between and st['f_kept']:
                 fam_pass = False
             if between and st['f_smooth'] == 0:
                 fam_held = True
             fam_kept += st['f_kept']
-            if bstats is not None:
-                bl = bstats.get(i, [])
+            for label, stats, decides in (('the steps off', ostats, True), ('the base' + ('s' if len(bases) > 1 else ''), bstats, ostats is None)):
+                if stats is None:
+                    continue
+                bl = stats.get(i, [])
                 if not bl:
-                    verdict.append('not in the base')
-                else:
-                    def within(v, key, tol):
-                        vals = [b[key] for b in bl if b[key] is not None]
-                        if v is None or not vals:
-                            return True, '-'
-                        lo, hi = min(vals), max(vals)
-                        span = ('%.2f' % lo) if lo == hi else ('%.2f-%.2f' % (lo, hi))
-                        return lo - tol - 1e-6 <= v <= hi + tol + 1e-6, span
-                    ok_n, sn = within(st['n'], 'n', 1)
-                    ok_l, sl = within(st['life'], 'life', TICK)
-                    ok_e, se = within(st['edges'], 'edges', 1)
-                    ok_m, sm = within(st['emissions'], 'emissions', 1)
-                    ok = ok_n and ok_l and ok_e and ok_m
-                    verdict.append('against the base%s: lives %s, life %s s, edges %s, emissions %s a life: %s' % (
-                        's' if len(bases) > 1 else '', sn.split('.')[0] if '-' not in sn else sn, sl, se, sm,
-                        'within a tick' if ok else 'DIFFERS (%s)' % ', '.join(n for n, o in (('lives', ok_n), ('life', ok_l), ('edges', ok_e),
-                                                                                           ('emissions', ok_m)) if not o)))
-                    if not ok:
-                        fam_pass = False
+                    verdict.append('not in %s' % label)
+                    continue
+                def within(v, key, tol):
+                    vals = [b[key] for b in bl if b[key] is not None]
+                    if v is None or not vals:
+                        return True, '-'
+                    lo, hi = min(vals), max(vals)
+                    span = ('%.2f' % lo) if lo == hi else ('%.2f-%.2f' % (lo, hi))
+                    return lo - tol - 1e-6 <= v <= hi + tol + 1e-6, span
+                ok_n, sn = within(st['n'], 'n', 1)
+                # a life still running at the end is the run's length, not the effect's
+                ok_l, sl = (True, 'still') if st['still'] or any(b['still'] for b in bl) else within(st['life'], 'life', TICK)
+                ok_e, se = within(st['edges'], 'edges', 1)
+                ok_m, sm = within(st['emissions'], 'emissions', 1)
+                ok = ok_n and ok_l and ok_e and ok_m
+                verdict.append('against %s: lives %s, life %s s, edges %s, emissions %s a life: %s' % (
+                    label, sn.split('.')[0] if '-' not in sn else sn, sl, se, sm,
+                    'within a tick' if ok else 'DIFFERS (%s)' % ', '.join(n for n, o in (('lives', ok_n), ('life', ok_l), ('edges', ok_e),
+                                                                                       ('emissions', ok_m)) if not o)))
+                if decides and not ok:
+                    fam_pass = False
             lines.append('           ' + '; '.join(verdict))
         if len(fid) == fam_place:
             lines.append('   %s: NOTHING SPAWNED%s' % (f, ' (only the place\'s own effects in its shots\' windows)' if fid else ''))
         elif not fam_measured:
             lines.append('   %s: spawned, but nothing measured (no effect of it updated its nodes)' % f)
         elif run['smooth']:
-            lines.append('   %s: %s' % (f, 'PASS (smooth, kept 0%s)' % (', the base agrees' if bstats is not None else '') if fam_pass else
+            lines.append('   %s: %s' % (f, 'PASS (smooth, kept 0%s)' % (', counted as with the steps off' if ostats is not None else
+                                                                        ', the base agrees' if bstats is not None else '') if fam_pass else
                                        'not yet: %d frames kept%s' % (fam_kept, '' if fam_kept else ', see above')))
         else:
             lines.append('   %s: %s' % (f, 'held between whole steps (effect steps 30, as today)' if fam_held else 'every frame a whole step'))
@@ -348,6 +360,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('run')
     ap.add_argument('--base', action='append', default=[], help='a run of the same plan to compare with; more than one: their spread')
+    ap.add_argument('--off', help='the same plan at the same rate with the smooth steps off: what a family counts must match it')
     ap.add_argument('--converted', help='the converted classes, 0x.. comma list (default: the list of as many classes as the build\'s exit report names)')
     a = ap.parse_args()
     d = Path(a.run)
@@ -357,7 +370,10 @@ def main():
     conv = None
     if a.converted:
         conv = CONVERTED_BY_COUNT.get(int(a.converted)) if a.converted.isdigit() else {int(x, 16) for x in a.converted.split(',')}
-    sys.stdout.write(report(text, read_words(d / 'words.tsv'), fams, base=base, name=d.name, converted=conv))
+    off = None
+    if a.off:
+        off = ((Path(a.off) / 'ac' / 'perf' / 'run.log').read_text(errors='replace'), read_words(Path(a.off) / 'words.tsv'))
+    sys.stdout.write(report(text, read_words(d / 'words.tsv'), fams, base=base, name=d.name, converted=conv, off=off))
 
 
 if __name__ == '__main__':
