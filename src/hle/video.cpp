@@ -230,6 +230,10 @@ const bool g_present_on_arrival = [] {
 // clock picks). Each <dir>/*.req file holds one line, carried out in name
 // order and then deleted:
 //   dump <path>           this displayed frame to <path>, as BBHOST_DUMP_FRAME writes one
+//   dumpseq <dir> [<n>]   the next n flips (30), one after another, to <dir>/seq-0000.ppm
+//                         and on: consecutive frames, which a `dump` request a frame cannot
+//                         give - the folder is read ten times a second, so two requests can
+//                         land on one flip and the flip between them goes without
 //   f12 [<name>]          an F12 capture (frame, render targets, draw list) on the next
 //                         flip, into the folder the log names
 //   capture <n> [<dir>]   with BBHOST_CAPTURE_ARMED=1, BBHOST_CAPTURE_DRAW may take up to n
@@ -250,6 +254,15 @@ const bool g_present_on_arrival = [] {
 struct TestRequest {
     std::string name, verb, arg, arg2;
 };
+// A `dumpseq` in progress: its folder, the flips still to dump, the next file's
+// number and the last flip dumped (the two flip threads may come with one flip).
+struct DumpSequence {
+    std::mutex mu;
+    std::string dir;
+    int left = 0, index = 0;
+    std::uint64_t last = ~0ull;
+};
+DumpSequence g_dump_seq;
 std::mutex g_test_req_mu;
 std::deque<TestRequest> g_test_reqs;  // under g_test_req_mu
 std::atomic<bool> g_test_exit{false};  // an `exit` request came
@@ -291,6 +304,22 @@ void test_requests(std::uint64_t display_va, std::uint64_t count) {
             test_requests_read(dir);
         }).detach();
     });
+    // A sequence asked for earlier dumps this flip, whichever thread brings it.
+    {
+        std::lock_guard<std::mutex> lk(g_dump_seq.mu);
+        if (g_dump_seq.left > 0 && count != g_dump_seq.last && display_va) {
+            char path[1100];
+            std::snprintf(path, sizeof(path), "%s/seq-%04d.ppm", g_dump_seq.dir.c_str(), g_dump_seq.index);
+            const bool ok = host_gpu_dump_display(display_va, path);
+            ++g_dump_seq.index;
+            --g_dump_seq.left;
+            g_dump_seq.last = count;
+            if (!ok || g_dump_seq.left == 0)
+                host_log("test: frame sequence %s at flip %llu (%d frames)", ok ? "done" : "stopped, a dump failed",
+                         static_cast<unsigned long long>(count), g_dump_seq.index);
+            if (!ok) g_dump_seq.left = 0;
+        }
+    }
     // The vblank's flips and the uncapped ones come here from two threads:
     // one at a time carries the queue out, in order.
     static std::mutex mu;
@@ -306,6 +335,15 @@ void test_requests(std::uint64_t display_va, std::uint64_t count) {
         if (verb == "dump" && !arg.empty()) {
             const bool ok = display_va && host_gpu_dump_display(display_va, arg.c_str());
             host_log("test: frame dump at flip %llu to %s%s", static_cast<unsigned long long>(count), arg.c_str(), ok ? "" : " failed");
+        } else if (verb == "dumpseq" && !arg.empty()) {
+            const int n = arg2.empty() ? 30 : std::atoi(arg2.c_str());
+            std::lock_guard<std::mutex> lk(g_dump_seq.mu);
+            g_dump_seq.dir = arg;
+            g_dump_seq.left = n > 0 ? n : 0;
+            g_dump_seq.index = 0;
+            g_dump_seq.last = count;  // from the next flip
+            host_log("test: frame sequence of %d asked for at flip %llu into %s", g_dump_seq.left, static_cast<unsigned long long>(count),
+                     arg.c_str());
         } else if (verb == "f12") {
             host_log("test: F12 capture %s asked for at flip %llu", arg.empty() ? "-" : arg.c_str(), static_cast<unsigned long long>(count));
             host_gpu_request_dump();
