@@ -3465,6 +3465,17 @@ void oob_counting() {
         CHECK(spirv_valid(walk.spirv));
         CHECK(count_op(walk.spirv, 234) == (on ? 1u : 0u));
     }
+    // The control (gcn::set_oob_control): the same counts against half the
+    // records - another module, as valid, with the same adds.
+    gcn::set_oob_count(true);
+    gcn::TranslateResult counting, control;
+    const gcn::LiftResult lc = lift_words(program(), nullptr, &counting);
+    gcn::set_oob_control(true);
+    const gcn::LiftResult lk = lift_words(program(), nullptr, &control);
+    gcn::set_oob_control(false);
+    CHECK(spirv_valid(control.spirv) && lifted_valid(lk));
+    CHECK(control.spirv != counting.spirv && lk.spirv != lc.spirv);
+    CHECK(count_op(control.spirv, 234) == 2 && count_op(lk.spirv, 234) == 2);
     gcn::set_oob_count(false);
 }
 

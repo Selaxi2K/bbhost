@@ -3300,7 +3300,8 @@ private:
             // gcn::set_oob_count, as the reference: an index at or past
             // num_records, and a read past the binding.
             const Id records = as_u(read(static_cast<std::uint16_t>(in.srsrc + 2), in));
-            oob_note(m.emit(spv::OpLogicalNot, t_bool, {m.emit(spv::OpULessThan, t_bool, {vindex, records})}), kOobPastRecords);
+            const Id limit = oob_control() ? shift(spv::OpShiftRightLogical, records, cu(1)) : records;  // gcn::set_oob_control
+            oob_note(m.emit(spv::OpLogicalNot, t_bool, {m.emit(spv::OpULessThan, t_bool, {vindex, limit})}), kOobPastRecords);
             int total_bits = 0;
             for (int k = 0; k < count; ++k) total_bits += bits[k];
             const Id length = m.emit(spv::OpArrayLength, t_u32, {buffer_vars[index], 0u});

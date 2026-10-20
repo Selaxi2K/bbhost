@@ -3691,11 +3691,15 @@ bool init_locked() {
     // buffer (gcn::set_oob_count; StageParams::lds_address points at it);
     // the frame detail line and the exit report read it. Lifts do not count:
     // run with BBHOST_DECOMP=0 for every stage.
-    if (const char* e = std::getenv("BBHOST_OOB_COUNT"); e && e[0] == '1') {
+    // =2: the control (gcn::set_oob_control) - a load by index counts as past
+    // the records from half of them on, to show the counters reach the host.
+    if (const char* e = std::getenv("BBHOST_OOB_COUNT"); e && (e[0] == '1' || e[0] == '2')) {
         if (create_dev_buffer(g.oob, std::uint64_t{gcn::kOobSlots} * gcn::kOobKinds * 4, true, true)) {
             std::memset(g.oob.map, 0, g.oob.size);
             gcn::set_oob_count(true);
-            host_log("gpu: out-of-range buffer accesses counted (BBHOST_OOB_COUNT=1; translated vertex and pixel stages)");
+            gcn::set_oob_control(e[0] == '2');
+            host_log("gpu: out-of-range buffer accesses counted (BBHOST_OOB_COUNT=%c; vertex and pixel stages%s)", e[0],
+                     e[0] == '2' ? "; the control: loads by index from half the records on count as past them" : "");
         }
     }
 

@@ -53,11 +53,14 @@ bool tbuffer_dst_sel() {
 namespace {
 std::atomic<bool> g_index_bounds{false};  // set_index_bounds
 std::atomic<bool> g_oob_count{false};     // set_oob_count
+std::atomic<bool> g_oob_control{false};   // set_oob_control
 }  // namespace
 void set_index_bounds(bool on) { g_index_bounds.store(on, std::memory_order_relaxed); }
 bool index_bounds() { return g_index_bounds.load(std::memory_order_relaxed); }
 void set_oob_count(bool on) { g_oob_count.store(on, std::memory_order_relaxed); }
 bool oob_count() { return g_oob_count.load(std::memory_order_relaxed); }
+void set_oob_control(bool on) { g_oob_control.store(on, std::memory_order_relaxed); }
+bool oob_control() { return g_oob_control.load(std::memory_order_relaxed); }
 
 std::string translation_switches() {
     // The variables as given rather than what each decides: two spellings of
@@ -2757,7 +2760,8 @@ struct Translator {
         // gcn::set_oob_count: an index at or past num_records, and a read past
         // the binding (its last dword at or past the array's length).
         if (oob_base64) {
-            oob_note(m.emit(spv::OpLogicalNot, t_bool, {ult(vindex, read_s(static_cast<std::uint16_t>(in.srsrc + 2), in))}), kOobPastRecords);
+            const Id records = read_s(static_cast<std::uint16_t>(in.srsrc + 2), in);
+            oob_note(m.emit(spv::OpLogicalNot, t_bool, {ult(vindex, oob_control() ? shr(records, c_one_u) : records)}), kOobPastRecords);
             const Id length = m.emit(spv::OpArrayLength, t_u32, {buffer_vars[index], 0u});
             const Id last = iadd(cb_bias(index), iadd(first, cu(static_cast<std::uint32_t>(nwords - 1))));
             oob_note(m.emit(spv::OpLogicalNot, t_bool, {ult(last, length)}), kOobPastBinding);

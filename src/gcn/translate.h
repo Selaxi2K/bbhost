@@ -479,6 +479,11 @@ inline bool indexed_typed_load(const Inst& in) { return in.enc == Enc::MTBUF && 
 // Set once before the first translation; part of every key while on.
 void set_oob_count(bool on);
 bool oob_count();
+// The counters' control (BBHOST_OOB_COUNT=2): a typed load by index counts
+// as past the records from half of them on, so a run shows the counters
+// reach the host where the game reads nothing past them. Keyed with the rest.
+void set_oob_control(bool on);
+bool oob_control();
 constexpr std::uint32_t kOobSlots = 4096, kOobKinds = 4;
 constexpr std::uint32_t kOobPastRecords = 0, kOobPastBinding = 1, kOobWalkPastRecords = 2;
 // The Vulkan stage a translation or lift with these options runs in.

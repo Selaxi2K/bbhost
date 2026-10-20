@@ -194,7 +194,7 @@ void hash_options(KeyHasher& h, const gcn::TranslateOptions& o) {
     // A clip-discarding pixel shader that demotes the pixel rather than ending it.
     if (o.stage == gcn::Stage::Pixel && o.ps_clip_discard && gcn::clip_demote()) h.u32(0xde40u);
     // The out-of-range counters (gcn::set_oob_count, a diagnostic).
-    if (gcn::oob_count()) h.u32(0x00bcu);
+    if (gcn::oob_count()) h.u32(gcn::oob_control() ? 0x00bdu : 0x00bcu);
 }
 
 // ---- an entry: the TranslateResult, every field ----
