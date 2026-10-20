@@ -19,6 +19,9 @@
 //     same, three within the Euler angles' (h w)^2; a step of 0 turns nothing;
 //   - the transform motion 0x570e710 (sub_2e8a3d0): never reads its step
 //     (rdx is overwritten first): every byte the same for any step;
+//   - the curve motion 0x570e910 (sub_2e8ec00): the position its curve at
+//     the node's time, the rotation kept; never reads its step: every byte
+//     the same for any step;
 //   - the composite motion 0x570e750 (sub_2e8ae30): its two parts, in order,
 //     with its own arguments;
 //   - the children module 0x56eb2e0 (sub_12fccf0): never reads the container's
@@ -42,7 +45,8 @@
 //     and +0x1c, the same) and 3 / 0x3d (0x56ebe20, sub_1325cd0: +0x18 and
 //     +0x1c the same): the same bounds and bytes, the accumulations within a
 //     rounding a frame, nothing added by a step of 0;
-//   - the wind source 0x283c (0x56eadf0, sub_12e3c30): its fade (+0xd0) by
+//   - the wind sources 0x283c (0x56eadf0, sub_12e3c30) and 0x283d (0x56eac40,
+//     sub_12e27b0, no velocity): its fade (+0xd0) by
 //     the elapsed time, its strengths from a curve at the record's time and
 //     that fade, its velocity the handle's move over the elapsed time: the
 //     same shape, place and bounds, the fade, strengths and velocity within
@@ -373,6 +377,59 @@ int check_transform(int cases) {
         if (!same && ++bad <= 6 && !g_quiet) std::printf("transform case %d: a step changed what it did\n", c);
     }
     if (!g_quiet) std::printf("decomp_sfx_classes: transform motion: %d cases, every byte the same for 5 steps, %d differ\n", cases, bad);
+    return bad;
+}
+
+// The curve motion 0x570e910 (sub_2e8ec00): the node's position (+0) the value of its curve (+8, vtable +0x58: a
+// vector) at the node's time (+0x7c), its rotation (+0x10) kept; it never reads its step - the frame domain's node time
+// is the whole of what it is handed. Every byte the same for any step, the position the curve at the node's time.
+GUEST_ABI __m128 curve_vector(u64 curve, u64, const float* t) {
+    const float k = load<float>(curve + 8), c = load<float>(curve + 12);
+    return _mm_set_ps(1.0f, c - *t, *t * 0.5f + c, *t * k + c);
+}
+alignas(64) u8 g_curve4_vtable[0x80];
+int check_curve_motion(int cases) {
+    const auto motion_fn = eboot_kit::fn<MotionFn>(0x2e8ec00);
+    store<u64>(reinterpret_cast<u64>(g_curve4_vtable) + 0x58, reinterpret_cast<u64>(&curve_vector));
+    int bad = 0;
+    for (int c = 0; c < cases; ++c) {
+        g_blocks.clear();
+        const u64 motion = block(0x20), node = make_node(), local = block(0x40), cv = block(0x20);
+        store<u64>(cv, reinterpret_cast<u64>(g_curve4_vtable));
+        store<float>(cv + 8, uni(-3, 3));
+        store<float>(cv + 12, uni(-20, 20));
+        const bool has = g_rng.chance(0.9);
+        store<u64>(motion + 8, has ? cv : 0);
+        store<float>(node + 0x7c, uni(0, 30));
+        const std::vector<u8> m0 = bytes_of(motion, 0x20), n0 = bytes_of(node, 0x100);
+        std::vector<u8> m1, n1;
+        const char* why = nullptr;
+        for (const float st : {1.0f / 30.0f, 0.0f, 1.0f / 120.0f, 1.0f, -1.0f}) {
+            put_bytes(motion, m0);
+            put_bytes(node, n0);
+            float step = g_control == 5 ? 0.0f : st;
+            motion_fn(motion, node, &step, local);
+            if (g_control == 5 && st != 0.0f) store<float>(node, load<float>(node) + st);  // the control: a position moved by the step
+            if (m1.empty()) {
+                m1 = bytes_of(motion, 0x20);
+                n1 = bytes_of(node, 0x100);
+            } else if (bytes_of(motion, 0x20) != m1 || bytes_of(node, 0x100) != n1) {
+                why = "a step changed what it did";
+            }
+        }
+        if (!why) {
+            std::vector<u8> want = n0;
+            if (has) {
+                float t;
+                std::memcpy(&t, n0.data() + 0x7c, 4);
+                const __m128 v = curve_vector(cv, node, &t);
+                std::memcpy(want.data(), &v, 16);
+            }
+            if (n1 != want) why = has ? "the position is not the curve at the node's time" : "no curve, yet the node changed";
+        }
+        if (why && ++bad <= 6 && !g_quiet) std::printf("curve motion case %d: %s\n", c, why);
+    }
+    if (!g_quiet) std::printf("decomp_sfx_classes: curve motion: %d cases, every byte the same for 5 steps, %d differ\n", cases, bad);
     return bad;
 }
 
@@ -1084,20 +1141,28 @@ GUEST_ABI void stub_wind_velocity(u64, const float* v) {
 }
 GUEST_ABI u64 stub_wind_object(u64) { return 0; }
 
-int check_wind_source(int cases) {
-    const auto update = eboot_kit::fn<TypeUpdate>(0x12e3c30);
+// The two wind types' layouts: 0x283c (sub_12e3c30) and 0x283d (sub_12e27b0, the same without the velocity, and its
+// strength and transform set only with a curve).
+struct WindLayout {
+    const char* name;
+    u64 fn, kind, sizes, velocity_on, velocity_scale, fade_time, strengths, curve, fade, handle;
+};
+constexpr WindLayout kWind283c{"0x283c", 0x12e3c30, 0x20, 0x24, 0x44, 0x48, 0x58, 0x78, 0xb8, 0xd0, 0xe0};
+constexpr WindLayout kWind283d{"0x283d", 0x12e27b0, 0x18, 0x1c, 0, 0, 0x50, 0x60, 0x88, 0x98, 0xa0};
+int check_wind_layout(int cases, const WindLayout& w) {
+    const auto update = eboot_kit::fn<TypeUpdate>(w.fn);
     int bad = 0;
     long ending = 0, released = 0, moving = 0;
     for (int c = 0; c < cases; ++c) {
         g_blocks.clear();
         const u64 type = block(0x100), rec = block(0x80), node = block(0x100), inst = block(0x98);
         for (int k = 0x10; k < 0x100; k += 4) store<float>(type + k, uni(-3, 3));
-        store<u32>(type + 0x20, static_cast<u32>(g_rng.range(0, 5)));
-        store<u32>(type + 0x44, g_rng.chance(0.7) ? 1u : 0u);
-        store<float>(type + 0x58, g_rng.chance(0.1) ? 0.0f : uni(0.05f, 2));
-        store<u64>(type + 0xb8, g_rng.chance(0.6) ? curve(uni(0, 2), g_rng.chance(0.5) ? 0.0f : uni(-0.5f, 0.5f)) : 0);
-        store<float>(type + 0xd0, g_rng.chance(0.3) ? 0.0f : uni(0, 1));
-        store<u64>(type + 0xe0, g_rng.chance(0.1) ? ~0ull : 0x100 + static_cast<u64>(c));
+        store<u32>(type + w.kind, static_cast<u32>(g_rng.range(0, 5)));
+        if (w.velocity_on) store<u32>(type + w.velocity_on, g_rng.chance(0.7) ? 1u : 0u);
+        store<float>(type + w.fade_time, g_rng.chance(0.1) ? 0.0f : uni(0.05f, 2));
+        store<u64>(type + w.curve, g_rng.chance(w.velocity_on ? 0.6 : 0.8) ? curve(uni(0, 2), g_rng.chance(0.5) ? 0.0f : uni(-0.5f, 0.5f)) : 0);
+        store<float>(type + w.fade, g_rng.chance(0.3) ? 0.0f : uni(0, 1));
+        store<u64>(type + w.handle, g_rng.chance(0.1) ? ~0ull : 0x100 + static_cast<u64>(c));
         const u32 state = static_cast<u32>(g_rng.range(0, 9));
         store<u32>(node + 0xdc, state);
         store<u64>(node + 0x58, inst);  // no overrides (+0x40)
@@ -1139,7 +1204,7 @@ int check_wind_source(int cases) {
         const double ulp_t = std::ldexp(1.0, std::ilogb(std::max(1.0, std::fabs(static_cast<double>(t)) + 1.0)) - 23);
         const double ulp_p = std::ldexp(1.0, std::ilogb(26.0) - 23);
         // the strength's largest size: the curve's value at the end (or 1); the fade only lowers it
-        const u64 strength_curve = load<u64>(type + 0xb8);
+        const u64 strength_curve = load<u64>(type + w.curve);
         const double s_max = strength_curve ? std::fabs(static_cast<double>(load<float>(strength_curve + 8))) +
                                                   std::fabs(static_cast<double>(load<float>(strength_curve + 12))) * (std::fabs(static_cast<double>(t)) + 1.0)
                                             : 1.0;
@@ -1164,15 +1229,15 @@ int check_wind_source(int cases) {
             for (u64 off = 0; off < 0x100 && !why; off += 4) {
                 const float a = load<float>(reinterpret_cast<u64>(type_whole.data()) + off), b = load<float>(type + off);
                 if (eboot_kit::same_float(a, b)) continue;
-                if (off != 0xd0 || std::fabs(static_cast<double>(a) - b) > 2.0 * n * (ulp_t + 1.2e-7 * (1 + std::fabs(static_cast<double>(a)))))
-                    why = off == 0xd0 ? "the fade" : "a word of the type";
+                if (off != w.fade || std::fabs(static_cast<double>(a) - b) > 2.0 * n * (ulp_t + 1.2e-7 * (1 + std::fabs(static_cast<double>(a)))))
+                    why = off == w.fade ? "the fade" : "a word of the type";
             }
             if (why) break;
             // the strengths: the curve at the same time, the fade within its rounding
-            const double fade_err = 2.0 * n * (ulp_t + 1.2e-7) / std::max(0.05, static_cast<double>(load<float>(type + 0x58)));
+            const double fade_err = 2.0 * n * (ulp_t + 1.2e-7) / std::max(0.05, static_cast<double>(load<float>(type + w.fade_time)));
             for (int i = 0; i < 2 && !why; ++i) {
                 const double a = whole.strength[i], b = fr.strength[i];
-                const double k = s_max * std::fabs(static_cast<double>(load<float>(type + 0x78 + 4 * static_cast<u64>(i))));
+                const double k = s_max * std::fabs(static_cast<double>(load<float>(type + w.strengths + 4 * static_cast<u64>(i))));
                 if (!eboot_kit::same_float(whole.strength[i], fr.strength[i]) && std::fabs(a - b) > 4e-6 * (1 + std::fabs(a)) + 4.0 * fade_err * k)
                     why = "the strengths";
             }
@@ -1180,7 +1245,7 @@ int check_wind_source(int cases) {
             double vmax = 0;
             for (int i = 0; i < 4; ++i) vmax = std::max(vmax, std::fabs(static_cast<double>(whole.velocity[i])));
             const double tol_v = 4e-6 * (1 + vmax) + vmax * 2.0 * n * ulp_t / h +
-                                 3.0 * n * ulp_p / h * s_max * std::fabs(static_cast<double>(load<float>(type + 0x48)));
+                                 3.0 * n * ulp_p / h * s_max * (w.velocity_scale ? std::fabs(static_cast<double>(load<float>(type + w.velocity_scale))) : 0.0);
             for (int i = 0; i < 4 && !why; ++i) {
                 const double a = whole.velocity[i], b = fr.velocity[i];
                 if (!eboot_kit::same_float(whole.velocity[i], fr.velocity[i]) && std::fabs(a - b) > tol_v) why = "the velocity";
@@ -1194,19 +1259,20 @@ int check_wind_source(int cases) {
             store<float>(rec + 0x18, t);
             put_at(0.0);
             update(reinterpret_cast<u64>(b_frame), type, rec, 0);
-            if (load<u32>(type + 0xd0) != load<u32>(reinterpret_cast<u64>(type0.data()) + 0xd0)) why = "a step of 0's fade";
+            if (load<u32>(type + w.fade) != load<u32>(reinterpret_cast<u64>(type0.data()) + w.fade)) why = "a step of 0's fade";
             for (int i = 0; i < 3 && !why; ++i)
                 if (g_wind.velocities && g_wind.velocity[i] != 0.0f) why = "a step of 0's velocity";
         }
         if (why && ++bad <= 6 && !g_quiet)
-            std::printf("wind source case %d (shape %u, state %u, time %g, velocity %u): %s differs\n", c,
-                        load<u32>(reinterpret_cast<u64>(type0.data()) + 0x20), state, t, load<u32>(reinterpret_cast<u64>(type0.data()) + 0x44), why);
+            std::printf("wind source %s case %d (shape %u, state %u, time %g): %s differs\n", w.name, c,
+                        load<u32>(reinterpret_cast<u64>(type0.data()) + w.kind), state, t, why);
     }
     if (!g_quiet)
-        std::printf("decomp_sfx_classes: the wind source 0x283c: %d cases (%ld ending, %ld of them let go, %ld moving), %d differ\n", cases, ending, released,
-                    moving, bad);
+        std::printf("decomp_sfx_classes: the wind source %s: %d cases (%ld ending, %ld of them let go, %ld moving), %d differ\n", w.name, cases, ending,
+                    released, moving, bad);
     return bad;
 }
+int check_wind_source(int cases) { return check_wind_layout(cases, kWind283c) + check_wind_layout(cases, kWind283d); }
 
 // --- the GPU particle simulations ------------------------------------------------------
 
@@ -1353,6 +1419,7 @@ int main() {
     bad += check_euler(kCases);
     bad += check_rotation(kCases);
     bad += check_transform(kCases / 4);
+    bad += check_curve_motion(kCases / 4);
     bad += check_composite(kCases / 4);
     bad += check_children(kCases / 4);
     bad += check_sprj(kCases / 4);
@@ -1373,6 +1440,7 @@ int main() {
                     {3, check_gx_record, "each frame handed the whole step (the GX record)"},
                     {3, check_ffx_types, "each frame handed the whole step (the FFX-format GX types' rates)"},
                     {3, check_wind_source, "each frame handed the whole step (the wind source's fade, strengths and velocity)"},
+                    {5, check_curve_motion, "a position moved by the step (the curve motion)"},
                     {4, check_sims, "each simulation update the whole step's time"}};
     for (const auto& k : controls) {
         g_control = k.control;
@@ -1382,6 +1450,6 @@ int main() {
         }
     }
     g_control = 0;
-    std::printf("decomp_sfx_classes: %s; %d of 6 controls caught\n", bad ? "the converted classes do not all hold" : "the converted classes hold", 6 - missed);
+    std::printf("decomp_sfx_classes: %s; %d of 7 controls caught\n", bad ? "the converted classes do not all hold" : "the converted classes hold", 7 - missed);
     return bad || missed ? 1 : 0;
 }
