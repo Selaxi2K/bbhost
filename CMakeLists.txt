@@ -534,6 +534,10 @@ if(UNIX)
   add_executable(arena_memory_test tests/arena_memory_test.cpp)
   target_include_directories(arena_memory_test PRIVATE src)
   add_test(NAME arena_memory_test COMMAND arena_memory_test)
+  # The copy watch's granules in front of its slots (host/gxvk_watch.h).
+  add_executable(gxvk_watch_test tests/gxvk_watch_test.cpp)
+  target_include_directories(gxvk_watch_test PRIVATE src)
+  add_test(NAME gxvk_watch_test COMMAND gxvk_watch_test)
   # The buffer shadow's page copies grow a run only where both ends meet.
   add_executable(copy_runs_test tests/copy_runs_test.cpp)
   target_include_directories(copy_runs_test PRIVATE src)
