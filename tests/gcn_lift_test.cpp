@@ -3430,6 +3430,44 @@ void index_bounds() {
     CHECK(compares[1][0] == compares[0][0] + 1 && compares[1][1] == compares[0][1] + 1);
 }
 
+// gcn::set_oob_count (BBHOST_OOB_COUNT, a diagnostic): the translation of a
+// typed load by index from a bound buffer counts an index past the V#'s
+// records and a read past the binding - two atomic adds, one array length -
+// into the program's slot, and its lift the same; the same load walked
+// through the page table counts a walk past the records (one add). Valid
+// modules either way; nothing counted when off.
+void oob_counting() {
+    const auto program = [&] {
+        Asm a;
+        a.smrd(kLoadX4, 8, 2, 4);
+        a.sopp(kWaitcnt, 0);
+        a.vop1(kVMov, 4, 1);
+        a.tbuffer_load(3, 0, 4, 8, 14, 7);
+        a.sopp(kWaitcnt, 0);
+        a.exp_mrt0(0, 1, 2, 3);
+        a.endpgm();
+        return a.w;
+    };
+    for (const bool on : {true, false}) {
+        gcn::set_oob_count(on);
+        gcn::TranslateResult ref;
+        const gcn::LiftResult l = lift_words(program(), nullptr, &ref);
+        CHECK(spirv_valid(ref.spirv));
+        CHECK(count_op(ref.spirv, 234) == (on ? 2u : 0u));  // OpAtomicIAdd: past the records, past the binding
+        CHECK(count_op(ref.spirv, 68) == (on ? 1u : 0u));   // OpArrayLength
+        CHECK((ref.oob_slot < gcn::kOobSlots) == on);
+        CHECK(lifted_valid(l));
+        CHECK(count_op(l.spirv, 234) == (on ? 2u : 0u));   // the lift counts as its reference
+        CHECK(count_op(l.spirv, 68) == (on ? 1u : 0u));
+        // The same load left to the page table: a walk past the records.
+        gcn::TranslateResult walk;
+        lift_words(program(), nullptr, &walk, {"user_sgpr[2]->load(+16)"});
+        CHECK(spirv_valid(walk.spirv));
+        CHECK(count_op(walk.spirv, 234) == (on ? 1u : 0u));
+    }
+    gcn::set_oob_count(false);
+}
+
 // Copies of a V#: a spill to lanes of a VGPR and back (v_writelane_b32 /
 // v_readlane_b32 of a spill cell), or s_mov, define what they copy, so a
 // constant buffer read through a copy of its V# is bound - where every copy
@@ -3621,6 +3659,7 @@ void run() {
     ranged_loads();
     typed_loads();
     index_bounds();
+    oob_counting();
     copies();
     cselect();
     lshl_b64();

@@ -503,6 +503,7 @@ struct Gpu {
     std::uint64_t mirror_size = 0;
     DmemChunk dmem[gcn::kDmemChunks];
     DevBuffer l1, sink, sink_l2;
+    DevBuffer oob;  // BBHOST_OOB_COUNT=1: gcn::set_oob_count's counters (gcn::kOobSlots x kOobKinds dwords)
     std::map<std::uint32_t, DevBuffer> l2;          // by va >> 32
     std::map<std::uint64_t, Chunk> anon_imports;    // by va: imported flexible mappings
     std::vector<GuestMapInfo> maps;                 // last snapshot

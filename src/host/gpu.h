@@ -598,6 +598,11 @@ struct GpuStats {
     // Draws whose pixel shader discards by the vertex stage's clip distances at
     // entry (TranslateOptions::kVsOutCntlClipVarying).
     std::uint64_t draws_clip_discard;
+    // BBHOST_OOB_COUNT=1 (gcn::set_oob_count): the counters' totals by kind -
+    // typed loads by index past num_records, past their binding, walks by
+    // index past num_records; oob_on whether they count.
+    std::uint64_t oob[3];
+    bool oob_on;
 };
 // A draw on the host's tessellator: counted, and by which of its stages ran as
 // typed lifts (BBHOST_LIFT_TESS) - the domain shader as the evaluation stage,

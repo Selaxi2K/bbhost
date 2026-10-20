@@ -56,7 +56,8 @@ bool same(const gcn::TranslateResult& a, const gcn::TranslateResult& b) {
         a.buffers.size() != b.buffers.size() || a.image_at != b.image_at || a.sampler_at != b.sampler_at || a.buffer_at != b.buffer_at ||
         a.errors != b.errors || a.lds_bytes != b.lds_bytes || a.store_buffers.size() != b.store_buffers.size() ||
         a.untraced_stores != b.untraced_stores || a.unnormalized_samples != b.unnormalized_samples || a.walks != b.walks ||
-        a.vs_params != b.vs_params || a.ps_inputs != b.ps_inputs || a.vs_clip_count != b.vs_clip_count || a.vs_point_size != b.vs_point_size) {
+        a.vs_params != b.vs_params || a.ps_inputs != b.ps_inputs || a.vs_clip_count != b.vs_clip_count || a.vs_point_size != b.vs_point_size ||
+        a.oob_slot != b.oob_slot) {
         return false;
     }
     for (std::size_t i = 0; i < a.images.size(); ++i) {

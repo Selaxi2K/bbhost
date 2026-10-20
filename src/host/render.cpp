@@ -5389,6 +5389,18 @@ void note_clip_discard_pipeline(const std::string& name, std::uint32_t clip_disc
         host_log("render: pipeline %s: its pixel shader discards where clip distances 0-%u are negative, at entry", name.c_str(), (clip_discard & 0xff) - 1);
     }
 }
+// BBHOST_OOB_COUNT=1: the programs behind each counter slot (TranslateResult::
+// oob_slot), for the exit report's per-program lines.
+std::mutex g_oob_names_mu;
+std::map<std::uint32_t, std::set<std::string>> g_oob_names;  // under g_oob_names_mu
+void note_oob_slots(const GfxPipeline& pl) {
+    if (!g.oob.map) return;
+    const std::size_t plus = pl.name.find('+');
+    const std::string vs = pl.name.substr(0, plus), ps = plus == std::string::npos ? std::string() : pl.name.substr(plus + 1);
+    std::lock_guard<std::mutex> lk(g_oob_names_mu);
+    if (pl.vs.meta().oob_slot < gcn::kOobSlots) g_oob_names[pl.vs.meta().oob_slot].insert("VS " + vs);
+    if (pl.ps.meta().oob_slot < gcn::kOobSlots) g_oob_names[pl.ps.meta().oob_slot].insert("PS " + ps);
+}
 void note_unwritten_ps_inputs(const GfxPipeline& pl, const DrawState& s) {
     if (pl.ps.meta().spirv.empty() || pl.vs.meta().spirv.empty() || s.tess_hw || s.gs || s.rect) return;
     const std::vector<std::uint32_t> outs = module_locations(pl.vs.meta().spirv, 3), ins = module_locations(pl.ps.meta().spirv, 1);
@@ -6017,6 +6029,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         return fail("a tessellation pipeline with a set 4 needs per-stage set layouts (BBHOST_SET_LAYOUTS=0)");
     }
     note_unwritten_ps_inputs(pl, s);
+    note_oob_slots(pl);
     if (create && !create_gfx_pipeline(pl, s, vertex_input, fetch_words.size())) pl.failed = true;
     return pl;
 }
@@ -10756,6 +10769,34 @@ void cross_vendor_report() {
     host_log("render: draws the PS4 rasterizes nothing for (DX_RASTERIZATION_KILL) %llu, point-list draws whose vertex stage writes no "
              "PointSize %llu",
              static_cast<ull>(g_raster_census[0].load()), static_cast<ull>(g_raster_census[1].load()));
+    if (g.oob.map) {
+        // BBHOST_OOB_COUNT=1: the totals, then the programs with the most.
+        const auto* c = static_cast<const volatile std::uint32_t*>(g.oob.map);
+        std::uint64_t total[3] = {};
+        std::vector<std::pair<std::uint64_t, std::uint32_t>> slots;
+        for (std::uint32_t slot = 0; slot < gcn::kOobSlots; ++slot) {
+            std::uint64_t n = 0;
+            for (std::uint32_t k = 0; k < 3; ++k) {
+                total[k] += c[slot * gcn::kOobKinds + k];
+                n += c[slot * gcn::kOobKinds + k];
+            }
+            if (n) slots.push_back({n, slot});
+        }
+        host_log("render: out-of-range buffer accesses (BBHOST_OOB_COUNT): typed loads by index at or past num_records %llu, reaching past "
+                 "their binding %llu; page-table walks by index at or past num_records %llu (lanes EXEC holds, translated stages)",
+                 static_cast<ull>(total[0]), static_cast<ull>(total[1]), static_cast<ull>(total[2]));
+        std::sort(slots.rbegin(), slots.rend());
+        std::lock_guard<std::mutex> lk(g_oob_names_mu);
+        for (std::size_t i = 0; i < slots.size() && i < 24; ++i) {
+            const std::uint32_t slot = slots[i].second;
+            std::string names;
+            if (auto it = g_oob_names.find(slot); it != g_oob_names.end()) {
+                for (const std::string& n : it->second) names += (names.empty() ? "" : ", ") + n;
+            }
+            host_log("render:   slot %u (%s): past records %u, past the binding %u, walks past records %u", slot, names.empty() ? "?" : names.c_str(),
+                     c[slot * gcn::kOobKinds], c[slot * gcn::kOobKinds + 1], c[slot * gcn::kOobKinds + 2]);
+        }
+    }
     host_log("render: depth targets whose first pass loads bytes nothing wrote: %llu test depth or stencil against them, %llu do not",
              static_cast<ull>(g_depth_first_unmade[0].load()), static_cast<ull>(g_depth_first_unmade[1].load()));
     if (feedback_census_on()) {
@@ -18502,6 +18543,7 @@ static bool draw_impl(const GpuDraw& d) {
         gcn::StageParams params{};
         params.l1_table = g.l1.address;
         std::memcpy(params.user_sgpr, st == 0 ? s.vs_user : s.ps_user, sizeof(params.user_sgpr));
+        params.lds_address = g.oob.address;  // BBHOST_OOB_COUNT=1: the counters (gcn::set_oob_count); 0 otherwise
         if (st == 0 && t_tess) {
             params.lds_address = t_tess->lds_address;
             params.lds_bytes = t_tess->lds_bytes;
