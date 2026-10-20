@@ -4,13 +4,12 @@
  * tools/fx_player/report.py. Never shipped.
  *
  * The shots, each from the main thread at a frame's start:
- *   sfx       CreateSfx_DummyPoly's work (sub_1719e10: the event scripts'
- *             effect on a character's dummy polys; edi unused, esi the
- *             entity - 10000 is the main player - edx the dummy poly, ecx the
- *             effect id): the effect made through SprjSfx at each of the
- *             player's dummy polys of that id. When none of that id appears
- *             within FXP_SPAWN_FRAMES (6) frames - a weapon's dummy poly with
- *             no such weapon in hand - once more at dummy poly 1 (the body's).
+ *   sfx       an effect on one of the player's dummy polys as the character's
+ *             own effects are made (sfx_at below: a SprjSfx request for the
+ *             character, bound to the dummy poly's model, as sub_1ca6410 does
+ *             it); a weapon's dummy poly with no such weapon in hand is the
+ *             body's dummy poly 1, and when no request of that id appears
+ *             within FXP_SPAWN_FRAMES (6) frames, once more at dummy poly 1.
  *   behavior  a BehaviorParam_PC row, and
  *   goods     an EquipParamGoods row, both through the character's behaviour
  *             call sub_1cb61c0(emit, chr + 0x178, chr), where every bullet a
@@ -128,20 +127,27 @@ static int load_plan(const char* path) {
     return nshots;
 }
 
-/* --- requests --------------------------------------------------------------------------------- */
-#define MAXR 2048
-#define MAXN 512  /* nodes remembered per request */
-#define MAXC 16   /* classes remembered per request */
+/* --- effect instances ------------------------------------------------------------------------ */
+/* Every effect instance whose nodes run their container updates (the hook below sees each call: (node + 0x80, &step,
+ * ...); node +0x58 its instance), whatever made it: a SprjSfx request (a character's effects, map effects), a bullet
+ * (its effects are made in the manager directly, sub_23786e0), the event scripts' CreateSfx. Its effect id: the
+ * instance +0 is the definition sub_2c53020 hands it (*(definition data + 8)); the FXR's root object holds the id
+ * (type 0x85 at +0, the id at +8; in a whole file, "FXR\0" at +0 and the id at +0x38). An instance not seen for
+ * GONE_FRAMES frames has gone; one whose definition changed is a new instance in the old one's memory. */
+#define MAXI 4096
+#define MAXN 512  /* nodes remembered per instance */
+#define MAXC 16   /* classes remembered per instance */
+#define GONE_FRAMES 8
 typedef struct {
     uint64_t node;
     uint32_t state, count;
     uint8_t staged, seen;
 } NodeRec;
 typedef struct {
-    uint64_t req, inst;
-    uint32_t id, state;
-    int shot, plan, live, seen;  /* the shot made (counting repeats) and its line in the plan */
-    uint64_t born, born_ticks, retired;
+    uint64_t inst, def;
+    uint32_t id;
+    int shot, plan, ambient, finished;  /* the shot made (counting repeats) and its line in the plan; ambient: the place's own */
+    uint64_t born, born_ticks, last_seen;
     /* node tree */
     NodeRec nodes[MAXN];
     int nnodes, nodes_total, nodes_lost;
@@ -152,16 +158,19 @@ typedef struct {
     uint32_t cur_whole, cur_held, cur_smooth;  /* this frame's calls */
     double cur_step_sum;
     uint32_t calls_whole, calls_held, calls_smooth;
-    uint32_t frames_whole, frames_kept, frames_smooth, frames_none;
+    uint32_t frames_whole, frames_kept, frames_smooth;
     double step_sum_whole, step_sum_between;
     /* the first frames' root node position (the flight of a bullet's effect) */
     float path[8][3];
     int npath;
-} Req;
-static Req* rq;  /* MAXR */
+} Inst;
+static Inst* in;  /* MAXI, dense: the first ninst used */
+static int ninst;
+static int tracking;  /* the hook makes slots for new instances */
+static uint64_t lost_insts;
 static int shot_cur = -1, shot_rep = 0, shot_index = 0;  /* the plan's shot, its repeat; shot_index counts every shot made */
 static uint64_t shot_at, shot_end_at;
-#define MAXAMB 1024
+#define MAXAMB 2048
 static uint32_t ambient[MAXAMB];
 static int nambient;
 static int is_ambient(uint32_t id) {
@@ -169,36 +178,80 @@ static int is_ambient(uint32_t id) {
         if (ambient[i] == id) return 1;
     return 0;
 }
+static void add_ambient(uint32_t id) {
+    if (id && !is_ambient(id) && nambient < MAXAMB) ambient[nambient++] = id;
+}
 
-/* instance -> request, for the hook (under mu) */
-#define IMAP 8192
+/* instance -> slot (rebuilt each frame; the hook adds the new) */
+#define IMAP 16384
 static uint64_t imap_inst[IMAP];
-static int imap_req[IMAP];
-static void imap_rebuild(void) {
-    memset(imap_inst, 0, sizeof imap_inst);
-    for (int i = 0; i < MAXR; ++i) {
-        if (!rq[i].live || !heap_ptr(rq[i].inst)) continue;
-        uint32_t h = (uint32_t)((rq[i].inst >> 4) * 2654435761u) & (IMAP - 1);
-        for (int k = 0; k < 64; ++k, h = (h + 1) & (IMAP - 1))
-            if (!imap_inst[h] || imap_inst[h] == rq[i].inst) {
-                imap_inst[h] = rq[i].inst;
-                imap_req[h] = i;
-                break;
-            }
-    }
+static int imap_slot[IMAP];
+static void imap_put(uint64_t inst, int slot) {
+    uint32_t h = (uint32_t)((inst >> 4) * 2654435761u) & (IMAP - 1);
+    for (int k = 0; k < 256; ++k, h = (h + 1) & (IMAP - 1))
+        if (!imap_inst[h] || imap_inst[h] == inst) {
+            imap_inst[h] = inst;
+            imap_slot[h] = slot;
+            return;
+        }
 }
 static int imap_find(uint64_t inst) {
     uint32_t h = (uint32_t)((inst >> 4) * 2654435761u) & (IMAP - 1);
-    for (int k = 0; k < 64; ++k, h = (h + 1) & (IMAP - 1)) {
-        if (imap_inst[h] == inst) return imap_req[h];
+    for (int k = 0; k < 256; ++k, h = (h + 1) & (IMAP - 1)) {
+        if (imap_inst[h] == inst) return imap_slot[h];
         if (!imap_inst[h]) return -1;
     }
     return -1;
+}
+static void imap_rebuild(void) {
+    memset(imap_inst, 0, sizeof imap_inst);
+    for (int i = 0; i < ninst; ++i) imap_put(in[i].inst, i);
+}
+
+/* An instance's effect id: the FXR's root object (type 0x85 at +0, the id at +8) or the whole file ("FXR\0" at +0,
+ * the id at +0x38), reached from the instance by one pointer (+o1) or two (+o1, then +o2). The path is the one the
+ * place's own requests agree with at the start (calibrate_ids: each request's instance +0x88 and id +0x68) - the
+ * instance +0 is what sub_2c53020 gives it from the effect's definition. */
+static int id_o1 = 0, id_o2 = -1;
+static uint32_t id_from(uint64_t inst, int o1, int o2) {
+    uint64_t p = r64(inst + (uint64_t)o1);
+    if (o2 >= 0) p = heap_ptr(p) ? r64(p + (uint64_t)o2) : 0;
+    if (!heap_ptr(p)) return 0;
+    const uint32_t w = r32(p);
+    if (w == 0x85) return r32(p + 8);
+    if (w == 0x00525846) return r32(p + 0x38);  /* "FXR\0" */
+    return 0;
+}
+static uint32_t id_of_inst(uint64_t inst) { return heap_ptr(inst) ? id_from(inst, id_o1, id_o2) : 0; }
+static void calibrate_ids(void) {
+    uint64_t inst[64];
+    uint32_t rid[64];
+    int n = 0;
+    const uint64_t sfx = r64(api->guest_addr(0x5940370));
+    const uint64_t head = sfx ? r64(sfx + 0x10) : 0;
+    uint64_t q = head ? r64(head) : 0;
+    for (int k = 0; q && q != head && k < 20000 && n < 64; ++k, q = r64(q)) {
+        const uint64_t req = r64(q + 0x10);
+        const uint64_t i = req ? r64(req + 0x88) : 0;
+        if (heap_ptr(i)) inst[n] = i, rid[n] = r32(req + 0x68), ++n;
+    }
+    int best = -1, b1 = 0, b2 = -1;
+    for (int o1 = 0; o1 < 0x98; o1 += 8)
+        for (int o2 = -8; o2 < 0x40; o2 += 8) {
+            const int oo2 = o2 < 0 ? -1 : o2;
+            int m = 0;
+            for (int k = 0; k < n; ++k) m += rid[k] && id_from(inst[k], o1, oo2) == rid[k];
+            if (m > best) best = m, b1 = o1, b2 = oo2;
+        }
+    if (best > 0) id_o1 = b1, id_o2 = b2;
+    api->log("fxp: f%llu effect ids from instances: the pointer at +0x%x, then %d (-1: none); %d of %d of the place's requests agree%s",
+             (unsigned long long)frames, id_o1, id_o2, best, n, best > 0 ? "" : " - NO PATH FOUND, ids unread");
 }
 
 /* this frame's kind, from the container calls: 1 a whole step, 2 between steps, 0 no call seen */
 static volatile int frame_kind;
 static uint64_t frames_whole, frames_between;
+static uint64_t ticks;  /* frames with a whole effect step so far */
 
 static int h_container(BbHookCtx* ctx, void* user) {
     (void)user;
@@ -207,15 +260,30 @@ static int h_container(BbHookCtx* ctx, void* user) {
     const float step = f32of(r32(ctx->arg[1]));
     const float sv = slot_value();
     const int between = sv == 0.0f;
+    const uint64_t inst = r64(c - 0x80 + 0x58);
     pthread_mutex_lock(&mu);
     if (between) {
         if (frame_kind != 1) frame_kind = 2;
     } else {
         frame_kind = 1;
     }
-    const int i = imap_find(r64(c - 0x80 + 0x58));
+    int i = heap_ptr(inst) ? imap_find(inst) : -1;
+    if (i < 0 && tracking && heap_ptr(inst)) {
+        if (ninst < MAXI) {
+            i = ninst++;
+            Inst* n = &in[i];
+            memset(n, 0, sizeof *n);
+            n->inst = inst;
+            n->born = frames + 1;  /* the frame now running: on_frame counts it when it ends */
+            n->born_ticks = ticks;
+            n->shot = -2;  /* to be attributed at the frame's end */
+            imap_put(inst, i);
+        } else {
+            ++lost_insts;
+        }
+    }
     if (i >= 0) {
-        Req* r = &rq[i];
+        Inst* r = &in[i];
         if (!between) ++r->cur_whole, r->cur_step_sum += step;
         else if (step != 0.0f) ++r->cur_smooth, r->cur_step_sum += step;
         else ++r->cur_held;
@@ -342,8 +410,8 @@ static void dump_words(void) {
     rename(tmp, out);
 }
 
-/* --- a request's node tree, once a frame ------------------------------------------------------ */
-static void add_class(Req* r, uint64_t obj) {
+/* --- an instance's node tree, once a frame ---------------------------------------------------- */
+static void add_class(Inst* r, uint64_t obj) {
     if (!heap_ptr(obj)) return;
     const uint32_t cls = bn_of(r64(obj));
     if (!cls) return;
@@ -351,7 +419,7 @@ static void add_class(Req* r, uint64_t obj) {
         if (r->classes[i] == cls) return;
     if (r->nclasses < MAXC) r->classes[r->nclasses++] = cls;
 }
-static void walk(Req* r) {
+static void walk(Inst* r) {
     const uint64_t inst = r->inst;
     if (!heap_ptr(inst)) return;
     for (int i = 0; i < r->nnodes; ++i) r->nodes[i].seen = 0;
@@ -431,21 +499,9 @@ static void walk(Req* r) {
     }
 }
 
-/* --- the request list, once a frame ----------------------------------------------------------- */
+/* --- the instances, once a frame ------------------------------------------------------------- */
 static const char* fam_of(int p) { return p >= 0 && p < nshots ? plan[p].family : "-"; }
-static Req* find_req(uint64_t req) {
-    for (int i = 0; i < MAXR; ++i)
-        if (rq[i].live && rq[i].req == req) return &rq[i];
-    return 0;
-}
-static Req* new_req(void) {
-    for (int i = 0; i < MAXR; ++i)
-        if (!rq[i].live) return &rq[i];
-    return 0;
-}
-static uint64_t ticks;  /* frames with a whole effect step so far */
-static uint64_t lost_reqs;
-static void finish(Req* r, const char* how) {
+static void finish(Inst* r, const char* how) {
     char cls[MAXC * 9 + 2] = "";
     int o = 0;
     for (int i = 0; i < r->nclasses && o < (int)sizeof cls - 10; ++i) o += snprintf(cls + o, sizeof cls - (size_t)o, "%s%x", i ? "," : "", r->classes[i]);
@@ -453,61 +509,130 @@ static void finish(Req* r, const char* how) {
     o = 0;
     for (int i = 0; i < r->npath && o < (int)sizeof path - 40; ++i)
         o += snprintf(path + o, sizeof path - (size_t)o, "%s%.2f/%.2f/%.2f", i ? ";" : "", r->path[i][0], r->path[i][1], r->path[i][2]);
-    api->log("fxp: f%llu %s s%d %s %u req %llx life %llu frames %llu steps retired %lld nodes %d lost %d edges %u emissions %u "
-             "frames whole %u kept %u smooth %u none %u calls whole %u held %u smooth %u step whole %.4f between %.4f classes %s path %s",
-             (unsigned long long)frames, how, r->shot, fam_of(r->plan), r->id, (unsigned long long)r->req, (unsigned long long)(frames - r->born),
-             (unsigned long long)(ticks - r->born_ticks), r->retired ? (long long)(r->retired - r->born) : -1LL, r->nodes_total, r->nodes_lost,
-             r->edges, r->emissions, r->frames_whole, r->frames_kept, r->frames_smooth, r->frames_none, r->calls_whole, r->calls_held,
-             r->calls_smooth, r->step_sum_whole, r->step_sum_between, cls[0] ? cls : "-", path[0] ? path : "-");
+    const uint64_t life = r->last_seen >= r->born ? r->last_seen - r->born + 1 : 0;
+    api->log("fxp: f%llu %s s%d %s %u inst %llx life %llu frames %llu steps retired -1 nodes %d lost %d edges %u emissions %u "
+             "frames whole %u kept %u smooth %u none 0 calls whole %u held %u smooth %u step whole %.4f between %.4f classes %s path %s",
+             (unsigned long long)frames, how, r->shot, fam_of(r->plan), r->id, (unsigned long long)r->inst, (unsigned long long)life,
+             (unsigned long long)(ticks - r->born_ticks), r->nodes_total, r->nodes_lost, r->edges, r->emissions, r->frames_whole, r->frames_kept,
+             r->frames_smooth, r->calls_whole, r->calls_held, r->calls_smooth, r->step_sum_whole, r->step_sum_between, cls[0] ? cls : "-",
+             path[0] ? path : "-");
 }
 static int shot_live(int shot) {
     int n = 0;
-    for (int i = 0; i < MAXR; ++i) n += rq[i].live && rq[i].shot == shot;
+    for (int i = 0; i < ninst; ++i) n += !in[i].finished && in[i].shot == shot;
+    return n;
+}
+/* The SprjSfx requests (+0x10: a ring, the request at +0x10; its effect id +0x68, its instance +0x88), each frame:
+ * their ids checked against their instances' (the id from the definition), and the requests a shot made logged as
+ * they come and go ("req new" / "req gone") - a request whose instance never runs its nodes (none of its frames reach
+ * the hook) is in the log only this way. */
+static uint64_t id_checked, id_differ;
+#define MAXQ 1024
+typedef struct {
+    uint64_t req, inst;
+    uint32_t id;
+    int shot, plan, seen, live;
+    uint64_t born;
+} Rq;
+static Rq rqs[MAXQ];
+static void check_requests(void) {
+    const uint64_t sfx = r64(api->guest_addr(0x5940370));
+    const uint64_t head = sfx ? r64(sfx + 0x10) : 0;
+    uint64_t n = head ? r64(head) : 0;
+    for (int i = 0; i < MAXQ; ++i) rqs[i].seen = 0;
+    for (int k = 0; n && n != head && k < 20000; ++k, n = r64(n)) {
+        const uint64_t req = r64(n + 0x10);
+        if (!req) continue;
+        const uint64_t inst = r64(req + 0x88);
+        const uint32_t rid = r32(req + 0x68);
+        const int i = heap_ptr(inst) ? imap_find(inst) : -1;
+        if (i >= 0 && !in[i].ambient && in[i].shot >= 0) {
+            ++id_checked;
+            if (rid != in[i].id && id_differ++ < 8)
+                api->log("fxp: f%llu instance %llx: its definition says %u, its request %u", (unsigned long long)frames, (unsigned long long)inst, in[i].id, rid);
+        }
+        Rq* q = 0;
+        for (int j = 0; j < MAXQ; ++j)
+            if (rqs[j].live && rqs[j].req == req && rqs[j].id == rid) { q = &rqs[j]; break; }
+        if (!q) {
+            if (shot_cur < 0 || is_ambient(rid)) continue;
+            for (int j = 0; j < MAXQ; ++j)
+                if (!rqs[j].live) { q = &rqs[j]; break; }
+            if (!q) continue;
+            q->req = req, q->inst = inst, q->id = rid, q->shot = shot_index - 1, q->plan = shot_cur, q->live = 1, q->born = frames;
+            api->log("fxp: f%llu req new s%d %s %u req %llx inst %llx", (unsigned long long)frames, q->shot, fam_of(q->plan), rid, (unsigned long long)req,
+                     (unsigned long long)inst);
+        }
+        q->seen = 1;
+    }
+    for (int j = 0; j < MAXQ; ++j)
+        if (rqs[j].live && !rqs[j].seen) {
+            api->log("fxp: f%llu req gone s%d %s %u req %llx life %llu frames", (unsigned long long)frames, rqs[j].shot, fam_of(rqs[j].plan), rqs[j].id,
+                     (unsigned long long)rqs[j].req, (unsigned long long)(frames - rqs[j].born));
+            rqs[j].live = 0;
+        }
+}
+static int req_live(int shot) {
+    int n = 0;
+    for (int j = 0; j < MAXQ; ++j) n += rqs[j].live && rqs[j].shot == shot;
     return n;
 }
 static int seen_id_since(uint32_t id, uint64_t since) {
-    for (int i = 0; i < MAXR; ++i)
-        if (rq[i].live && rq[i].id == id && rq[i].born >= since) return 1;
+    for (int i = 0; i < ninst; ++i)
+        if (in[i].id == id && in[i].born >= since) return 1;
+    for (int j = 0; j < MAXQ; ++j)
+        if (rqs[j].live && rqs[j].id == id && rqs[j].born >= since) return 1;
     return 0;
 }
-static void track(void) {
-    const uint64_t sfx = r64(api->guest_addr(0x5940370));
-    const uint64_t head = sfx ? r64(sfx + 0x10) : 0;
-    for (int i = 0; i < MAXR; ++i) rq[i].seen = 0;
-    if (head) {
-        uint64_t n = r64(head);
-        for (int k = 0; n && n != head && k < 20000; ++k, n = r64(n)) {
-            const uint64_t req = r64(n + 0x10);
-            if (!req) continue;
-            const uint32_t id = r32(req + 0x68), state = r32(req + 0xc);
-            Req* r = find_req(req);
-            if (r && r->id != id) {  /* the same memory, a new request: the old one ended */
-                finish(r, "gone");
-                r->live = 0;
-                r = 0;
+/* At a frame's end (mu held): fold the frame's calls, name and attribute the new instances, end the gone. */
+static void instances_frame(void) {
+    for (int i = 0; i < ninst; ++i) {
+        Inst* r = &in[i];
+        if (r->finished) continue;
+        const int seen = r->cur_whole || r->cur_held || r->cur_smooth;
+        if (seen) {
+            r->last_seen = frames;
+            r->calls_whole += r->cur_whole, r->calls_held += r->cur_held, r->calls_smooth += r->cur_smooth;
+            if (r->cur_whole) ++r->frames_whole, r->step_sum_whole += r->cur_step_sum;
+            else if (r->cur_smooth) ++r->frames_smooth, r->step_sum_between += r->cur_step_sum;
+            else if (r->cur_held) ++r->frames_kept;
+        }
+        r->cur_whole = r->cur_held = r->cur_smooth = 0;
+        r->cur_step_sum = 0;
+        const uint64_t def = r64(r->inst + (uint64_t)id_o1);
+        if (r->shot == -2) {  /* new: its id, the shot it is part of, or the place's own */
+            r->def = def;
+            r->id = id_of_inst(r->inst);
+            if (shot_cur < 0) {
+                r->ambient = 1;
+                add_ambient(r->id);
+                r->shot = -1;
+            } else if (is_ambient(r->id) || !r->id) {
+                static int unnamed;
+                if (!r->id && unnamed++ < 8)
+                    api->log("fxp: f%llu instance %llx: no effect id in its definition %llx (%08x %08x %08x %08x)", (unsigned long long)frames,
+                             (unsigned long long)r->inst, (unsigned long long)def, r32(def), r32(def + 4), r32(def + 8), r32(def + 12));
+                r->ambient = 1;
+                r->shot = -1;
+            } else {
+                r->shot = shot_index - 1;
+                r->plan = shot_cur;
+                api->log("fxp: f%llu new s%d %s %u inst %llx", (unsigned long long)frames, r->shot, fam_of(r->plan), r->id, (unsigned long long)r->inst);
             }
-            if (!r) {
-                if (shot_cur < 0 || is_ambient(id)) continue;
-                r = new_req();
-                if (!r) { ++lost_reqs; continue; }
-                memset(r, 0, sizeof *r);
-                r->req = req, r->id = id, r->state = state, r->shot = shot_index - 1, r->plan = shot_cur, r->live = 1;
-                r->born = frames, r->born_ticks = ticks;
-                r->inst = r64(req + 0x88);
-                api->log("fxp: f%llu new s%d %s %u req %llx inst %llx", (unsigned long long)frames, r->shot, fam_of(r->plan), id,
-                         (unsigned long long)req, (unsigned long long)r->inst);
-            }
-            if (!heap_ptr(r->inst)) r->inst = r64(req + 0x88);
-            if (state == 3 && !r->retired) r->retired = frames;
-            r->state = state;
-            r->seen = 1;
+        } else if (def != r->def || (!seen && frames - r->last_seen >= GONE_FRAMES)) {
+            if (!r->ambient) finish(r, "gone");
+            r->finished = 1;
         }
     }
-    for (int i = 0; i < MAXR; ++i)
-        if (rq[i].live && !rq[i].seen) {
-            finish(&rq[i], "gone");
-            rq[i].live = 0;
+    /* the finished out, the rest packed */
+    int k = 0;
+    for (int i = 0; i < ninst; ++i)
+        if (!in[i].finished) {
+            if (k != i) in[k] = in[i];
+            ++k;
         }
+    ninst = k;
+    imap_rebuild();
 }
 
 /* --- the shots -------------------------------------------------------------------------------- */
@@ -593,13 +718,58 @@ static int call_behavior(uint64_t chr, int goods, int behavior, int bullet, floa
     return rc ? -1 : (int)(r.ret & 0xff);
 }
 
-static void sfx_at(int dummy, int id) {
+/* An effect on one of the player's dummy polys as the character's own effects are made (sub_1ca6410's pattern): a
+ * SprjSfx request for the character (sub_2378160(&request, SprjSfx, chr, &effect id, *0x57bf090 + 0x30), queued for
+ * SprjSfx's next update, which moves it to its list +0x10), its offset +0x30..+0x4f from 0x593e970, then bound to the
+ * dummy poly of the model PlayerIns vfunc +0x6b0 names for the id (0 body - 999, a weapon's or armour's by the
+ * thousands) through sub_2372fd0, and the reference handed back dropped (the list keeps its own). A dummy poly whose
+ * model is not there (a weapon not in hand) is the body's dummy poly 1. Returns the dummy poly used, -1 for none made.
+ * (CreateSfx_DummyPoly's work, sub_1719e10, makes its effects in the manager directly, with no request a harness can
+ * follow: not used.) */
+static int sfx_at(uint64_t chr, int dummy, int id) {
+    static int32_t eid, dmy_model, dmy_bind;
+    static uint64_t request;
+    const uint64_t sfx = r64(api->guest_addr(0x5940370));
+    const uint64_t params = r64(api->guest_addr(0x57bf090));
+    const uint64_t model_fn = bn_of(r64(r64(chr) + 0x6b0));
+    if (!sfx || !params || !model_fn) return -1;
     BbCallRegs r;
     memset(&r, 0, sizeof r);
-    r.arg[1] = 10000;
-    r.arg[2] = (uint32_t)dummy;
-    r.arg[3] = (uint32_t)id;
-    api->call_guest(0x1719e10, &r);
+    dmy_model = dummy;
+    r.arg[0] = chr;
+    r.arg[1] = (uint64_t)(uintptr_t)&dmy_model;
+    if (api->call_guest(model_fn, &r)) return -1;
+    uint64_t model = r.ret;
+    if (!heap_ptr(model) && dummy != 1) {
+        dummy = 1;
+        dmy_model = 1;
+        memset(&r, 0, sizeof r);
+        r.arg[0] = chr;
+        r.arg[1] = (uint64_t)(uintptr_t)&dmy_model;
+        if (api->call_guest(model_fn, &r)) return -1;
+        model = r.ret;
+    }
+    if (!heap_ptr(model)) return -1;
+    eid = id;
+    request = 0;
+    memset(&r, 0, sizeof r);
+    r.arg[0] = (uint64_t)(uintptr_t)&request;
+    r.arg[1] = sfx;
+    r.arg[2] = chr;
+    r.arg[3] = (uint64_t)(uintptr_t)&eid;
+    r.arg[4] = params + 0x30;
+    if (api->call_guest(0x2378160, &r) || !heap_ptr(request)) return -1;
+    uint8_t offset[32];
+    if (!api->read(0x593e970, offset, sizeof offset)) memcpy((void*)(uintptr_t)(request + 0x30), offset, sizeof offset);
+    dmy_bind = dummy;
+    memset(&r, 0, sizeof r);
+    r.arg[0] = (uint64_t)(uintptr_t)&request;
+    r.arg[1] = (uint64_t)(uintptr_t)&dmy_bind;
+    r.arg[2] = model;
+    api->call_guest(0x2372fd0, &r);
+    volatile uint32_t* refs = (volatile uint32_t*)(uintptr_t)(request + 8);
+    if (*refs > 1) *refs -= 1;  /* ours; SprjSfx's list keeps its own */
+    return dummy;
 }
 
 /* the SpEffect's node on the player's list (ChrIns +0x1c8 -> +8, next +0x58, id +0x40), taken off by the game's removal */
@@ -663,7 +833,7 @@ static void start_shot(uint64_t chr) {
     ++shot_index;
     int rc = 0;
     if (s->kind == K_SFX) {
-        sfx_at(s->dummy, s->id);
+        rc = sfx_at(chr, s->dummy, s->id);  /* the dummy poly used */
     } else if (s->kind == K_BEHAVIOR) {
         rc = call_behavior(chr, -1, s->id, -1, s->pitch);
     } else if (s->kind == K_GOODS) {
@@ -687,26 +857,20 @@ static void start_shot(uint64_t chr) {
 
 static void on_frame(void* user) {
     (void)user;
-    /* the frame that just ended: its kind, and every live request's container calls in it */
+    /* the frame that just ended: its kind, and every instance's container calls in it */
     pthread_mutex_lock(&mu);
     const int fk = frame_kind;
     frame_kind = 0;
     transition = fk == 1 ? 0 : fk == 2 ? 1 : -1;
     if (fk == 1) ++frames_whole, ++ticks;
     else if (fk == 2) ++frames_between;
-    for (int i = 0; i < MAXR; ++i) {
-        Req* r = &rq[i];
-        if (!r->live) continue;
-        r->calls_whole += r->cur_whole, r->calls_held += r->cur_held, r->calls_smooth += r->cur_smooth;
-        if (r->cur_whole) ++r->frames_whole, r->step_sum_whole += r->cur_step_sum;
-        else if (r->cur_smooth) ++r->frames_smooth, r->step_sum_between += r->cur_step_sum;
-        else if (r->cur_held) ++r->frames_kept;
-        else ++r->frames_none;
-        r->cur_whole = r->cur_held = r->cur_smooth = 0;
-        r->cur_step_sum = 0;
-    }
     pthread_mutex_unlock(&mu);
     ++frames;
+    if (tracking) {
+        pthread_mutex_lock(&mu);
+        instances_frame();
+        pthread_mutex_unlock(&mu);
+    }
 
     if (stage == DONE) return;
     float at[3], yaw = 0;
@@ -737,22 +901,25 @@ static void on_frame(void* user) {
                  "place (%.2f %.2f %.2f): the player faces %sZ; %d shots, %.0f frames a game second",
                  (unsigned long long)frames, block, at[0], at[1], at[2], yaw, w ? "REFUSED" : "on", X[0], X[1], X[2], Y[0], Y[1], Y[2], Z[0], Z[1],
                  Z[2], P[0], P[1], P[2], forward_sign > 0 ? "+" : "-", nshots, fps);
-        /* the place's own effects: their ids stay out */
+        /* the place's own effects: every instance seen while it settles (their ids stay out), and the requests' */
         const uint64_t sfx = r64(api->guest_addr(0x5940370));
         const uint64_t head = sfx ? r64(sfx + 0x10) : 0;
         uint64_t n = head ? r64(head) : 0;
         for (int k = 0; n && n != head && k < 20000; ++k, n = r64(n)) {
             const uint64_t req = r64(n + 0x10);
-            const uint32_t id = req ? r32(req + 0x68) : 0;
-            if (id && !is_ambient(id) && nambient < MAXAMB) ambient[nambient++] = id;
+            if (req) add_ambient(r32(req + 0x68));
         }
-        api->log("fxp: f%llu the place's own effects: %d ids left out", (unsigned long long)frames, nambient);
+        calibrate_ids();
+        pthread_mutex_lock(&mu);
+        tracking = 1;
+        pthread_mutex_unlock(&mu);
         stage = SETTLE;
         stage_at = frames;
         return;
     }
     if (stage == SETTLE) {
         if (game_s(stage_at) < 1.0) return;
+        api->log("fxp: f%llu the place's own effects: %d ids left out", (unsigned long long)frames, nambient);
         stage = SHOOT;
         shot_cur = 0, shot_rep = 0;
         start_shot(chr);
@@ -761,10 +928,9 @@ static void on_frame(void* user) {
     }
 
     pthread_mutex_lock(&mu);
-    track();
-    for (int i = 0; i < MAXR; ++i)
-        if (rq[i].live) walk(&rq[i]);
-    imap_rebuild();
+    check_requests();
+    for (int i = 0; i < ninst; ++i)
+        if (!in[i].ambient && in[i].shot >= 0) walk(&in[i]);
     pthread_mutex_unlock(&mu);
     if (frames % (uint64_t)env_i("FXP_WORDS_EVERY", 3000) == 0) {
         pthread_mutex_lock(&mu);
@@ -779,8 +945,9 @@ static void on_frame(void* user) {
         if (s->kind == K_SFX && !spawn_retry_done && frames - shot_at >= (uint64_t)env_i("FXP_SPAWN_FRAMES", 6)) {
             spawn_retry_done = 1;
             if (!seen_id_since((uint32_t)s->id, shot_at) && s->dummy != 1) {
-                api->log("fxp: f%llu shot s%d: no %d at dummy poly %d; at dummy poly 1", (unsigned long long)frames, shot_index - 1, s->id, s->dummy);
-                sfx_at(1, s->id);
+                const int used = sfx_at(chr, 1, s->id);
+                api->log("fxp: f%llu shot s%d: no %d at dummy poly %d; at dummy poly 1 (%d)", (unsigned long long)frames, shot_index - 1, s->id, s->dummy,
+                         used);
             }
         }
         if (speffect_on && t >= s->arg) {
@@ -798,10 +965,10 @@ static void on_frame(void* user) {
             }
             ++dumps_made;
         }
-        const int live = shot_live(shot_index - 1);
+        const int live = shot_live(shot_index - 1) + req_live(shot_index - 1);
         const double min_s = env_f("FXP_MIN_S", 1.0), max_s = env_f("FXP_MAX_S", 15.0);
         if (t < min_s || speffect_on || (live && t < max_s)) return;
-        if (live) api->log("fxp: f%llu shot s%d: %d request(s) live at %.1f s, the cap - on to the next", (unsigned long long)frames, shot_index - 1, live, t);
+        if (live) api->log("fxp: f%llu shot s%d: %d instance(s) live at %.1f s, the cap - on to the next", (unsigned long long)frames, shot_index - 1, live, t);
         api->log("fxp: f%llu shot s%d done after %.2f s", (unsigned long long)frames, shot_index - 1, t);
         shot_end_at = frames;
         stage = TAIL;  /* the gap */
@@ -822,19 +989,18 @@ static void on_frame(void* user) {
     if (stage == FINAL) {
         /* every shot made: the last requests, then done */
         int live = 0;
-        for (int i = 0; i < MAXR; ++i) live += rq[i].live;
+        for (int i = 0; i < ninst; ++i) live += !in[i].ambient && in[i].shot >= 0;
         if (live && game_s(shot_end_at) < env_f("FXP_TAIL_S", 10.0)) return;
         pthread_mutex_lock(&mu);
-        for (int i = 0; i < MAXR; ++i)
-            if (rq[i].live) {
-                finish(&rq[i], "still");
-                rq[i].live = 0;
-            }
+        for (int i = 0; i < ninst; ++i)
+            if (!in[i].ambient && in[i].shot >= 0) finish(&in[i], "still");
+        tracking = 0;
         dump_words();
         pthread_mutex_unlock(&mu);
-        api->log("fxp: f%llu done: %d shots made, %llu frames with a whole step, %llu between, %llu requests not tracked, %llu word snapshots lost",
+        api->log("fxp: f%llu done: %d shots made, %llu frames with a whole step, %llu between, %llu instances not tracked, %llu word snapshots lost; "
+                 "ids checked against requests %llu, differing %llu",
                  (unsigned long long)frames, shot_index, (unsigned long long)frames_whole, (unsigned long long)frames_between,
-                 (unsigned long long)lost_reqs, (unsigned long long)wlost);
+                 (unsigned long long)lost_insts, (unsigned long long)wlost, (unsigned long long)id_checked, (unsigned long long)id_differ);
         stage = DONE;
         if (env_i("FXP_EXIT", 0)) request("exit\n");
     }
@@ -870,11 +1036,11 @@ BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* a) {
     img_rt = a->guest_addr(0x400000);
     int32_t rel = 0;
     if (!a->read(0x2377d4e, &rel, 4)) step_slot = a->guest_addr(0x2377d4e) + 4 + (int64_t)rel;
-    rq = calloc(MAXR, sizeof(Req));
+    in = calloc(MAXI, sizeof(Inst));
     snaps = calloc(SNAP, sizeof(Snap));
     wstats = calloc(WSTAT, sizeof(WStat));
     ostats = calloc(OSTAT, sizeof(OStat));
-    if (!rq || !snaps || !wstats || !ostats) return 1;
+    if (!in || !snaps || !wstats || !ostats) return 1;
     /* push rbp; mov rbp, rsp; push r15, r14, r13, r12, rbx; sub rsp, 0x128: the container update's own first bytes */
     static const uint8_t p_cont[20] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x81, 0xec, 0x28, 0x01, 0x00, 0x00};
     const int hk = a->hook2(0x2c4c8c0, p_cont, sizeof p_cont, h_container, 0);

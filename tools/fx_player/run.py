@@ -2,15 +2,16 @@
 """Make the player's combat effects at one place and measure them, one game run.
 
     tools/fx_player/run.py --bbhost BUILD --config TEST.toml --seed DATA --out DIR
-        [--place hunters-dream] [--stand X,Y,Z,DEG] [--fps 30|60|120] [--smooth 0|1]
+        [--place central-yharnam] [--stand X,Y,Z,DEG] [--fps 30|60|120] [--smooth 0|1]
         [--sim-frame-time] [--family NAME ...] [--repeat N] [--dumps 0.3,1.5]
         [--env BBHOST_X=Y ...] [--base RUN_DIR]
 
 plan.py's plan (every family, or --family), then a run of tools/area_check.py's
 machinery whose tour travels to --place (an area_check place: its lamp, its
-view), stands the player there (--stand: a spot of its own, in the map's
-frame), switches the enemies near it off, puts the camera behind the player
-and holds; fx_player.c (built here) waits until the player has been in the
+view; Central Yharnam's lamp square by default - the Hunter's Dream lawn draws
+at under a frame a second on a software renderer), stands the player there
+(--stand: a spot of its own, in the map's frame), switches the enemies near it
+off, puts the camera behind the player and holds; fx_player.c (built here) waits until the player has been in the
 place's block FXP_SETTLE frames with no loading screen, makes the plan's shots
 one after another, and ends the run when they are done. Then report.py on the
 run's log, into DIR/report.txt (against --base's run when given).
@@ -61,7 +62,7 @@ def main():
     ap.add_argument('--config', required=True, help='a test config (its [paths] app0 and eboot)')
     ap.add_argument('--seed', required=True)
     ap.add_argument('--out', required=True)
-    ap.add_argument('--place', default='hunters-dream', help='an area_check place (its lamp and view)')
+    ap.add_argument('--place', default='central-yharnam', help='an area_check place (its lamp and view)')
     ap.add_argument('--stand', help='X,Y,Z,DEG: a spot of its own in the place, the map\'s frame')
     ap.add_argument('--fps', type=int, default=30)
     ap.add_argument('--smooth', choices=('0', '1'), help='BBHOST_SFX_SMOOTH')

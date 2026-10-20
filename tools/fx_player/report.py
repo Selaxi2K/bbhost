@@ -49,10 +49,12 @@ SHOT = re.compile(r'fxp: f(\d+) shot s(\d+) (\d+)/(\d+) (\S+) (\S+) (\w+) (-?\d+
 FALLBACK = re.compile(r'fxp: f(\d+) shot s(\d+): no (\d+) at dummy poly (-?\d+)')
 SHOT_DONE = re.compile(r'fxp: f(\d+) shot s(\d+) done after ([\d.]+) s')
 CAPPED = re.compile(r'fxp: f(\d+) shot s(\d+): (\d+) request\(s\) live at')
-END = re.compile(r'fxp: f(\d+) (gone|still) s(-?\d+) (\S+) (\d+) req ([0-9a-f]+) life (\d+) frames (\d+) steps retired (-?\d+) nodes (\d+) lost (\d+) '
+END = re.compile(r'fxp: f(\d+) (gone|still) s(-?\d+) (\S+) (\d+) (?:req|inst) ([0-9a-f]+) life (\d+) frames (\d+) steps retired (-?\d+) nodes (\d+) lost (\d+) '
                  r'edges (\d+) emissions (\d+) frames whole (\d+) kept (\d+) smooth (\d+) none (\d+) calls whole (\d+) held (\d+) smooth (\d+) '
                  r'step whole (\S+) between (\S+) classes (\S+) path (\S+)')
 DONE = re.compile(r'fxp: f(\d+) done: (\d+) shots made, (\d+) frames with a whole step, (\d+) between')
+IDS = re.compile(r'ids checked against requests (\d+), differing (\d+)')
+REQ_GONE = re.compile(r'fxp: f(\d+) req gone s(-?\d+) (\S+) (\d+) req ([0-9a-f]+) life (\d+) frames')
 SMOOTH_ON = re.compile(r'frame rate: effect steps smooth: ')
 SIM_TIME = re.compile(r'frame rate: BBHOST_SIM_FRAME_TIME=1')
 SIM_FPS = re.compile(r'BBHOST_SFX_SIM_FPS=(\d+): the effects')
@@ -83,7 +85,7 @@ def read_words(path):
 def parse(text):
     r = {'fps': 30, 'shots': {}, 'ends': [], 'fallback': set(), 'capped': set(), 'smooth': bool(SMOOTH_ON.search(text)),
          'sim_time': bool(SIM_TIME.search(text)), 'sim_fps': None, 'done': None, 'kept_total': None, 'kept_classes': {},
-         'converted_count': None}
+         'converted_count': None, 'ids_checked': None, 'reqs': []}
     m = SIM_FPS.search(text)
     if m:
         r['sim_fps'] = int(m.group(1))
@@ -120,9 +122,16 @@ def parse(text):
                  'path': [] if g[23] == '-' else [tuple(float(v) for v in p.split('/')) for p in g[23].split(';')]}
             r['ends'].append(e)
             continue
+        m = REQ_GONE.search(line)
+        if m:
+            r['reqs'].append({'shot': int(m.group(2)), 'family': m.group(3), 'id': int(m.group(4)), 'life': int(m.group(6))})
+            continue
         m = DONE.search(line)
         if m:
             r['done'] = (int(m.group(2)), int(m.group(3)), int(m.group(4)))
+            m2 = IDS.search(line)
+            if m2:
+                r['ids_checked'] = (int(m2.group(1)), int(m2.group(2)))
             continue
         m = KEPT_LINE.search(line)
         if m:
@@ -189,6 +198,8 @@ def report(text, words, fams, base=None, name='', converted=None):
               ', the effects\' schedule as at %d (SIM)' % run['sim_fps'] if run['sim_fps'] else '')]
     if run['done']:
         lines.append('  %d shots made; frames with a whole effect step %d, between %d' % run['done'])
+        if run['ids_checked']:
+            lines.append('  effect ids read from the instances\' definitions, checked against their requests\' ids: %d checks, %d differ' % run['ids_checked'])
     else:
         lines.append('  THE PLAN DID NOT FINISH (no "done" line): %d shots made' % len(run['shots']))
     lines.append('  the converted list: %d classes%s' % (len(converted), ' (the build names %d)' % run['converted_count'] if run['converted_count'] else ''))
@@ -200,8 +211,14 @@ def report(text, words, fams, base=None, name='', converted=None):
     made = defaultdict(set)
     for e in run['ends']:
         made[e['shot']].add(e['id'])
+    for q in run['reqs']:
+        made[q['shot']].add(q['id'])
+    req_lives = defaultdict(list)
+    for q in run['reqs']:
+        req_lives[q['id']].append(q['life'] / fps)
+        fam_of.setdefault(q['id'], q['family'])
     lines.append('')
-    lines.append('shots (spawned = the shot made effect requests):')
+    lines.append('shots (spawned = the shot made effect instances):')
     for k, s in sorted(run['shots'].items()):
         got = made.get(k, set())
         lines.append('  s%-3d %-20s %-44s %-8s %9d: %s%s%s' % (
@@ -227,6 +244,11 @@ def report(text, words, fams, base=None, name='', converted=None):
         lines.append('== %s: %d effect ids seen%s' % (f, len(fid), ('; expected, not seen: ' + ' '.join(map(str, missing))) if missing else ''))
         fam_pass, fam_held, fam_kept = True, False, 0
         for i in fid:
+            if i not in ids:
+                rl = sorted(req_lives.get(i, []))
+                lines.append('  %8d%s request only: %d lives, life %s s - its instance ran no node updates, nothing to measure between steps' % (
+                    i, '' if i in expected or not expected else '+', len(rl), fmt(med(rl))))
+                continue
             st = id_stats(ids[i], fps)
             between = st['f_kept'] + st['f_smooth']
             off_list = [c for c in st['classes'] if c not in converted and c != COMPOSITE]
