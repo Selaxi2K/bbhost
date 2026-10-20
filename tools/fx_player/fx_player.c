@@ -212,17 +212,30 @@ static void imap_rebuild(void) {
  * the id at +0x38), reached from the instance by one pointer (+o1) or two (+o1, then +o2). The path is the one the
  * place's own requests agree with at the start (calibrate_ids: each request's instance +0x88 and id +0x68) - the
  * instance +0 is what sub_2c53020 gives it from the effect's definition. */
-static int id_o1 = 0, id_o2 = -1;
-static uint32_t id_from(uint64_t inst, int o1, int o2) {
+static int id_o1 = 0, id_o2 = -1, id_o3 = -1;
+static uint32_t id_from(uint64_t inst, int o1, int o2, int o3) {
     uint64_t p = r64(inst + (uint64_t)o1);
     if (o2 >= 0) p = heap_ptr(p) ? r64(p + (uint64_t)o2) : 0;
+    if (o3 >= 0) p = heap_ptr(p) ? r64(p + (uint64_t)o3) : 0;
     if (!heap_ptr(p)) return 0;
     const uint32_t w = r32(p);
-    if (w == 0x85) return r32(p + 8);
-    if (w == 0x00525846) return r32(p + 0x38);  /* "FXR\0" */
+    if (w == 0x85) return r32(p + 8);                             /* the root object: its type, then its id */
+    if (w == 0x00525846 || r32(p + 0x30) == 0x85) return r32(p + 0x38);  /* the file: "FXR\0", the root at +0x30 */
     return 0;
 }
-static uint32_t id_of_inst(uint64_t inst) { return heap_ptr(inst) ? id_from(inst, id_o1, id_o2) : 0; }
+/* An instance's id from the request that holds it (+0x88), for when its definition gives none: the requests' effects
+ * only - the ones a manager makes directly have no request. */
+static uint32_t req_id_of_inst(uint64_t inst) {
+    const uint64_t sfx = r64(api->guest_addr(0x5940370));
+    const uint64_t head = sfx ? r64(sfx + 0x10) : 0;
+    uint64_t q = head ? r64(head) : 0;
+    for (int k = 0; q && q != head && k < 20000; ++k, q = r64(q)) {
+        const uint64_t req = r64(q + 0x10);
+        if (req && r64(req + 0x88) == inst) return r32(req + 0x68);
+    }
+    return 0;
+}
+static uint32_t id_of_inst(uint64_t inst) { return heap_ptr(inst) ? id_from(inst, id_o1, id_o2, id_o3) : 0; }
 static void calibrate_ids(void) {
     uint64_t inst[64];
     uint32_t rid[64];
@@ -235,17 +248,19 @@ static void calibrate_ids(void) {
         const uint64_t i = req ? r64(req + 0x88) : 0;
         if (heap_ptr(i)) inst[n] = i, rid[n] = r32(req + 0x68), ++n;
     }
-    int best = -1, b1 = 0, b2 = -1;
-    for (int o1 = 0; o1 < 0x98; o1 += 8)
-        for (int o2 = -8; o2 < 0x40; o2 += 8) {
-            const int oo2 = o2 < 0 ? -1 : o2;
-            int m = 0;
-            for (int k = 0; k < n; ++k) m += rid[k] && id_from(inst[k], o1, oo2) == rid[k];
-            if (m > best) best = m, b1 = o1, b2 = oo2;
-        }
-    if (best > 0) id_o1 = b1, id_o2 = b2;
-    api->log("fxp: f%llu effect ids from instances: the pointer at +0x%x, then %d (-1: none); %d of %d of the place's requests agree%s",
-             (unsigned long long)frames, id_o1, id_o2, best, n, best > 0 ? "" : " - NO PATH FOUND, ids unread");
+    /* the shortest path that agrees with the most: one pointer, then two, then three */
+    int best = 0, b1 = 0, b2 = -1, b3 = -1;
+    for (int depth = 1; depth <= 3 && best < n; ++depth)
+        for (int o1 = 0; o1 < 0x98; o1 += 8)
+            for (int o2 = depth >= 2 ? 0 : -1; o2 < (depth >= 2 ? 0x40 : 0); o2 += depth >= 2 ? 8 : 1)
+                for (int o3 = depth >= 3 ? 0 : -1; o3 < (depth >= 3 ? 0x40 : 0); o3 += depth >= 3 ? 8 : 1) {
+                    int m = 0;
+                    for (int k = 0; k < n; ++k) m += rid[k] && id_from(inst[k], o1, o2, o3) == rid[k];
+                    if (m > best) best = m, b1 = o1, b2 = o2, b3 = o3;
+                }
+    if (best > 0) id_o1 = b1, id_o2 = b2, id_o3 = b3;
+    api->log("fxp: f%llu effect ids from instances: the pointer at +0x%x, then %d, then %d (-1: none); %d of %d of the place's requests agree%s",
+             (unsigned long long)frames, id_o1, id_o2, id_o3, best, n, best > 0 ? "" : " - NO PATH FOUND, ids unread");
 }
 
 /* this frame's kind, from the container calls: 1 a whole step, 2 between steps, 0 no call seen */
@@ -603,6 +618,10 @@ static void instances_frame(void) {
         if (r->shot == -2) {  /* new: its id, the shot it is part of, or the place's own */
             r->def = def;
             r->id = id_of_inst(r->inst);
+            static int from_req;
+            if (!r->id && shot_cur >= 0 && (r->id = req_id_of_inst(r->inst)) && from_req++ < 4)
+                api->log("fxp: f%llu instance %llx: its id %u from its request (its definition gives none)", (unsigned long long)frames,
+                         (unsigned long long)r->inst, r->id);
             if (shot_cur < 0) {
                 r->ambient = 1;
                 add_ambient(r->id);

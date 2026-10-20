@@ -43,6 +43,7 @@ TICK = 1.0 / 30
 FRAME_WORD = 0.9   # a word that changes on this share of whole-step frames or more is a frame word
 MOVING, HELD = 0.9, 0.1
 MIN_OBS = 8
+PLACE_LIFE = 20.0  # an id no family expects that lives longer (game seconds) or past the end is the place's, not the shot's
 
 READY = re.compile(r'fxp: f(\d+) ready in (\w+) .* (\d+) shots, (\d+) frames a game second')
 SHOT = re.compile(r'fxp: f(\d+) shot s(\d+) (\d+)/(\d+) (\S+) (\S+) (\w+) (-?\d+) dummy (-?\d+) pitch (\S+) repeat (\d+)/(\d+): (-?\d+)')
@@ -242,7 +243,7 @@ def report(text, words, fams, base=None, name='', converted=None):
         expected = set(fams.get(f, {}).get('expected', [])) if fams else set()
         missing = sorted(expected - set(fid))
         lines.append('== %s: %d effect ids seen%s' % (f, len(fid), ('; expected, not seen: ' + ' '.join(map(str, missing))) if missing else ''))
-        fam_pass, fam_held, fam_kept = True, False, 0
+        fam_pass, fam_held, fam_kept, fam_measured, fam_place = True, False, 0, 0, 0
         for i in fid:
             if i not in ids:
                 rl = sorted(req_lives.get(i, []))
@@ -250,6 +251,11 @@ def report(text, words, fams, base=None, name='', converted=None):
                     i, '' if i in expected or not expected else '+', len(rl), fmt(med(rl))))
                 continue
             st = id_stats(ids[i], fps)
+            if expected and i not in expected and (st['still'] or (st['life'] or 0) > PLACE_LIFE):
+                lines.append('  %8d+ lives %d, life %s s%s: the place\'s own, most likely (born during a shot, alive long past it) - not counted' % (
+                    i, st['n'], fmt(st['life']), ', %d still alive at the end' % st['still'] if st['still'] else ''))
+                fam_place += 1
+                continue
             between = st['f_kept'] + st['f_smooth']
             off_list = [c for c in st['classes'] if c not in converted and c != COMPOSITE]
             wv = word_verdicts(words, i, converted)
@@ -269,7 +275,9 @@ def report(text, words, fams, base=None, name='', converted=None):
             if wl:
                 lines.append('           words (* off the list): ' + ', '.join(wl))
             verdict = []
-            if between:
+            if st['f_whole'] + between == 0:
+                verdict.append('its nodes never updated (no container call) - nothing measured')
+            elif between:
                 if st['f_kept'] == 0 and st['f_smooth'] > 0:
                     verdict.append('smooth on every frame between steps')
                 elif st['f_smooth'] == 0:
@@ -280,6 +288,8 @@ def report(text, words, fams, base=None, name='', converted=None):
                     verdict.append('converted classes\' frame words: %d of %d move between steps, %d held' % (conv_moving, conv_fw, conv_held))
             else:
                 verdict.append('no frame between steps (every frame a whole step)')
+            if st['f_whole'] + between:
+                fam_measured += 1
             if run['smooth'] and between and (st['f_kept'] or conv_held):
                 fam_pass = False
             if between and st['f_smooth'] == 0:
@@ -297,18 +307,22 @@ def report(text, words, fams, base=None, name='', converted=None):
                         lo, hi = min(vals), max(vals)
                         span = ('%.2f' % lo) if lo == hi else ('%.2f-%.2f' % (lo, hi))
                         return lo - tol - 1e-6 <= v <= hi + tol + 1e-6, span
+                    ok_n, sn = within(st['n'], 'n', 1)
                     ok_l, sl = within(st['life'], 'life', TICK)
                     ok_e, se = within(st['edges'], 'edges', 1)
                     ok_m, sm = within(st['emissions'], 'emissions', 1)
-                    ok = ok_l and ok_e and ok_m
-                    verdict.append('against the base%s: life %s s, edges %s, emissions %s a life: %s' % (
-                        's' if len(bases) > 1 else '', sl, se, sm,
-                        'within a tick' if ok else 'DIFFERS (%s)' % ', '.join(n for n, o in (('life', ok_l), ('edges', ok_e), ('emissions', ok_m)) if not o)))
+                    ok = ok_n and ok_l and ok_e and ok_m
+                    verdict.append('against the base%s: lives %s, life %s s, edges %s, emissions %s a life: %s' % (
+                        's' if len(bases) > 1 else '', sn.split('.')[0] if '-' not in sn else sn, sl, se, sm,
+                        'within a tick' if ok else 'DIFFERS (%s)' % ', '.join(n for n, o in (('lives', ok_n), ('life', ok_l), ('edges', ok_e),
+                                                                                           ('emissions', ok_m)) if not o)))
                     if not ok:
                         fam_pass = False
             lines.append('           ' + '; '.join(verdict))
-        if not fid:
-            lines.append('   %s: NOTHING SPAWNED' % f)
+        if len(fid) == fam_place:
+            lines.append('   %s: NOTHING SPAWNED%s' % (f, ' (only the place\'s own effects in its shots\' windows)' if fid else ''))
+        elif not fam_measured:
+            lines.append('   %s: spawned, but nothing measured (no effect of it updated its nodes)' % f)
         elif run['smooth']:
             lines.append('   %s: %s' % (f, 'PASS (smooth, kept 0%s)' % (', the base agrees' if bstats is not None else '') if fam_pass else
                                        'not yet: %d frames kept%s' % (fam_kept, '' if fam_kept else ', see above')))
