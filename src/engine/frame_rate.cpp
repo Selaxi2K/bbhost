@@ -979,6 +979,19 @@ bool g_dt_unfloored = false;
 // The shortest frame each_frame believes: a guard against a zero or negative
 // measurement, not a limit (the title runs ~0.4 ms frames).
 constexpr float kShortestFrame = 1.0f / 20000.0f;
+// BBHOST_SIM_FRAME_TIME=1 (a test mode for slow devices, converted rates
+// only): each frame counts as its target's length - 1/60 at 60, 1/120 at 120,
+// the swing's (BBHOST_TEST_FPS_SWING) when it moves - instead of the time it
+// took, so a software device that runs a frame a second still steps the game
+// as at that rate: every clock of the game, the effects' schedule with them,
+// advances a target's length a frame. The game then runs slower than real
+// time; a loading screen (no target) keeps its measured time.
+const bool g_sim_frame_time = [] {
+    const char* e = std::getenv("BBHOST_SIM_FRAME_TIME");
+    const bool on = e && e[0] == '1';
+    if (on) host_log("frame rate: BBHOST_SIM_FRAME_TIME=1: each frame counts as its target's length (a test mode)");
+    return on;
+}();
 // BBHOST_BENCH_UNCAPPED=1 (with BBHOST_UNCAP=1, which completes flips at
 // once): every frame runs with no target - a measure of how fast the machine
 // can run the game's frames, not a way to play it: at 60 and 90 the steps
@@ -1114,6 +1127,7 @@ void sprj_flipper_update(SprjFlipper* f, FlipClock& clock, float target) {
     f->frame_history[idx].delayed_or_behind = f->frame_behind;
     const float frame_s = us_to_float(frame_us) / 1000000.0f;
     f->measured_frame_seconds = frame_s;
+    if (g_sim_frame_time && converted && f->target_frame_seconds > 0.0f) f->measured_frame_seconds = f->target_frame_seconds;
     // On time, unless this frame and the late ones before it overran their
     // budget (plus 1% of the target), in which case only when the allowance
     // is used up.

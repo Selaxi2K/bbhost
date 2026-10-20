@@ -314,7 +314,12 @@ whole steps as at N fps whatever the frame's time - the carry grows 1/N a
 frame - so a renderer far below N (lavapipe) runs the cadence N has, 1/30, 0,
 1/30, 0 ... at 60 with whole 1/30 s steps; the rest of the game keeps the
 frame's time (1/30 s a frame below 30 fps), so the effects run N/30 times
-slower than it. The start of the log says which rate
+slower than it. `BBHOST_SIM_FRAME_TIME=1` (a test switch, same rates) does
+the same for the whole game: each frame counts as its target's length (1/60 at
+60, the swing's when `BBHOST_TEST_FPS_SWING` moves it), so every clock the game
+steps by - the task step, physics, the effects' schedule, the wind - advances
+as at that rate however long the frame took, and a slow renderer runs the
+game in slow motion at the rate's steps. The start of the log says which rate
 runs and how many values and code sites were converted (`frame rate:` lines),
 and names any site whose bytes were not the expected ones (that rate is then
 refused: 90, 120 or uncapped falls back to 60).
