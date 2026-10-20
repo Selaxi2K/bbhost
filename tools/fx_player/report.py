@@ -1,27 +1,33 @@
 #!/usr/bin/env python3
 """What fx_player.c's log and word table say, per family and effect id.
 
-    tools/fx_player/report.py RUN_DIR [--base RUN_DIR ...] [--converted 13|19|0x..,0x..]
+    tools/fx_player/report.py RUN_DIR [--base RUN_DIR ...] [--off RUN_DIR] [--converted 13|19|0x..,0x..]
 
 RUN_DIR is a tools/fx_player/run.py output (ac/perf/run.log, words.tsv,
 families.json). Per shot: whether it made any effect. Per family and effect id:
-its requests' lives (median, game seconds), state edges and emissions (per life
-and per game second), the frames its containers ran (with a whole step;
+its instances' lives (median, game seconds), state edges and emissions (per
+life and per game second), the frames its containers ran (with a whole step;
 between steps with the frame's own step - "smooth" - or held - "kept"), the
 classes behind a kept frame that are not on the converted list (the build's:
 its exit report names how many; --converted 13, 19 or a 0x.. list to say),
-and the frame words: in each
-class's objects, the words that change on 90% or more of the frames with a
-whole step ("frame words"), and how many of those change on 90% or more of the
-frames between steps (moving) or on 10% or less (held).
+and the frame words: in each class's objects, the words that change on 90% or
+more of the frames with a whole step ("frame words"), and how many of those
+change on 90% or more of the frames between steps (moving) or on 10% or less
+(held).
 
-With --base (the same plan at the game's own 30, say; given more than once, the
-bases' spread is the reference: a second run of the same arm is the noise
-floor of what a birth's random draws move), each id's median life, edges and
-emissions per life against the bases', and the pass rule for the smooth steps:
-the converted classes' frame words move on the frames between steps, the
-lives agree within a tick (1/30 s) of the bases' and the edges and emissions
-within one, and no frame of the family was kept.
+--base: the same plan at the game's own 30 (given more than once, the bases'
+spread is the reference: a second run of the same arm is the noise floor of
+what a birth's random draws move); each id's count of lives, median life,
+edges and emissions per life against the bases'. --off: the same plan at the
+same rate with the smooth steps off. The pass rule for the smooth steps: no
+frame of the family was kept on the held path, and what its effects count -
+the count of lives, a life within a tick (1/30 s), the edges and emissions
+within one - is what they count with the steps off (with --off; without it,
+against the base). A rate differs from 30 in what the game around the effects
+does at it (the bullets' flight, the camera, the random draws they share), with
+the steps off as much as on, so with --off the base is shown, not judged.
+Held frame words of converted classes are shown, not judged: some of them count
+once a whole step by design (the light's flicker phase).
 """
 import argparse
 import json
@@ -34,10 +40,10 @@ from pathlib import Path
 # The converted classes (decomp/sfx/step_gate.cpp's kConverted) as the smooth steps' first two batches list them - the
 # 13 of the first, then the FFX light and the FFX-format GX types and wind source - by the count the build's exit report
 # names ("(N classes on it)"); and the composite motion, converted when its two parts are (the step gate looks through it).
-M21_CONVERTED = {0x570e650, 0x570e790, 0x570e710, 0x56eb2e0, 0x5756e50, 0x56e3090, 0x56e3100, 0x56eb1d0, 0x56eb120, 0x56eb220, 0x56ea9b0,
+FIRST_CONVERTED = {0x570e650, 0x570e790, 0x570e710, 0x56eb2e0, 0x5756e50, 0x56e3090, 0x56e3100, 0x56eb1d0, 0x56eb120, 0x56eb220, 0x56ea9b0,
                  0x56eaa90, 0x56eb290}
-M22_CONVERTED = M21_CONVERTED | {0x56ebba0, 0x56e35d0, 0x56e3530, 0x56e3580, 0x56ebe20, 0x56eadf0}
-CONVERTED_BY_COUNT = {13: M21_CONVERTED, 19: M22_CONVERTED}
+SECOND_CONVERTED = FIRST_CONVERTED | {0x56ebba0, 0x56e35d0, 0x56e3530, 0x56e3580, 0x56ebe20, 0x56eadf0}
+CONVERTED_BY_COUNT = {13: FIRST_CONVERTED, 19: SECOND_CONVERTED}
 COMPOSITE = 0x570e750
 TICK = 1.0 / 30
 FRAME_WORD = 0.9   # a word that changes on this share of whole-step frames or more is a frame word
@@ -194,7 +200,7 @@ def report(text, words, fams, base=None, name='', converted=None, off=None):
     bases = [] if base is None else (list(base) if isinstance(base, list) else [base])
     run = parse(text)
     if converted is None:
-        converted = CONVERTED_BY_COUNT.get(run['converted_count'], M21_CONVERTED)
+        converted = CONVERTED_BY_COUNT.get(run['converted_count'], FIRST_CONVERTED)
     fps = run['fps'] or 30
     ids, fam_of = by_id(run)
     lines = ['fx_player %s: %d frames a game second; effect steps smooth %s%s%s' %
