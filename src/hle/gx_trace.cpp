@@ -2842,9 +2842,10 @@ std::atomic<std::uint64_t> g_copy_calls{0}, g_copy_tokens{0}, g_copy_ranges{0}, 
 // usage, source, usage, size) is one such copy, and CopyResource's. Both
 // shaders copy size >> 2 whole dwords.
 std::uint64_t native_copy(Kind kind, const std::uint64_t* f) {
-    // A GX buffer the host keeps a copy of is never written after its
-    // creation: one a copy writes is retired (host/gxvk.h).
-    if (gxvk::buffers_on()) {
+    // A GX buffer the host keeps a copy of is immutable, which no copy may
+    // write: the compare mode retires (and counts) one a copy writes all the
+    // same (host/gxvk.h).
+    if (gxvk::watch_writes()) {
         if (kind == kCopyBuffers) {
             const std::uint64_t entries = f[2];
             const std::uint32_t count = static_cast<std::uint32_t>(f[1]);
@@ -6721,7 +6722,7 @@ void hle_gx_trace_arm(GuestMemory* mem) {
     int hooked = 0;
     for (std::uint64_t id = 0; id < kKinds; ++id) {
         if (id == kUpdateSubresource && !g_trace && !g_gx_cost_enabled && !g_watch_update && !g_upload_census && !gxvk::census() &&
-            !gxvk::buffers_on())
+            !gxvk::watch_writes())
             continue;
         if (id == kEmitDma && (!g_cp_census_hooks || gnm_dma_placed())) continue;  // ours notes its callers itself
         if (id == kCopyStructureCount && !g_count_copies) continue;

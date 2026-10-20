@@ -478,8 +478,6 @@ void register_holder(std::uint64_t key, std::uint64_t holder, Kind kind, bool in
             gxvk::census_texture_made(holder);
         }
     }
-    // A texture made over a kept buffer's memory: the buffer's end, unseen.
-    if (e.info.type >= 2 && e.info.type <= 4 && e.info.memory && e.info.bytes) gxvk::memory_written(e.info.memory, e.info.bytes, gxvk::kRetireReplaced);
     if (key & kMemoryKey) key = kMemoryKey | e.info.memory;
     register_entry(key, e);
 }
@@ -508,6 +506,9 @@ void register_entry(std::uint64_t key, Entry& e) {
             const GxResourceInfo& old = h->second.info;
             if (old.memory + old.bytes <= e.info.memory) continue;
             g_overlapped[old.type < 5 ? old.type : 0][e.info.type < 5 ? e.info.type : 0].fetch_add(1, std::memory_order_relaxed);
+            // A buffer the host keeps a copy of ended with this (host/gxvk.h;
+            // its lock is never held while the registry's is taken).
+            if (old.type == 1) gxvk::buffer_replaced(o->second);
             if (g_overlap_logged.fetch_add(1, std::memory_order_relaxed) < 12) {
                 host_log("gx-resources: resource %u (type %u) [0x%llx, +0x%x) made at flip %llu over live resource %u (type %u) [0x%llx, +0x%x) "
                          "made at flip %llu",
@@ -529,6 +530,7 @@ void register_entry(std::uint64_t key, Entry& e) {
                          old != g_by_holder.end() ? old->second.info.id : 0u, old != g_by_holder.end() ? old->second.info.type : 0u,
                          static_cast<unsigned long long>(old != g_by_holder.end() ? old->second.created_flip : 0), static_cast<unsigned long long>(m->second));
             }
+            if (const auto old = g_by_holder.find(m->second); old != g_by_holder.end() && old->second.info.type == 1) gxvk::buffer_replaced(m->second);
             if (old_holder_alive(m->second)) g_by_holder.erase(m->second);
         }
         g_by_memory[e.info.memory] = key;

@@ -24,7 +24,7 @@ namespace {
 using ull = unsigned long long;
 
 // Why a buffer is not kept, by the not-kept counts' index.
-const char* const kNotKept[8] = {"dynamic or staging", "default without initial data", "CPU access", "a constant buffer",
+const char* const kNotKept[8] = {"dynamic or staging", "default (UpdateSubresource and GPU copies may write it)", "CPU access", "a constant buffer",
                                  "a bind the GPU writes (unordered access, stream output)", "no vertex or index bind",
                                  "CPU-only memory (misc 0x4000)", "the table full"};
 const char* const kRetireName[kRetires] = {"updated", "mapped", "a GPU copy's destination", "its holder released", "its memory unmapped",
@@ -41,9 +41,15 @@ std::vector<std::uint32_t> g_free, g_retired_q;
 std::unordered_map<std::uint64_t, std::uint32_t> g_by_holder;
 std::map<std::uint64_t, std::uint32_t> g_by_memory;
 
+// Only immutable buffers are kept: Direct3D 11 - and GX after it - lets
+// nothing write one after its creation (no Map, no UpdateSubresource, no copy
+// into it), so nothing on GX's threads has to tell the table of a write.
+// (The 1a census found no UpdateSubresource of any buffer but constant
+// buffers; default buffers with data were 7-13 a session.)
 int not_kept(std::uint8_t usage, std::uint8_t cpu, std::uint8_t bind, std::uint32_t misc, bool initial_data) {
+    (void)initial_data;  // an immutable buffer always has it (the creator refuses one without)
     if (usage >= 2) return 0;
-    if (usage == 0 && !initial_data) return 1;
+    if (usage == 0) return 1;
     if (cpu) return 2;
     if (bind & 4) return 3;
     if (bind & 0x90) return 4;
@@ -94,6 +100,14 @@ bool retire_live_locked(std::uint32_t index, Retire why) {
     return e && retire_locked(index, entry_gen(e->word.load(std::memory_order_acquire)), why);
 }
 
+// The handle a holder's +0x14 carries now (0: none): a lock-free test of
+// whether the table can know the holder at all.
+std::uint32_t holder_handle(std::uint64_t holder) {
+    std::uint32_t h = 0;
+    std::memcpy(&h, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(holder + kHolderSpareA)), 4);
+    return is_handle(h) ? h : 0;
+}
+
 // The live entries whose memory overlaps [va, va + bytes), retired.
 void retire_overlapping_locked(std::uint64_t va, std::uint64_t bytes, Retire why) {
     if (g_by_memory.empty() || !bytes) return;
@@ -115,6 +129,11 @@ void write_handle(std::uint64_t holder, std::uint32_t handle) {
 
 bool buffers_on() {
     static const bool on = buffers_mode() != Buffers::kOff;
+    return on;
+}
+
+bool watch_writes() {
+    static const bool on = buffers_mode() == Buffers::kCompare;
     return on;
 }
 
@@ -150,6 +169,15 @@ void buffer_made(std::uint64_t holder, std::uint64_t memory, std::uint32_t bytes
                  std::uint32_t misc, bool initial_data) {
     if (!buffers_on() || !holder) return;
     int why = memory && bytes ? not_kept(usage, cpu, bind, misc, initial_data) : 5;
+    // A buffer the table does not keep - nearly every one GX makes, its
+    // constant buffers above all - takes no lock: no handle in its holder,
+    // unless the holder's memory last held a kept buffer whose end the table
+    // never heard of (its handle is still there), which is retired first.
+    if (why >= 0 && !holder_handle(holder)) {
+        g_not_kept[why].fetch_add(1, std::memory_order_relaxed);
+        write_handle(holder, 0);
+        return;
+    }
     std::uint32_t handle = 0;
     {
         std::lock_guard<std::mutex> lk(g_mu);
@@ -188,14 +216,24 @@ void buffer_made(std::uint64_t holder, std::uint64_t memory, std::uint32_t bytes
     write_handle(holder, handle);
 }
 
+// Both take the lock only for a holder that carries a handle: GX's threads
+// release, map and update buffers the table does not keep thousands of times
+// a frame (every constant buffer's update), and a lock taken on each - one
+// for every worker - more than doubled their time.
 void buffer_gone(std::uint64_t holder) {
-    if (!buffers_on() || !holder) return;
+    if (!buffers_on() || !holder || !holder_handle(holder)) return;
     std::lock_guard<std::mutex> lk(g_mu);
     if (auto h = g_by_holder.find(holder); h != g_by_holder.end()) retire_live_locked(h->second, kRetireGone);
 }
 
-void buffer_written(std::uint64_t holder, Retire why) {
+void buffer_replaced(std::uint64_t holder) {
     if (!buffers_on() || !holder) return;
+    std::lock_guard<std::mutex> lk(g_mu);
+    if (auto h = g_by_holder.find(holder); h != g_by_holder.end()) retire_live_locked(h->second, kRetireReplaced);
+}
+
+void buffer_written(std::uint64_t holder, Retire why) {
+    if (!buffers_on() || !holder || !holder_handle(holder)) return;
     std::lock_guard<std::mutex> lk(g_mu);
     if (auto h = g_by_holder.find(holder); h != g_by_holder.end()) retire_live_locked(h->second, why);
 }

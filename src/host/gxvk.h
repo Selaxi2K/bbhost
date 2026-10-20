@@ -117,6 +117,12 @@ void census_report();
 // today's path again. With 2 every binding takes today's path, and the
 // handle's is checked against it (gxvk_vk.cpp).
 bool buffers_on();
+// Whether GX's writes of buffers are watched for kept ones - its
+// UpdateSubresource hooked, its GPU copies' destinations looked up: with 2,
+// as a check (a kept buffer is immutable, which nothing may write). With 1
+// nothing on GX's threads looks: the hook alone, on every constant buffer's
+// update, cost the GX workers about a core.
+bool watch_writes();
 // The handle in a holder's +0x14: the tag in the top four bits, the entry's
 // generation, its index (host/gxvk_table.h). Any other value is no handle.
 constexpr std::uint32_t kHandleTag = 0xa0000000u, kHandleTagMask = 0xf0000000u;
@@ -141,6 +147,9 @@ enum Retire : int {
 void buffer_made(std::uint64_t holder, std::uint64_t memory, std::uint32_t bytes, std::uint8_t usage, std::uint8_t cpu, std::uint8_t bind,
                  std::uint32_t misc, bool initial_data);
 void buffer_gone(std::uint64_t holder);
+// The registry found the buffer at `holder` ended unseen (its memory given to
+// a new resource): its entry retired, whatever the holder's bytes are now.
+void buffer_replaced(std::uint64_t holder);
 void buffer_written(std::uint64_t holder, Retire why);
 void memory_written(std::uint64_t va, std::uint64_t bytes, Retire why);
 void memory_released(std::uint64_t va, std::uint64_t bytes);
