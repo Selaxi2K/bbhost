@@ -660,7 +660,17 @@ GUEST_ABI int hle_gnm_submit_flip(unsigned count, void** dcb, unsigned* dcb_byte
             host_log("  sync: %s", sync.c_str());
             host_log("  pacing: %s; %s", frame_rate_limiter_window().c_str(), hle_video_pacing_window().c_str());
         }
-        host_log("  %s", host_gpu_shadow_report().c_str());
+        {
+            // A line a call (host_log keeps 1 KiB of one): the shadow's main
+            // line, then its own lines after it (the in-place census).
+            const std::string r = host_gpu_shadow_report();
+            for (std::size_t at = 0; at <= r.size();) {
+                const std::size_t nl = r.find('\n', at);
+                host_log("  %s", r.substr(at, nl == std::string::npos ? std::string::npos : nl - at).c_str());
+                if (nl == std::string::npos) break;
+                at = nl + 1;
+            }
+        }
         if (const std::string r = host_gpu_recorder_report(); !r.empty()) host_log("  %s", r.c_str());
         if (const std::string r = host_gpu_occlusion_report(); !r.empty()) host_log("  %s", r.c_str());
         if (const std::string r = host_gpu_image_heap_report(); !r.empty()) host_log("  %s", r.c_str());

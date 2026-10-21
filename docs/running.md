@@ -227,7 +227,11 @@ ring and the texture upload scratch at their largest from the start. On a GPU
 without sparse binding (AMD, integrated GPUs) the vertex data's mirrors are
 made 64 MiB at a time as the game's meshes need them (16 MiB on an
 integrated GPU; `BBHOST_SHADOW_WINDOW_MB` sets it), rather than a whole
-gigabyte each (`BBHOST_SHADOW_WINDOWS=0` goes back to whole ones).
+gigabyte each (`BBHOST_SHADOW_WINDOWS=0` goes back to whole ones). On an
+integrated GPU, where those mirrors would be the same memory again, the
+meshes in the game's own vertex and index buffers are read where they are,
+with no copy (`BBHOST_SHADOW_IN_PLACE=0` copies them as before; `=1` reads
+them in place on any GPU).
 
 **AMD on Linux, no picture.** AMD's kernel driver only imports anonymous
 memory, so bbhost passes the game's memory to the GPU through `/dev/udmabuf`.
