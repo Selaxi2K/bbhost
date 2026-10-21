@@ -199,8 +199,10 @@ either way.
 
 **Black or broken image in the world, or slow on a card with little video
 memory.** bbhost follows the driver's video memory budget as the game runs:
-it keeps the last 512 MiB for render targets, puts textures in system memory
-when the card is down to that, and moves them back once there is room. Every
+it keeps the last 512 MiB for render targets (less on a card with under
+6 GB free: a twelfth of what is free at the start, at least 256 MiB), puts
+textures in system memory when the card is down to that, and moves them back
+once there is room. Every
 five seconds the log says `video memory: headroom ...`; look there, and for
 `video memory is full`, before anything else. Other programs holding video
 memory (browsers, OBS, a second game) shrink the budget. On a GPU with under

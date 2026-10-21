@@ -246,8 +246,9 @@ std::uint64_t g_given_back_ms = 0;   // when video memory last ran short (shadow
 std::uint64_t g_gives = 0, g_returns = 0;
 // The live share (shadow_live): a mirror block or a whole mirror is made only
 // while video memory keeps the reserve and this cushion above it for the
-// next area's textures (BBHOST_SHADOW_CUSHION_MB, 256); a page refused for
-// want of room is read from host memory by that draw and tried again later.
+// next area's textures (BBHOST_SHADOW_CUSHION_MB; a 24th of the budget at the
+// start, from 128 to 256 MiB, as the reserve scales); a page refused for want
+// of room is read from host memory by that draw and tried again later.
 bool g_live = false;
 std::uint64_t g_cushion = 256ull << 20;
 std::uint64_t g_room_refusals = 0;     // copies refused for want of room, counted per draw
@@ -2171,6 +2172,7 @@ void shadow_budget_locked() {
     // keeps the fixed share.
     const char* live = std::getenv("BBHOST_SHADOW_LIVE");
     g_live = !(e && *e) && vram_reserve_bytes() && !(live && live[0] == '0');
+    g_cushion = std::clamp<std::uint64_t>((g.local_budget >> 20) / 24, 128, 256) << 20;
     if (const char* c = std::getenv("BBHOST_SHADOW_CUSHION_MB"); c && *c) g_cushion = std::strtoull(c, nullptr, 10) << 20;
     g_mirror_cap = e && *e ? static_cast<std::uint64_t>(std::strtoull(e, nullptr, 10)) << 20
                    : g_live ? ~0ull
@@ -2178,8 +2180,11 @@ void shadow_budget_locked() {
     g_initial_cap = g_mirror_cap;
     if (!buffer_shadow_on()) return;
     if (g_live) {
+        char how[64];
+        std::snprintf(how, sizeof(how), "%llu MiB windows", static_cast<unsigned long long>(window_bytes() >> 20));
         host_log("buffer shadow: its mirrors may hold what video memory has free above the reserve and a %llu MiB cushion (%s)",
-                 static_cast<unsigned long long>(g_cushion >> 20), g.has_sparse ? "64 MiB blocks" : "whole 1 GiB mirrors: no sparse binding");
+                 static_cast<unsigned long long>(g_cushion >> 20),
+                 g.has_sparse ? "64 MiB blocks" : g_windows_on ? how : "whole 1 GiB mirrors: no sparse binding");
         return;
     }
     if (!g.has_sparse && g_mirror_cap < kChunkBytes) {

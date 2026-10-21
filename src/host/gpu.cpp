@@ -6544,15 +6544,21 @@ std::int64_t vram_headroom() {
     return g_budget_room - (static_cast<std::int64_t>(local) - static_cast<std::int64_t>(g_budget_local_at_read));
 }
 
-// The reserve: 512 MiB on a discrete GPU, none on an integrated one (its
-// video memory is the same RAM, and a Steam Deck's 1 GiB carve-out would be
-// half reserve) or with tight memory, whose own settings apply.
-// BBHOST_VRAM_RESERVE_MB sets it; 0 places everything until an allocation
-// fails, as before.
+// The reserve: on a discrete GPU a twelfth of the budget at the start, from
+// 256 to 512 MiB (512 from about 6 GB free, so an 8 GB card's as before);
+// none on an integrated one (its video memory is the same RAM, and a Steam
+// Deck's 1 GiB carve-out would be half reserve) or with tight memory, whose
+// own settings apply. With 512 a 4 GB card's budget kept 800 MiB free in play
+// - the reserve, the mirrors' cushion above it and a block - while half the
+// vertex data was read across the bus: 42-44 fps at the first Central Yharnam
+// lamp on the RTX 3070 Ti Laptop held to 2,950 MiB (BBHOST_TEST_VRAM_MB),
+// 58 with 256 and a 128 MiB cushion. BBHOST_VRAM_RESERVE_MB sets it; 0
+// places everything until an allocation fails, as before.
 void vram_reserve_init() {
     const char* e = std::getenv("BBHOST_VRAM_RESERVE_MB");
     const bool given = e && *e;
-    const std::uint64_t mib = given ? std::strtoull(e, nullptr, 10) : (g.integrated || g.tight ? 0 : 512);
+    const std::uint64_t scaled = std::clamp<std::uint64_t>((g.local_budget >> 20) / 12, 256, 512);
+    const std::uint64_t mib = given ? std::strtoull(e, nullptr, 10) : (g.integrated || g.tight ? 0 : scaled);
     g_vram_reserve = mib << 20;
     if (g_vram_reserve)
         host_log("gpu: video memory followed against the driver's budget, the last %llu MiB kept for render targets and device buffers%s",
