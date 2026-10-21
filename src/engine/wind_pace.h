@@ -10,9 +10,9 @@
 // step is a fixed 1/60 (0x4d29e70, loaded at 0x2713d8d): at 30 the wind runs
 // 1/60 s each 1/30 s of game time, half the game's pace. That is the wind the
 // game was made and shown at. Above 30 the frame-time site there gave it the
-// frame's step, a whole 1/60 s each 1/60 s at 60 - twice 30's pace (round 14:
-// slot ages 0.500 game s a game second at 30, 0.999 at 60 and 120; a push's
-// fade 1.5 s at 30, 0.75 s above). Half the frame's step keeps 30's pace at
+// frame's step, a whole 1/60 s each 1/60 s at 60 - twice 30's pace (measured
+// in the Hunter's Dream: slot ages 0.500 game s a game second at 30, 0.999 at
+// 60 and 120; a push's fade 1.5 s at 30, 0.75 s above). Half the frame's step keeps 30's pace at
 // every rate and still moves every frame.
 //
 // The same step weighed the force the function uploads (WindForceAndTime.xyz =
