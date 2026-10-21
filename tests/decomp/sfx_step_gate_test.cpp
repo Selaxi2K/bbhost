@@ -44,6 +44,16 @@
 //     call with the record's previous time +0x24 and the type's sizes +0x1c /
 //     +0x20 and colours +0x50..+0x7f put back - every other byte the game's,
 //     and the elapsed time the type's draw then reads the last whole step's;
+//   - the same record update with the ribbon, FFX-format GX type 0x28 (its
+//     update 0x2ec1e00 and set-up 0x2ec47f0 the game's), under the smooth
+//     steps at 60, 120, 144 and jittered rates, against the game's update once
+//     a whole step at the whole step's time and place: after every whole step
+//     its insert history (times, places, lengths, scalars, the seed, the end
+//     time) and the FX RNG bit-equal, the points both hold bit-equal (which
+//     old ones are held may differ by what a frame's own time lets go);
+//     between whole steps none of that moves and no point is smoothed; on
+//     every frame the last drawn point the emitter at the frame's own time, the
+//     record's times as the game's one call leaves them, the definition back;
 // and each of the source's mutants caught. Skips without the 1.09 eboot.
 #define DECOMP_SFX_STEP_GATE_MUTANTS
 int g_sfx_gate_mutant = 0;
@@ -1212,6 +1222,382 @@ int check_records(int cases, u64 sfx) {
     return bad;
 }
 
+// --- the ribbon (FFX-format GX type 0x28) under the smooth steps --------------------------
+
+// The ribbon's set-up allocates its point arrays from an allocator (vtable +0x58: (allocator, size, alignment)).
+GUEST_ABI u64 stub_ribbon_alloc(u64, u64 size, u64) { return block(size); }
+alignas(64) u8 g_ribbon_alloc_vt[0x80];
+alignas(64) u8 g_ribbon_alloc[0x10];
+// A property record of an FFX-format definition: kind 0 (the value of the last key at or before the time; for the
+// bounds' table, the largest value), its keys {count n, n times, n values}.
+void ribbon_property(u64 at, int keys, float lo, float hi) {
+    const u64 k = block(4 + 8 * static_cast<std::size_t>(keys));
+    store<s32>(k, keys);
+    float t = 0;
+    for (int i = 0; i < keys; ++i) {
+        store<float>(k + 4 + 4 * static_cast<u64>(i), t);
+        store<float>(k + 4 + 4 * static_cast<u64>(keys + i), value(lo, hi));
+        t += value(0.05f, 1.5f);
+    }
+    store<u64>(at, 0);
+    store<u64>(at + 8, k);
+}
+
+struct Ribbon {
+    u64 record, item, type, def, node, inst;
+    u8 rng[0x20];
+};
+// The type's word fields its update keeps (the end time +0x18 to the history's +0x74, room +0x78, +0x84), and the
+// point arrays: times, places, lengths, the scalar (+0xb0, unless +0x68's kind is 0x1c), the vectors (mode +0x3c 1).
+// (With the definition's +0x128 bit 1 every call writes the lengths' array afresh from the points' count and index -
+// a texture coordinate, not history: left out.)
+std::vector<u64> ribbon_arrays(const Ribbon& r) {
+    std::vector<u64> a = {0x88, 0x90, 0x98, 0xa0};
+    if (!(load<u32>(r.def + 0x128) & 2)) a.push_back(0xa8);
+    if (load<u32>(r.def + 0x68) != 0x1c) a.push_back(0xb0);
+    if (load<u32>(r.def + 0x3c) == 1)
+        for (const u64 off : {0xb8ull, 0xc0ull, 0xc8ull}) a.push_back(off);
+    return a;
+}
+bool ribbon_fields_same(const Ribbon& a, const Ribbon& b) {
+    return std::memcmp(reinterpret_cast<void*>(a.type + 0x18), reinterpret_cast<void*>(b.type + 0x18), 0x78 - 0x18 + 4) == 0 &&
+           load<u32>(a.type + 0x84) == load<u32>(b.type + 0x84);
+}
+// The kept points of a against those of b from index d on (b's first d gone early from a).
+bool ribbon_points_same(const Ribbon& a, const Ribbon& b, u32 d) {
+    const u32 n = load<u32>(a.type + 0x7c);
+    for (const u64 off : ribbon_arrays(a))
+        if (std::memcmp(reinterpret_cast<void*>(load<u64>(a.type + off)), reinterpret_cast<void*>(load<u64>(b.type + off) + 4 * static_cast<u64>(d)),
+                        4 * static_cast<std::size_t>(n)) != 0)
+            return false;
+    return true;
+}
+std::vector<u8> bytes_of_block(u64 p, std::size_t n) {
+    std::vector<u8> v(n);
+    std::memcpy(v.data(), reinterpret_cast<void*>(p), n);
+    return v;
+}
+std::vector<u8> ribbon_snapshot(const Ribbon& r) {
+    const u32 n = load<u32>(r.type + 0x7c);
+    std::vector<u8> v(0xf0);
+    std::memcpy(v.data(), reinterpret_cast<void*>(r.type), 0xf0);
+    for (const u64 off : ribbon_arrays(r)) {
+        const std::size_t at = v.size();
+        v.resize(at + 4 * static_cast<std::size_t>(n));
+        std::memcpy(v.data() + at, reinterpret_cast<void*>(load<u64>(r.type + off)), 4 * static_cast<std::size_t>(n));
+    }
+    return v;
+}
+// A snapshot's kept points against the ribbon's now, the first d gone since.
+bool ribbon_kept_since(const Ribbon& r, const std::vector<u8>& snap, u32 d) {
+    const u32 n = load<u32>(r.type + 0x7c), m = load<u32>(reinterpret_cast<u64>(snap.data()) + 0x7c);
+    if (n + d != m) return false;
+    std::size_t at = 0xf0;
+    for (const u64 off : ribbon_arrays(r)) {
+        if (std::memcmp(reinterpret_cast<void*>(load<u64>(r.type + off)), snap.data() + at + 4 * static_cast<std::size_t>(d), 4 * static_cast<std::size_t>(n)) != 0)
+            return false;
+        at += 4 * static_cast<std::size_t>(m);
+    }
+    return true;
+}
+
+// After a whole step, the frame domain's kept points (a) against the game's at 30 (b): both a run of the ribbon's
+// inserted points ending at its newest, the part both hold bit-equal. Which old points are still held differs: the
+// game drops the oldest a block of +0x94 + 1 at a time when the next block's first point has expired (or one by one
+// with few left) and makes room for an update's new points, once an update - the frame domain's frames between whole
+// steps do the same at their own, later, times, so a block or a room's worth goes a frame early, and the blocks then
+// fall at other points. So a point only one of them holds is past its life by the frame's time, give or take an
+// insert's spacing (`spacing`: the whole step past the definition's interval), or went for room.
+bool ribbon_tails_agree(const Ribbon& a, const Ribbon& b, float now, double spacing) {
+    const u32 na = load<u32>(a.type + 0x7c), nb = load<u32>(b.type + 0x7c);
+    if (!na || !nb) return na == nb || (na + nb) <= load<u32>(a.def + 0x94) + 2;
+    const u64 ta = load<u64>(a.type + 0x88), tb = load<u64>(b.type + 0x88);
+    // the newest the same, then where each one's oldest is in the other
+    if (load<u32>(ta + 4 * static_cast<u64>(na - 1)) != load<u32>(tb + 4 * static_cast<u64>(nb - 1))) return false;
+    u32 skip_a = 0, skip_b = 0;
+    if (na >= nb) skip_a = na - nb;
+    else skip_b = nb - na;
+    if (load<u32>(ta + 4 * static_cast<u64>(skip_a)) != load<u32>(tb + 4 * static_cast<u64>(skip_b))) return false;
+    const u32 common = na - skip_a;
+    for (const u64 off : ribbon_arrays(a))
+        if (std::memcmp(reinterpret_cast<void*>(load<u64>(a.type + off) + 4 * static_cast<u64>(skip_a)),
+                        reinterpret_cast<void*>(load<u64>(b.type + off) + 4 * static_cast<u64>(skip_b)), 4 * static_cast<std::size_t>(common)) != 0)
+            return false;
+    // the points only one of them holds
+    const float life = load<float>(a.def + 0x8c);
+    const u32 cap = load<u32>(b.type + 0x78), add = std::min(cap, 2 * load<u32>(b.def + 0x94) + 3);
+    const u32 room = nb + add > cap ? nb + add - cap : 0;
+    u32 young_b = 0;  // b's that a let go before their life ended: room's
+    for (u32 i = 0; i < skip_b; ++i)
+        if (!(static_cast<double>(load<float>(tb + 4 * static_cast<u64>(i))) + life <= static_cast<double>(now) + 1e-6)) ++young_b;
+    if (young_b > room) return false;
+    for (u32 i = 0; i < skip_a; ++i)
+        if (!(static_cast<double>(load<float>(ta + 4 * static_cast<u64>(i))) + life <= static_cast<double>(now) + spacing + 1e-6)) return false;
+    return true;
+}
+
+// The emitter: a place along a path (a line, a curve and a swing), rows the record's matrix (the place in the w lanes).
+struct Emitter {
+    float p0[3], v[3], a[3], amp[3], w;
+    float rows[12];
+    void at(double t, u64 out) const {
+        for (int i = 0; i < 3; ++i) {
+            const double x = p0[i] + v[i] * t + 0.5 * a[i] * t * t + amp[i] * std::sin(w * t);
+            store<float>(out + 16 * static_cast<u64>(i), rows[4 * i]);
+            store<float>(out + 16 * static_cast<u64>(i) + 4, rows[4 * i + 1]);
+            store<float>(out + 16 * static_cast<u64>(i) + 8, rows[4 * i + 2]);
+            store<float>(out + 16 * static_cast<u64>(i) + 12, static_cast<float>(x));
+        }
+    }
+};
+
+Ribbon make_ribbon(const Emitter& e, u64 def, float t0, float scale, const u8* rng) {
+    Ribbon r;
+    r.def = def;
+    r.record = block(0x80);
+    r.item = block(0x70);
+    r.type = block(0xf0);
+    r.node = block(0x100);
+    r.inst = block(0x98);
+    const u64 counts = block(0x20);  // +8 = 0: no buffers
+    store<u64>(r.record + 8, r.type);
+    store<u64>(r.record + 0x10, r.node);
+    store<u64>(r.record + 0x18, counts);
+    store<float>(r.record + 0x24, t0);
+    store<float>(r.record + 0x28, t0);
+    e.at(0.0, r.record + 0x50);
+    store<u32>(r.node + 0x78, 0);  // its time scale 1
+    store<u64>(r.node + 0x58, r.inst);
+    store<u32>(r.node + 0xdc, 3);
+    store<float>(r.inst + 8, scale);
+    // as sub_2cf80c0 makes one: the base, the vtable, then the set-up (the arrays, the first point, two draws)
+    eboot_kit::fn<GUEST_ABI void (*)(u64, u64)>(0x2ec4230)(r.type, def);
+    store<u64>(r.type, game_address(kGxTypeRibbon));
+    std::memcpy(g_rng_state, rng, sizeof g_rng_state);
+    eboot_kit::fn<GUEST_ABI u8 (*)(u64, u64, u64)>(0x2ec47f0)(r.type, r.record + 0x10, reinterpret_cast<u64>(g_ribbon_alloc));
+    std::memcpy(r.rng, g_rng_state, sizeof r.rng);
+    return r;
+}
+
+struct RibbonSeen {
+    long cases = 0, frames = 0, ticks = 0, between = 0, adjusted = 0, inserts = 0, smoothed = 0, gone_early = 0, ending = 0, degenerate = 0, too_small = 0;
+} g_seen_rb;
+
+// The ribbon's smooth steps (sfx_gx_record_update) against the game's own record update and ribbon update
+// (0x2cbcf50, 0x2ec1e00), the game's set-up (0x2ec47f0) making both: frame sequences at 60, 120, 144 and jittered rates,
+// the record's item each frame the frame's step and the emitter's place at the frame's end; against them, the game's
+// update once a whole step, as at 30, with the same place and the whole step's time on the frame domain's clock (the
+// record's time less the frame's carry past the step). After every whole step: the history (inserts' times and places,
+// lengths, scalars, the per-ribbon seed, the end time) and the FX RNG bit-equal, the kept points the same but for those
+// the frame's own time has already let go; between whole steps none of that moves; on every frame the last drawn point
+// the emitter's place at the frame's own time, the record's times as the game's one call leaves them and the
+// definition back in the type.
+int check_ribbons(int cases, u64 sfx, u64 manager) {
+    const auto game = eboot_kit::fn<GxRecordFn>(kGxRecordUpdate);
+    store<u32>(sfx + 0x8c, 0);
+    int bad = 0;
+    for (int c = 0; c < cases; ++c) {
+        g_blocks.clear();
+        // the definition
+        const u64 def = block(0x140);
+        for (int k = 0; k < 0x130; k += 4) store<u32>(def + k, g_rng.u32());
+        const u32 mode = g_rng.chance(0.5) ? 1u : 0u;
+        store<u32>(def + 0x3c, mode);
+        ribbon_property(def + 0x58, g_rng.range(1, 3), 0.01f, 2.0f);
+        if (g_rng.chance(0.2)) {
+            store<u64>(def + 0x68, 0x1c);  // no scalar array
+            store<u64>(def + 0x70, 0);
+        } else {
+            ribbon_property(def + 0x68, g_rng.range(1, 3), -1.0f, 1.0f);
+        }
+        ribbon_property(def + 0x78, g_rng.range(1, 3), 0.0f, 1.0f);
+        const float interval = g_rng.chance(0.6) ? 0.0f : g_rng.chance(0.5) ? value(0.0f, 0.12f) : value(0.025f, 0.04f);
+        store<float>(def + 0x88, interval);
+        store<float>(def + 0x8c, value(0.05f, 1.2f));
+        store<s32>(def + 0x90, g_rng.chance(0.5) ? -1 : g_rng.range(4, 40));
+        store<u32>(def + 0x94, static_cast<u32>(g_rng.range(0, 3)));
+        store<float>(def + 0x98, g_rng.chance(0.5) ? 0.0f : value(0.05f, 0.6f));
+        store<u32>(def + 0x128, g_rng.u32() & 3);
+        // the emitter, the scales, the frame rate
+        Emitter e;
+        for (int i = 0; i < 3; ++i) {
+            e.p0[i] = value(-20, 20);
+            e.v[i] = g_rng.chance(0.15) ? 0.0f : value(-15, 15);
+            e.a[i] = g_rng.chance(0.5) ? 0.0f : value(-10, 10);
+            e.amp[i] = g_rng.chance(0.5) ? 0.0f : value(0, 2);
+        }
+        e.w = value(1, 20);
+        {
+            double q[4], qn = 0;
+            for (double& x : q) {
+                x = value(-1, 1);
+                qn += x * x;
+            }
+            qn = std::sqrt(qn) + 1e-9;
+            const double x = q[0] / qn, y = q[1] / qn, z = q[2] / qn, w = q[3] / qn;
+            const double m[12] = {1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w), 0, 2 * (x * y + z * w), 1 - 2 * (x * x + z * z),
+                                  2 * (y * z - x * w), 0, 2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y), 0};
+            for (int i = 0; i < 12; ++i) e.rows[i] = static_cast<float>(m[i]);
+        }
+        const float scale = g_rng.chance(0.6) ? 1.0f : value(0.5f, 2.0f), time_scale = g_rng.chance(0.7) ? 1.0f : value(0.5f, 1.5f);
+        store<float>(manager + 0x5d8, time_scale);
+        store<u8>(manager + 0x5ce, 0);
+        const float t0 = g_rng.chance(0.3) ? 0.0f : value(0, 30);
+        const double tick_time = 1.0 / 30.0 * time_scale * scale, interval_bound = interval + 2.0 * tick_time;
+        u8 rng[0x20];
+        for (int k = 0; k < 0x20; k += 4) store<u32>(reinterpret_cast<u64>(rng) + k, g_rng.u32() | 1);
+        Ribbon F = make_ribbon(e, def, t0, scale, rng);
+        // A set-up whose room (+0x78, from the interval, the life and the FX data rate) is less than one update's new
+        // points (2 x +0x94 + 3) has the game's update write past its arrays: not a ribbon to compare.
+        if (load<u32>(F.type + 0x78) < 2 * load<u32>(def + 0x94) + 3) {
+            ++g_seen_rb.too_small;
+            --c;
+            continue;
+        }
+        Ribbon R = make_ribbon(e, def, t0, scale, rng);
+        // an unmarked twin (a pre-roll's or a held instance's ribbon) through ours, and the game's own beside it
+        Ribbon U = make_ribbon(e, def, t0, scale, rng), G = make_ribbon(e, def, t0, scale, rng);
+        const int rate_kind = g_rng.range(0, 3);  // 60, 120, 144, jittered
+        const int frames = g_rng.range(8, 160);
+        const int end_at = g_rng.chance(0.5) ? g_rng.range(4, frames) : frames + 1;  // the node ends (state 4) at the first whole step from here
+        double carry = 0.0, tau = 0.0;
+        const char* why = nullptr;
+        int at = -1;
+        std::vector<u8> snap = ribbon_snapshot(F);
+        u8 snap_rng[0x20];
+        std::memcpy(snap_rng, F.rng, sizeof snap_rng);
+        ++g_seen_rb.cases;
+        g_seen_rb.smoothed += load<float>(def + 0x98) > 0.0f;
+        decomp_sfx_smooth(true);
+        for (int f = 0; f < frames && !why; ++f) {
+            const double dt = rate_kind == 0 ? 1.0 / 60 : rate_kind == 1 ? 1.0 / 120 : rate_kind == 2 ? 1.0 / 144 : g_rng.value(1.0f / 150, 1.0f / 40);
+            const sfx_schedule::Frame fr = sfx_schedule::next(carry, dt, 30);
+            tau += fr.frame;
+            const bool tick = fr.whole > 0;
+            decomp_sfx_step_frame(!tick);
+            decomp_sfx_frame_time(fr.frame, fr.from, fr.into);
+            if (tick && f >= end_at && load<u32>(F.node + 0xdc) == 3) {
+                store<u32>(F.node + 0xdc, 4);
+                store<u32>(R.node + 0xdc, 4);
+                ++g_seen_rb.ending;
+            }
+            // the frame domain's item: the emitter now, the frame's step on the scales
+            const float step = fr.frame * time_scale * scale;
+            for (int k = 0; k < 0x60; k += 4) store<u32>(F.item + k, 0);
+            e.at(tau, F.item);
+            store<float>(F.item + 0x60, step);
+            const u32 prev = load<u32>(F.record + 0x28);
+            const float into = fr.into * time_scale * scale;
+            const bool adjusted = tick && into > 0.0f && into < step;
+            const float whole_time = adjusted ? add_ss(std::bit_cast<float>(prev), step - into) : add_ss(std::bit_cast<float>(prev), step);
+            const float head_time = adjusted ? add_ss(whole_time, into) : whole_time;
+            // the whole step's place: the rows that far between the last frame's (the record's) and this one's
+            float whole_rows[12];
+            {
+                const float share = adjusted ? (step - into) / step : 1.0f;
+                for (int i = 0; i < 12; ++i) {
+                    const float last = load<float>(F.record + 0x50 + 4 * static_cast<u64>(i)), now = load<float>(F.item + 4 * static_cast<u64>(i));
+                    whole_rows[i] = adjusted ? last + (now - last) * share : now;
+                }
+            }
+            ribbon_mark(F.type);  // as smooth_update marks its instance's ribbons
+            std::memcpy(g_rng_state, F.rng, sizeof g_rng_state);
+            sfx_gx_record_update(F.record, F.item);
+            std::memcpy(F.rng, g_rng_state, sizeof F.rng);
+            // the unmarked twin: the game's call, every byte
+            std::memcpy(reinterpret_cast<void*>(U.item), reinterpret_cast<void*>(F.item), 0x70);
+            std::memcpy(reinterpret_cast<void*>(G.item), reinterpret_cast<void*>(F.item), 0x70);
+            std::memcpy(g_rng_state, U.rng, sizeof g_rng_state);
+            sfx_gx_record_update(U.record, U.item);
+            std::memcpy(U.rng, g_rng_state, sizeof U.rng);
+            std::memcpy(g_rng_state, G.rng, sizeof g_rng_state);
+            game(G.record, G.item);
+            std::memcpy(G.rng, g_rng_state, sizeof G.rng);
+            {
+                std::vector<u8> u = ribbon_snapshot(U), g = ribbon_snapshot(G);
+                for (const u64 off : {0x88ull, 0x90ull, 0x98ull, 0xa0ull, 0xa8ull, 0xb0ull, 0xb8ull, 0xc0ull, 0xc8ull, 0x8ull}) {
+                    // the pointers differ: the arrays' bytes compared through them (ribbon_snapshot), the words beside
+                    store<u64>(reinterpret_cast<u64>(u.data()) + off, 0);
+                    store<u64>(reinterpret_cast<u64>(g.data()) + off, 0);
+                }
+                const std::vector<u8> ur = bytes_of_block(U.record, 0x80), gr = bytes_of_block(G.record, 0x80);
+                if (u != g || std::memcmp(U.rng, G.rng, sizeof U.rng) != 0 ||
+                    std::memcmp(ur.data() + 0x20, gr.data() + 0x20, 0x60) != 0)
+                    why = "a ribbon not marked this frame (a pre-roll's, a held instance's): the game's call";
+            }
+            ++g_seen_rb.frames;
+            g_seen_rb.adjusted += adjusted;
+            // every frame: the definition back, the record's times the game's one call's, the last drawn point the emitter at the
+            // frame's time
+            const u32 n = load<u32>(F.type + 0x7c), drawn = load<u32>(F.type + 0x80);
+            if (load<u64>(F.type + 8) != def) {
+                why = "the definition not put back";
+                store<u64>(F.type + 8, def);
+            } else if (load<u32>(F.record + 0x24) != prev || load<u32>(F.record + 0x28) != bits(add_ss(std::bit_cast<float>(prev), step))) {
+                why = "the record's times";
+            } else if (n + drawn >= 1) {
+                // the last drawn point: the emitter at the frame's time - or, where the emitter moved too little since the
+                // last insert for the game to draw a point to it, that insert's own
+                const u64 last = 4 * static_cast<u64>(n + drawn - 1);
+                const bool degenerate = load<u32>(load<u64>(F.type + 0x88) + last) == load<u32>(F.type + 0x1c) &&
+                                        load<u32>(load<u64>(F.type + 0x90) + last) == load<u32>(F.type + 0x24) &&
+                                        load<u32>(load<u64>(F.type + 0x98) + last) == load<u32>(F.type + 0x28) &&
+                                        load<u32>(load<u64>(F.type + 0xa0) + last) == load<u32>(F.type + 0x2c);
+                if (degenerate) {
+                    const double dx = load<float>(F.type + 0x24) - load<float>(F.item + 12), dy = load<float>(F.type + 0x28) - load<float>(F.item + 28),
+                                 dz = load<float>(F.type + 0x2c) - load<float>(F.item + 44);
+                    if (std::sqrt(dx * dx + dy * dy + dz * dz) > 1e-6) why = "the last drawn point is the last insert, the emitter away from it";
+                    ++g_seen_rb.degenerate;
+                } else if (load<u32>(load<u64>(F.type + 0x88) + last) != bits(head_time)) {
+                    why = "the last drawn point's time";
+                }
+                else if (!degenerate && (load<u32>(load<u64>(F.type + 0x90) + last) != load<u32>(F.item + 12) ||
+                                         load<u32>(load<u64>(F.type + 0x98) + last) != load<u32>(F.item + 28) ||
+                                         load<u32>(load<u64>(F.type + 0xa0) + last) != load<u32>(F.item + 44)))
+                    why = "the last drawn point's place (the emitter's at the frame's time)";
+            }
+            if (!why && !tick) {
+                // between whole steps: no insert, draw or smoothing - the history, the RNG and the kept points as at the last
+                // whole step, but for those the frame's time has let go
+                ++g_seen_rb.between;
+                const u32 m = load<u32>(reinterpret_cast<u64>(snap.data()) + 0x7c);
+                if (std::memcmp(reinterpret_cast<void*>(F.type + 0x18), snap.data() + 0x18, 0x78 - 0x18 + 4) != 0 ||
+                    load<u32>(F.type + 0x84) != load<u32>(reinterpret_cast<u64>(snap.data()) + 0x84))
+                    why = "between whole steps: the history moved (an insert)";
+                else if (std::memcmp(F.rng, snap_rng, sizeof snap_rng) != 0) why = "between whole steps: a draw of the FX RNG";
+                else if (n > m || !ribbon_kept_since(F, snap, m - n)) why = "between whole steps: the kept points moved (smoothing)";
+            }
+            if (!why && tick) {
+                // the game at 30: once a whole step, the same place, the whole step's time
+                ++g_seen_rb.ticks;
+                std::memcpy(reinterpret_cast<void*>(R.item), reinterpret_cast<void*>(F.item), 0x60);
+                std::memcpy(reinterpret_cast<void*>(R.item), whole_rows, sizeof whole_rows);
+                store<float>(R.item + 0x60, 0.0f);
+                store<float>(R.record + 0x28, whole_time);
+                const u32 r_last = load<u32>(R.type + 0x1c);
+                std::memcpy(g_rng_state, R.rng, sizeof g_rng_state);
+                game(R.record, R.item);
+                std::memcpy(R.rng, g_rng_state, sizeof R.rng);
+                g_seen_rb.inserts += load<u32>(R.type + 0x1c) != r_last;
+                const u32 nr = load<u32>(R.type + 0x7c);
+                g_seen_rb.gone_early += nr > n ? nr - n : n - nr;
+                if (!ribbon_fields_same(F, R)) why = "after a whole step: the history (inserts, places, scalars, seed, end time)";
+                else if (std::memcmp(F.rng, R.rng, sizeof F.rng) != 0) why = "after a whole step: the FX RNG";
+                else if (!ribbon_tails_agree(F, R, head_time, interval_bound)) why = "after a whole step: the kept points";
+                snap = ribbon_snapshot(F);
+                std::memcpy(snap_rng, F.rng, sizeof snap_rng);
+            }
+            if (why) at = f;
+        }
+        decomp_sfx_smooth(false);
+        decomp_sfx_step_frame(false);
+        if (why && ++bad <= 6 && !g_quiet)
+            std::printf("ribbon case %d (rate kind %d, interval %g, life %g, subdiv %u, smoothing %g, mode %u, scale %g x %g): %s differs at frame %d\n", c,
+                        rate_kind, interval, load<float>(def + 0x8c), load<u32>(def + 0x94), load<float>(def + 0x98), mode, scale, time_scale, why, at);
+    }
+    return bad;
+}
+
 }  // namespace
 
 int main() {
@@ -1409,6 +1795,53 @@ int main() {
         }
     }
     g_sfx_gate_mutant = 0;
-    std::printf("decomp_sfx_step_gate: %d of 27 mutants caught\n", 27 - missed);
+    // The ribbon last: its set-up's allocator the test's; the manager's time scale per case.
+    store<u64>(reinterpret_cast<u64>(g_ribbon_alloc_vt) + 0x58, reinterpret_cast<u64>(&stub_ribbon_alloc));
+    store<u64>(reinterpret_cast<u64>(g_ribbon_alloc), reinterpret_cast<u64>(g_ribbon_alloc_vt));
+    g_quiet = false;
+    g_rng.specials = false;
+    const int bbad = check_ribbons(kCases / 2, sfx, manager);
+    std::printf("decomp_sfx_step_gate: %d ribbon cases (%ld frames: %ld whole steps, %ld between, %ld whole steps past the frame's carry; %ld inserts; "
+                "%ld with smoothing, %ld ending; %ld old points held by one and not the other after a whole step; %ld set-ups too small for an update, "
+                "not compared), %d differ\n",
+                kCases / 2, g_seen_rb.frames, g_seen_rb.ticks, g_seen_rb.between, g_seen_rb.adjusted, g_seen_rb.inserts, g_seen_rb.smoothed,
+                g_seen_rb.ending, g_seen_rb.gone_early, g_seen_rb.too_small, bbad);
+    if (bbad) return 1;
+    {
+        // the marks' table: a frame's marks gone at the next; a ribbon whose slots this frame are all others' finds none
+        decomp_sfx_frame_time(1.0f / 120, 0.0f, 0.0f);
+        const u64 t = 0x123450000ull;
+        if (!ribbon_mark(t) || !ribbon_marked(t)) {
+            std::printf("decomp_sfx_step_gate: a ribbon's mark not found in its frame\n");
+            return 1;
+        }
+        decomp_sfx_frame_time(1.0f / 120, 0.0f, 0.0f);
+        if (ribbon_marked(t)) {
+            std::printf("decomp_sfx_step_gate: a ribbon's mark kept into the next frame\n");
+            return 1;
+        }
+        int taken = 0;
+        for (u64 k = 1; k < 1 << 20 && taken < 16; ++k)
+            if (ribbon_slot(k << 4) == ribbon_slot(t) && ribbon_mark(k << 4)) ++taken;
+        // the 16 slots from t's are this frame's now (probes run on from each one's own)
+        bool full = true;
+        for (std::size_t i = 0; i < 16; ++i)
+            full &= (g_ribbon_marks[(ribbon_slot(t) + i) & (kRibbonSlots - 1)].load() & ~kMarkType) == ribbon_frame();
+        if (!full || ribbon_mark(t) || ribbon_marked(t)) {
+            std::printf("decomp_sfx_step_gate: a full stretch of the marks' table took a ribbon\n");
+            return 1;
+        }
+        decomp_sfx_frame_time(1.0f / 120, 0.0f, 0.0f);
+    }
+    g_quiet = true;
+    for (const int m : {29, 30, 31, 32, 33, 34, 35, 37}) {
+        g_sfx_gate_mutant = m;
+        if (!check_ribbons(2000, sfx, manager)) {
+            std::printf("decomp_sfx_step_gate: mutant %d not caught by the ribbon\n", m);
+            ++missed;
+        }
+    }
+    g_sfx_gate_mutant = 0;
+    std::printf("decomp_sfx_step_gate: %d of 35 mutants caught\n", 35 - missed);
     return missed ? 1 : 0;
 }

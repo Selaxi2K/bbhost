@@ -36,6 +36,7 @@
 #include "decomp/guest.h"
 
 #include <atomic>
+#include <bit>
 #include <cstdint>
 #include <cstring>
 
@@ -63,6 +64,8 @@ constexpr u64 kControllerUpdate = 0x2c820f0;   // (controller, instance, step)
 constexpr u64 kPrerollContext = 0x56dbd80;     // sub_2c500e0's stand-in render context's vtable
 constexpr u64 kGxRecordUpdate = 0x2cbcf50;     // a GPU particle system's record taking an item: (record, item)
 constexpr u64 kGxType2713 = 0x56eb0d0;         // GPU particle type 0x2713's vtable: its parameters are curves read at the elapsed time
+constexpr u64 kGxTypeRibbon = 0x56e3620;       // FFX-format GX type 0x28's vtable: a ribbon (update sub_2ec1e00)
+constexpr std::size_t kRibbonDefinition = 0x12c;  // what sub_2ec1e00 reads of its definition (type +8): up to +0x128's dword
 constexpr u64 kWobbleA = 0x2e89d10;            // motion 0x570e6d0's update (and the end of 0x570e690's): count +0x6c, period +0x68
 constexpr u64 kWobbleABase = 0x2e866f0;        //   its base motion, which moves by the step
 constexpr u64 kWobbleB = 0x2e8e430;            // motion 0x570e8d0's update: count +0x7c, period +0x78
@@ -98,6 +101,45 @@ std::atomic<u32> g_smooth{0};
 std::atomic<u64> g_smooth_updates{0}, g_smooth_kept{0};
 std::atomic<u64> g_lights_smooth{0}, g_lights_counted{0}, g_fades_smooth{0};
 std::atomic<u64> g_frames_between{0}, g_instances_held{0}, g_lights_held{0}, g_motions_held{0}, g_still_frames{0}, g_records_held{0};
+std::atomic<u64> g_ribbons_between{0}, g_ribbons_whole{0}, g_ribbons_unmarked{0};
+
+// The ribbons (their GX types) of the instances the smooth steps run this frame, marked as smooth_update takes an
+// instance, for the record update: it runs later from the render context's queue, and a pre-roll's (sub_2c500e0's
+// updates, through the game's node update) or a held instance's look the same to it. A small open table of words
+// (the frame's serial << 48 | the type), a slot of another frame free to take; wiped when the serial's 16 bits wrap.
+constexpr std::size_t kRibbonSlots = 1024;
+std::atomic<u64> g_ribbon_marks[kRibbonSlots] = {};
+std::atomic<u32> g_frame_serial{1};
+constexpr u64 kMarkType = 0xffffffffffffull;
+inline std::size_t ribbon_slot(u64 type) { return static_cast<std::size_t>(((type >> 3) * 0x9E3779B97F4A7C15ull) >> 54) & (kRibbonSlots - 1); }
+inline u64 ribbon_frame() { return static_cast<u64>(g_frame_serial.load(std::memory_order_relaxed) & 0xffffu) << 48; }
+bool ribbon_mark(u64 type) {
+    const u64 now = ribbon_frame(), want = now | (type & kMarkType);
+    std::size_t h = ribbon_slot(type);
+    for (int k = 0; k < 16; ++k, h = (h + 1) & (kRibbonSlots - 1)) {
+        u64 w = g_ribbon_marks[h].load(std::memory_order_relaxed);
+        while ((w & ~kMarkType) != now)
+            if (g_ribbon_marks[h].compare_exchange_weak(w, want, std::memory_order_release, std::memory_order_relaxed)) return true;
+        if (w == want) return true;
+    }
+    return false;
+}
+bool ribbon_marked(u64 type) {
+    const u64 now = ribbon_frame(), want = now | (type & kMarkType);
+    std::size_t h = ribbon_slot(type);
+    for (int k = 0; k < 16; ++k, h = (h + 1) & (kRibbonSlots - 1)) {
+        const u64 w = g_ribbon_marks[h].load(std::memory_order_acquire);
+        if (w == want) return true;
+        if ((w & ~kMarkType) != now) return false;
+    }
+    return false;
+}
+
+// The game's vaddss x, x, y: the record's time plus an item's step, as sub_2cbcf50 adds them.
+inline float add_ss(float x, float y) {
+    __asm__("addss %1, %0" : "+x"(x) : "x"(y));
+    return x;
+}
 
 // A frame bbhost put between whole steps that is not the game's own still frame.
 inline bool held() {
@@ -173,9 +215,9 @@ constexpr u64 kManagerOf = 0x70;  // SprjSfx +0x70: the effect manager (its time
 // frames as with 30: the wobble motions 0x570e6d0, 0x570e690 and 0x570e8d0
 // (they count their updates), the module 0x5760f20, the GPU particle types 0x2712
 // (0x56eb030: whole grid passes of elapsed x 30) and 0x2713 (0x56eb0d0: its
-// parameters are curves read at the elapsed time), and the FFX-format GX type
-// 0x28 (0x56e3620: a ribbon, its points added an update with a draw of the FX
-// RNG).
+// parameters are curves read at the elapsed time). The ribbon, FFX-format GX
+// type 0x28, is on it for sfx_gx_record_update, which inserts its points once a
+// whole step at the whole step's time (tests/decomp/sfx_step_gate_test.cpp).
 constexpr u64 kConverted[] = {
     0x570e650,  // motion: velocity along itself by step x speed curve x +0x24, position by step x velocity, facing the move
     0x570e610,  // motion: the same with gravity (data_5ad1150 x a curve at the node's time, in the parent's frame) by step
@@ -200,6 +242,7 @@ constexpr u64 kConverted[] = {
     0x56ebe20,  // GX type 3 / 0x3d (FFX format): +0x18 and +0x1c += the elapsed time x rates; a root definition's value
     0x56eadf0,  // GX type 0x283c: a wind source; its fade += the elapsed time, its velocity the move over it (0 for none)
     0x56eac40,  // GX type 0x283d: a wind source without the velocity; its fade += the elapsed time
+    0x56e3620,  // GX type 0x28 (FFX format): a ribbon; its inserts once a whole step at its time (sfx_gx_record_update)
 };
 const u64* g_converted = kConverted;
 std::size_t g_converted_count = sizeof kConverted / sizeof kConverted[0];
@@ -270,6 +313,20 @@ u64 first_unconverted(u64 instance) {
     return 0;
 }
 
+// The instance's ribbons marked for this frame (ribbon_mark); false when one finds no slot.
+bool mark_ribbons(u64 instance) {
+    const auto next_of = game_function<NextFn>(kNodeNext);
+    for (u64 node = load<u64>(instance + 0x78); node; node = next_of(node))
+        for (u64 item = load<u64>(node + 0x80 + 0x30); item; item = load<u64>(item + 0x18)) {
+            const u64 target = load<u64>(item + 0x20);
+            if (!target || load<u64>(target) != game_address(0x56e3100)) continue;
+            const u64 holder = load<u64>(target + 0x10);
+            const u64 type = holder ? load<u64>(holder + 8) : 0;
+            if (type && load<u64>(type) == game_address(kGxTypeRibbon) && !ribbon_mark(type)) return false;
+        }
+    return true;
+}
+
 u8 smooth_update(u64 instance, u64 context, float step) {
     g_smooth_updates.fetch_add(1, std::memory_order_relaxed);
     const bool tick = !g_between.load(std::memory_order_relaxed) || MUTANT(20);
@@ -322,6 +379,9 @@ DECOMP_LEAF u8 sfx_instance_update(u64 instance, u64 context, float step) {
             if (const u64 kept = first_unconverted(instance)) {
                 g_smooth_kept.fetch_add(1, std::memory_order_relaxed);
                 count_kept(kept);
+            } else if (!mark_ribbons(instance)) {
+                g_smooth_kept.fetch_add(1, std::memory_order_relaxed);
+                count_kept(game_address(kGxTypeRibbon));  // no room to mark a ribbon this frame: held, as at 30
             } else {
                 return smooth_update(instance, context, step);
             }
@@ -493,9 +553,132 @@ DECOMP_LEAF void sfx_wobble_follow(u64 motion, u64 node, const float* step, u64 
 // the game's call runs as it is - the matrix, the bounds, every other field -
 // and both are put back, so the type's update and its draw read the last whole
 // step's elapsed time and values, as on every frame at 30.
+// The ribbon, FFX-format GX type 0x28 (0x56e3620; update sub_2ec1e00, read in
+// Binary Ninja), under the smooth steps. Its type keeps a history of points:
+// times +0x88, places +0x90 / +0x98 / +0xa0, lengths +0xa8 and two optional
+// arrays, +0x7c of them kept, room for +0x78. Each update, at its record's time
+// (+0x28) alone - it never reads the elapsed time:
+//   - points whose time plus the definition's life (+0x8c) has passed go, and
+//     the oldest go to make room for the update's new ones;
+//   - the points from the last kept one to the emitter (the record's matrix)
+//     are made again: a spline between the last two inserted places and a line
+//     from the last to the emitter, plus an extrapolated one - drawn, not kept
+//     (+0x80 of them);
+//   - when more than the definition's interval (+0x88) has passed since the
+//     last insert (+0x1c), the spline's points are kept, the place history
+//     shifts, and one draw of the FX RNG sets the next point's scalar (+0x4c):
+//     the insert, counted - at most one an update;
+//   - with smoothing (+0x98 above 0), every kept point moves that share toward
+//     the next one - counted too, once an update.
+// So at 30 a ribbon inserts at most 30 times a second, and its spacing, its
+// draws and its smoothing follow its updates; with the frame's own time on
+// every frame it would insert and smooth up to once a frame (four times at
+// 120, overflowing room the set-up sized for 60 inserts a second). The smooth
+// steps' frame domain therefore runs it:
+//   - between whole steps, the game's call with a copy of its definition in
+//     the type's +8 whose interval is +inf and smoothing 0, put back after: no
+//     insert, draw or smoothing, and the drawn points made again to the
+//     emitter at the frame's own time - the ribbon's head moves every frame;
+//   - on a frame with a whole step, the game's call as it is, at the whole
+//     step's time and place: a smooth instance's item carries the frame's
+//     step, which ends `into` (the frame's carry past the step, scaled) after
+//     it, so the call gets the step less that, and the emitter's matrix that
+//     far between the last frame's (the record's) and this one's - the
+//     inserts, draws and smoothing of 30, at 30's times - then a second, as
+//     between whole steps, by `into` with this frame's matrix, so the drawn
+//     points end at the emitter at the frame's own time; the record's times
+//     are left as the game's one call leaves them.
+// A held instance's item between whole steps carries no step, and on a frame
+// with one the whole step's (as does a frame of 1/30 s itself): the game's.
+// The record update runs after the instance's (the render context queues its
+// items), so what the frame is comes from the frame's own numbers.
+namespace {
+
+inline void ribbon_held_call(GxRecordFn game, u64 record, u64 item, u64 type) {
+    const u64 def = load<u64>(type + 8);
+    alignas(16) u8 copy[0x130];
+    std::memcpy(copy, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(def)), kRibbonDefinition);
+    const u64 at = reinterpret_cast<u64>(copy);
+    if (!MUTANT(29)) store<u32>(at + 0x88, 0x7f800000u);  // +inf: no insert
+    if (!MUTANT(29) && !MUTANT(30)) store<u32>(at + 0x98, 0u);  // no smoothing
+    store<u64>(type + 8, at);
+    game(record, item);
+    if (load<u64>(type + 8) == at && !MUTANT(34)) store<u64>(type + 8, def);
+}
+
+// Whether a ribbon's record update is a smooth instance's, and how: 0 the game's, 1 between whole steps, 2 a frame with
+// a whole step whose item ends `into` past it.
+inline int ribbon_mode(u64 record, u64 item, u64 type, float& into) {
+    if (!g_smooth.load(std::memory_order_relaxed)) return 0;
+    if (!ribbon_marked(type) && !MUTANT(37)) {  // not a smooth instance's this frame: a pre-roll's, a held one's
+        g_ribbons_unmarked.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+    const u64 sfx = load<u64>(game_address(kSprjSfx));
+    if (sfx && load<u32>(sfx + 0x8c)) return 0;  // the game's own still frame
+    const float step = load<float>(item + 0x60);
+    if (!(step > 0.0f)) return 0;  // a held instance between whole steps, or the manager still
+    if (g_step_between.load(std::memory_order_relaxed)) return 1;
+    // A frame with a whole step: a smooth instance's step is the frame's (the node update's (frame x time scale) x
+    // scale); a held one's the whole step's. A frame of 1/30 s, where the two are one, is the game's.
+    const float frame = g_frame_step.load(std::memory_order_relaxed);
+    if (!(frame < 1.0f / 30.0f)) return 0;
+    const u64 node = load<u64>(record + 0x10);
+    const u64 instance = node ? load<u64>(node + 0x58) : 0;
+    const u64 manager = sfx ? load<u64>(sfx + kManagerOf) : 0;
+    if (!instance || !manager || load<u8>(manager + 0x5ce)) return 0;
+    const float time_scale = load<float>(manager + 0x5d8), scale = load<float>(instance + 8);
+    if (std::bit_cast<u32>(frame * time_scale * scale) != std::bit_cast<u32>(step)) return 0;
+    into = g_frame_into.load(std::memory_order_relaxed) * time_scale * scale;
+    return 2;
+}
+
+}  // namespace
+
 DECOMP_LEAF void sfx_gx_record_update(u64 record, u64 item) {
     const auto game = reinterpret_cast<GxRecordFn>(g_game_gx_record);
     const u64 type = load<u64>(record + 8);
+    if (type && load<u64>(type) == game_address(kGxTypeRibbon)) {
+        float into = 0.0f;
+        const int mode = ribbon_mode(record, item, type, into);
+        if (mode == 1) {
+            g_ribbons_between.fetch_add(1, std::memory_order_relaxed);
+            ribbon_held_call(game, record, item, type);
+            return;
+        }
+        if (mode == 2) {
+            g_ribbons_whole.fetch_add(1, std::memory_order_relaxed);
+            const float step = load<float>(item + 0x60);
+            if (!(into > 0.0f) || !(into < step) || MUTANT(31)) {
+                game(record, item);  // the frame ends on the whole step (or a mutant's: the inserts at the frame's time)
+                return;
+            }
+            const u32 before = load<u32>(record + 0x28);
+            // the whole step's time, and its place: the matrix rows (the place in their w lanes) as far between the last
+            // frame's, which the record holds, and this frame's as the step is into the frame
+            const float share = (step - into) / step;
+            float rows[12];
+            std::memcpy(rows, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(item)), sizeof rows);
+            if (!MUTANT(35))
+                for (int i = 0; i < 12; ++i) {
+                    const float last = load<float>(record + 0x50 + 4 * static_cast<u64>(i));
+                    store<float>(item + 4 * static_cast<u64>(i), last + (rows[i] - last) * share);
+                }
+            store<float>(item + 0x60, step - into);
+            game(record, item);
+            std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(item)), rows, sizeof rows);
+            if (!MUTANT(32)) {
+                store<float>(item + 0x60, into);  // and on to the frame's time and place: the drawn points, nothing counted
+                ribbon_held_call(game, record, item, type);
+            }
+            if (!MUTANT(33)) {
+                store<u32>(record + 0x24, before);
+                store<float>(record + 0x28, add_ss(std::bit_cast<float>(before), step));
+            }
+            store<float>(item + 0x60, step);
+            return;
+        }
+    }
     const bool is_2713 = type && (load<u64>(type) == game_address(kGxType2713) || MUTANT(15));
     if (!is_2713 || (load<float>(item + 0x60) != 0.0f && !MUTANT(16)) || (load<u32>(record + 0x24) == load<u32>(record + 0x28) && !MUTANT(17)) ||
         !between_steps()) {
@@ -523,6 +706,14 @@ void decomp_sfx_gate_frame(bool between) {
 void decomp_sfx_step_frame(bool between) { g_step_between.store(between ? 1u : 0u, std::memory_order_relaxed); }
 
 void decomp_sfx_frame_time(float frame, float from, float into) {
+    // a new frame for the ribbons' marks: the serial's 16 bits wrapping, the table wiped (between frames: no effect
+    // update runs now) and 0 skipped
+    u32 serial = g_frame_serial.load(std::memory_order_relaxed) + 1;
+    if (!(serial & 0xffffu)) {
+        for (auto& m : g_ribbon_marks) m.store(0, std::memory_order_relaxed);
+        ++serial;
+    }
+    g_frame_serial.store(serial, std::memory_order_relaxed);
     g_frame_step.store(frame, std::memory_order_relaxed);
     g_frame_from.store(from, std::memory_order_relaxed);
     g_frame_into.store(into, std::memory_order_relaxed);
@@ -557,6 +748,9 @@ void report() {
              static_cast<ull>(g_smooth_updates.load()), static_cast<ull>(g_smooth_kept.load()), g_converted_count);
     host_log("decomp:   FFX light updates by the frame's time: %llu, %llu of them after the whole step's own; light fades by the frame's time: %llu",
              static_cast<ull>(g_lights_smooth.load()), static_cast<ull>(g_lights_counted.load()), static_cast<ull>(g_fades_smooth.load()));
+    host_log("decomp:   ribbon updates: %llu between whole steps (the head by the frame's time, nothing inserted), %llu on frames with one, "
+             "%llu not a smooth instance's (a pre-roll's or a held one's: the game's)",
+             static_cast<ull>(g_ribbons_between.load()), static_cast<ull>(g_ribbons_whole.load()), static_cast<ull>(g_ribbons_unmarked.load()));
     for (std::size_t i = 0; i < kKeptSlots; ++i) {
         const u64 vt = g_kept_class[i].load();
         if (!vt) break;
