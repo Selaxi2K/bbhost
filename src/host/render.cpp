@@ -2843,26 +2843,49 @@ const bool g_masked_blend = [] {
 thread_local std::uint32_t t_masked_blend_changed = 0, t_masked_blend_blending = 0;
 std::atomic<std::uint64_t> g_masked_blend_pipelines{0}, g_masked_blend_blending{0};
 
-// BBHOST_LVP_MASKED_SPLIT (host/lvp_split.h), on unless 0, on lavapipe
+// BBHOST_LVP_BLEND_SPLIT (host/lvp_split.h), on unless 0, on lavapipe
 // (VK_DRIVER_ID_MESA_LLVMPIPE) only: whether this draw starts a command buffer
-// of its own - a bound target it writes no channel of, and blending into one it
-// writes. The count of such splits is in the exit report.
+// of its own - a pipeline without colour attachments was bound earlier in the
+// command buffer being recorded, and drawing every colour slot with slot 0's
+// blend state would change what this draw writes. A draw without colour
+// targets marks the command buffer. The count of such splits is in the exit
+// report.
 std::atomic<std::uint64_t> g_lvp_splits{0};
-bool lvp_masked_split(const DrawState& s) {
+std::uint64_t g_lvp_depth_only_serial = ~0ull;  // the recording a depth-only pipeline was bound in
+bool lvp_blend_split(const DrawState& s) {
     static const bool on = [] {
-        const char* e = std::getenv("BBHOST_LVP_MASKED_SPLIT");
+        const char* e = std::getenv("BBHOST_LVP_BLEND_SPLIT");
         return !(e && e[0] == '0');
     }();
     if (!on || g.driver_id != VK_DRIVER_ID_MESA_LLVMPIPE) return false;
-    bool bound[8], blend[8];
-    std::uint32_t mask[8];
+    int count = 0;
     for (int t = 0; t < 8; ++t) {
-        bound[t] = s.color[t] != nullptr;
-        mask[t] = s.color_mask[t];
-        const bool enable = s.gx_blend ? s.gx_blend->rt[t].enable != 0 : (s.blend[t] & (1u << 30)) != 0;
-        blend[t] = bound[t] && enable && format_blends(s.color[t]->format);
+        if (s.color[t]) count = t + 1;
     }
-    return lvp_split_wanted(bound, mask, blend);
+    if (!count) {
+        g_lvp_depth_only_serial = g.record_serial;
+        return false;
+    }
+    if (g_lvp_depth_only_serial != g.record_serial) return false;
+    LvpSlot slot[8];
+    for (int t = 0; t < count; ++t) {
+        if (!s.color[t]) continue;
+        LvpSlot& o = slot[t];
+        o.bound = true;
+        o.mask = s.color_mask[t] & 0xf;
+        if (s.gx_blend) {
+            const GxBlendTarget& rt = s.gx_blend->rt[t];
+            o.blend = rt.enable && format_blends(s.color[t]->format);
+            o.eq = rt.src | rt.dst << 5 | rt.op << 10 | rt.src_alpha << 13 | rt.dst_alpha << 18 | rt.op_alpha << 23;
+        } else {
+            const std::uint32_t bc = s.blend[t];
+            o.blend = (bc & (1u << 30)) && format_blends(s.color[t]->format);
+            // CB_BLENDn_CONTROL's factors and operations; without SEPARATE_ALPHA_BLEND alpha takes colour's.
+            o.eq = (bc & (1u << 29)) ? (bc & 0x1fff1fffu) : ((bc & 0x1fffu) | (bc & 0x1fffu) << 16);
+        }
+        if (!o.blend) o.eq = 0;
+    }
+    return lvp_blend_collapse_changes(slot, count);
 }
 
 GfxFixedState fixed_state(const DrawState& s) {
@@ -14805,8 +14828,8 @@ std::string host_gpu_clear_view_report() {
     }
     if (const std::string r = clip_control_report(); !r.empty()) host_log("render: %s", r.c_str());
     if (const std::uint64_t n = g_lvp_splits.load()) {
-        host_log("render: lavapipe: %llu command buffers split before a draw that writes no channel of a bound target while blending into "
-                 "another (BBHOST_LVP_MASKED_SPLIT=0 records them like any other)",
+        host_log("render: lavapipe: %llu command buffers split before a draw whose colour slots' blend states differ, after a depth-only "
+                 "pipeline (BBHOST_LVP_BLEND_SPLIT=0 records them like any other)",
                  static_cast<unsigned long long>(n));
     }
     if (g_masked_blend_pipelines.load()) {
@@ -18074,10 +18097,11 @@ static bool draw_impl(const GpuDraw& d) {
     // before this draw's sets exist, so memory and images hold its inputs.
     const bool capture = capture_candidate(pl.name, d.index_count, hle_video_flip_count(), pl.lean_variant && !pl.lean_variant->failed, d.indirect_va);
     if (capture) capture_settle_locked();
-    // Lavapipe only (host/lvp_split.h): a draw that writes no channel of a
-    // bound target while it blends into another starts a command buffer of its
-    // own, what was recorded before it submitted (not waited for).
-    if (lvp_masked_split(s)) {
+    // Lavapipe only (host/lvp_split.h): after a depth-only pipeline, a draw
+    // whose colour slots differ where lavapipe would draw them all with slot
+    // 0's blend state starts a command buffer of its own, what was recorded
+    // before it submitted (not waited for).
+    if (lvp_blend_split(s)) {
         submit_locked();
         g_lvp_splits.fetch_add(1, std::memory_order_relaxed);
     }

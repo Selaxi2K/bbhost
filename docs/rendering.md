@@ -266,12 +266,16 @@ target is undefined and Vulkan writes nothing through an empty mask, so the
 state is dead where a driver honours the mask; a driver may blend the undefined
 output in anyway, and with the state zeroed there is nothing to blend
 (`BBHOST_MASKED_BLEND=0` keeps the game's blend state).
-Lavapipe still writes such a target when the draw blends into the others and
-other draws come before it in the same command buffer: the puddle decals leave
-NaN in the G-buffer's seventh target, and the floor shows black holes. On
-lavapipe alone, such a draw starts a command buffer of its own, what was
-recorded before it submitted without waiting (`BBHOST_LVP_MASKED_SPLIT=0`
-records it like any other); other drivers draw it correctly.
+Lavapipe, once a pipeline without colour attachments has been bound in a
+command buffer, draws every colour attachment of the later draws in it with
+attachment 0's blend state: a target the shader does not export is written
+wherever attachment 0 blends, and the puddle decals left NaN in the G-buffer's
+seventh target - black holes in the floor. On lavapipe alone, a draw that
+follows a depth-only pipeline in the command buffer being recorded, and whose
+attachments' blend states differ where that would change what it draws, starts
+a command buffer of its own, what was recorded before it submitted without
+waiting (`BBHOST_LVP_BLEND_SPLIT=0` records it like any other); other drivers
+draw it correctly.
 A draw whose rasterizer state comes from the registers rather than a GX
 description takes its depth clamp from PA_CL_CLIP_CNTL: with CLIP_DISABLE,
 ZCLIP_NEAR_DISABLE or ZCLIP_FAR_DISABLE set z is not clipped, and the depth

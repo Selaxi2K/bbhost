@@ -1,7 +1,6 @@
-// Which draws start a command buffer of their own on lavapipe (host/lvp_split.h):
-// a bound colour target with an empty write mask, and blending into a target the
-// draw writes. Every combination of bound, write mask (empty, partial, full) and
-// blend over three slots against the rule written out, the game's own cases by
+// Which draws lavapipe's collapse of every colour slot to slot 0's blend state
+// changes (host/lvp_split.h): every combination of bound, write mask, blend and
+// equation over three slots against the rule written out, the game's draws by
 // name, then four mutants, each of which a check here must catch.
 #include "host/lvp_split.h"
 
@@ -19,43 +18,52 @@ int g_failures = 0;
         }                                                                                 \
     } while (0)
 
-using Rule = bool (*)(const bool[8], const std::uint32_t[8], const bool[8]);
+using gpu::LvpSlot;
+using Rule = bool (*)(const LvpSlot*, int);
 
-// The rule written out: some bound target has no channel written, and some
-// bound target with a channel written blends.
-bool expected(const bool bound[8], const std::uint32_t mask[8], const bool blend[8]) {
-    bool masked = false, blending = false;
-    for (int t = 0; t < 8; ++t) {
-        masked = masked || (bound[t] && (mask[t] & 0xf) == 0);
-        blending = blending || (bound[t] && (mask[t] & 0xf) != 0 && blend[t]);
+// The collapse simulated: each slot drawn with slot 0's state (a gap at slot 0
+// has none: nothing written, nothing blended), against the slot's own. A slot
+// the draw writes is drawn differently when mask, blend or equation differ; a
+// slot it does not write is written only if the applied state blends a channel.
+bool expected(const LvpSlot* s, int count) {
+    const std::uint32_t m0 = s[0].bound ? s[0].mask : 0u;
+    const bool b0 = s[0].bound && s[0].blend;
+    for (int t = 1; t < count; ++t) {
+        if (!s[t].bound) continue;
+        const bool written = s[t].mask != 0;
+        if (written) {
+            const bool same = s[t].mask == m0 && s[t].blend == b0 && (!b0 || s[t].eq == s[0].eq);
+            if (!same) return true;
+        } else if (b0 && m0 != 0) {
+            return true;
+        }
     }
-    return masked && blending;
+    return false;
 }
 
 const std::uint32_t kMasks[3] = {0x0, 0x7, 0xf};
+const std::uint32_t kEqs[2] = {0x0f05, 0x0104};
 
-// 3 slots, each unbound or bound with one of three masks, blending or not:
-// 7^3 combinations; slots 3-7 unbound (their masks and blends set to what
-// would count, so a rule that reads unbound slots is caught).
+// One slot from a code 0-12: 12 unbound, else mask (code % 3), blend (code / 3 % 2), equation (code / 6).
+LvpSlot slot_of(int code) {
+    LvpSlot s;
+    if (code == 12) return s;
+    s.bound = true;
+    s.mask = kMasks[code % 3];
+    s.blend = (code / 3) % 2 != 0;
+    s.eq = s.blend ? kEqs[code / 6] : 0u;
+    return s;
+}
+
 int run_checks(Rule rule, bool report) {
     int wrong = 0, n = 0;
-    for (int a = 0; a < 7; ++a) {
-        for (int b = 0; b < 7; ++b) {
-            for (int c = 0; c < 7; ++c) {
-                const int code[3] = {a, b, c};
-                bool bound[8] = {}, blend[8] = {};
-                std::uint32_t mask[8] = {};
-                for (int t = 0; t < 3; ++t) {
-                    bound[t] = code[t] != 6;
-                    mask[t] = code[t] == 6 ? 0u : kMasks[code[t] % 3];
-                    blend[t] = code[t] != 6 && code[t] >= 3;
-                }
-                for (int t = 3; t < 8; ++t) {
-                    mask[t] = 0;      // unbound: an empty mask that must not count as a masked target
-                    blend[t] = true;  // nor as blending
-                }
+    for (int a = 0; a < 13; ++a) {
+        for (int b = 0; b < 13; ++b) {
+            for (int c = 0; c < 13; ++c) {
+                const LvpSlot s[3] = {slot_of(a), slot_of(b), slot_of(c)};
+                const int count = c != 12 ? 3 : b != 12 ? 2 : 1;
                 ++n;
-                const bool got = rule(bound, mask, blend), want = expected(bound, mask, blend);
+                const bool got = rule(s, count), want = expected(s, count);
                 if (got != want) {
                     ++wrong;
                     if (report && wrong <= 6) std::fprintf(stderr, "  wrong: slots %d %d %d -> %d, want %d\n", a, b, c, got, want);
@@ -67,70 +75,84 @@ int run_checks(Rule rule, bool report) {
     return wrong;
 }
 
-// Mutants: blending counted on the masked target too, unbound slots counted,
-// a masked target alone enough, blending alone enough.
-bool mutant_masked_blend_counts(const bool bound[8], const std::uint32_t mask[8], const bool blend[8]) {
-    bool masked = false, blending = false;
-    for (int t = 0; t < 8; ++t) {
-        if (!bound[t]) continue;
-        if (!(mask[t] & 0xf)) masked = true;
-        if (blend[t]) blending = true;
+// Mutants: a slot the draw does not write counted whatever slot 0 does, the
+// equations ignored, the write masks ignored, a gap at slot 0 read as bound.
+bool mutant_unwritten_always(const LvpSlot* s, int count) {
+    for (int t = 1; t < count; ++t) {
+        if (s[t].bound && !s[t].mask) return true;
     }
-    return masked && blending;
+    return gpu::lvp_blend_collapse_changes(s, count);
 }
-bool mutant_unbound_counts(const bool[8], const std::uint32_t mask[8], const bool blend[8]) {
-    const bool all[8] = {true, true, true, true, true, true, true, true};
-    return gpu::lvp_split_wanted(all, mask, blend);
-}
-bool mutant_masked_alone(const bool bound[8], const std::uint32_t mask[8], const bool[8]) {
-    for (int t = 0; t < 8; ++t) {
-        if (bound[t] && !(mask[t] & 0xf)) return true;
+bool mutant_no_eq(const LvpSlot* s, int count) {
+    LvpSlot c[8];
+    for (int t = 0; t < count; ++t) {
+        c[t] = s[t];
+        c[t].eq = 0;
     }
-    return false;
+    return gpu::lvp_blend_collapse_changes(c, count);
 }
-bool mutant_blending_alone(const bool bound[8], const std::uint32_t mask[8], const bool blend[8]) {
-    for (int t = 0; t < 8; ++t) {
-        if (bound[t] && (mask[t] & 0xf) && blend[t]) return true;
+bool mutant_no_mask(const LvpSlot* s, int count) {
+    LvpSlot c[8];
+    for (int t = 0; t < count; ++t) {
+        c[t] = s[t];
+        if (c[t].mask) c[t].mask = 0xf;
     }
-    return false;
+    return gpu::lvp_blend_collapse_changes(c, count);
+}
+bool mutant_gap_bound(const LvpSlot* s, int count) {
+    LvpSlot c[8];
+    for (int t = 0; t < count; ++t) c[t] = s[t];
+    if (!c[0].bound) {
+        c[0].bound = true;
+        c[0].mask = 0xf;  // what a stale state would hold
+    }
+    return gpu::lvp_blend_collapse_changes(c, count);
+}
+
+LvpSlot bound(std::uint32_t mask, bool blend, std::uint32_t eq) {
+    LvpSlot s;
+    s.bound = true;
+    s.mask = mask;
+    s.blend = blend;
+    s.eq = blend ? eq : 0u;
+    return s;
 }
 
 }  // namespace
 
 int main() {
-    CHECK(run_checks(&gpu::lvp_split_wanted, true) == 0);
+    CHECK(run_checks(&gpu::lvp_blend_collapse_changes, true) == 0);
 
-    // The game's draws by name. The G-buffer's puddle decals: seven targets
-    // bound, six written (RGB) and blended, the seventh not exported.
-    {
-        bool bound[8] = {true, true, true, true, true, true, true, false}, blend[8] = {true, true, true, true, true, true, false, false};
-        std::uint32_t mask[8] = {7, 7, 7, 7, 7, 7, 0, 0};
-        CHECK(gpu::lvp_split_wanted(bound, mask, blend));
-        // The same decals' opaque variant and the G-buffer's geometry: six written, none blended.
-        bool opaque[8] = {};
-        std::uint32_t full[8] = {0xf, 0xf, 0xf, 0xf, 0xf, 0xf, 0, 0};
-        CHECK(!gpu::lvp_split_wanted(bound, full, opaque));
-    }
-    // The effects' soft sprites: two targets, one written and blended.
-    {
-        bool bound[8] = {true, true}, blend[8] = {true, true};
-        std::uint32_t mask[8] = {0xf, 0};
-        CHECK(gpu::lvp_split_wanted(bound, mask, blend));
-    }
-    // A gap below the last bound slot (no target) is not a masked target.
-    {
-        bool bound[8] = {true, false, true}, blend[8] = {true, false, true};
-        std::uint32_t mask[8] = {0xf, 0, 0xf};
-        CHECK(!gpu::lvp_split_wanted(bound, mask, blend));
-    }
+    // The G-buffer's puddle decals: six slots written (RGB) and blended alike, the seventh not exported.
+    LvpSlot decal[7];
+    for (int t = 0; t < 6; ++t) decal[t] = bound(0x7, true, kEqs[0]);
+    decal[6] = bound(0x0, false, 0);
+    CHECK(gpu::lvp_blend_collapse_changes(decal, 7));
+    // The G-buffer's opaque geometry: six slots written alike, not blended, the seventh not exported.
+    LvpSlot geometry[7];
+    for (int t = 0; t < 6; ++t) geometry[t] = bound(0xf, false, 0);
+    geometry[6] = bound(0x0, false, 0);
+    CHECK(!gpu::lvp_blend_collapse_changes(geometry, 7));
+    // The effects' soft sprites: one slot written and blended, the second not exported.
+    const LvpSlot sprite[2] = {bound(0xf, true, kEqs[1]), bound(0x0, false, 0)};
+    CHECK(gpu::lvp_blend_collapse_changes(sprite, 2));
+    // Two slots written and blended alike: drawn the same either way.
+    const LvpSlot alike[2] = {bound(0xf, true, kEqs[0]), bound(0xf, true, kEqs[0])};
+    CHECK(!gpu::lvp_blend_collapse_changes(alike, 2));
+    // A gap at slot 0 (Cainhurst's ground has none) and slot 1 written: nothing would be.
+    const LvpSlot gap0[2] = {LvpSlot{}, bound(0xf, false, 0)};
+    CHECK(gpu::lvp_blend_collapse_changes(gap0, 2));
+    // One slot: nothing to collapse.
+    const LvpSlot one[1] = {bound(0x7, true, kEqs[0])};
+    CHECK(!gpu::lvp_blend_collapse_changes(one, 1));
 
     struct Mutant {
         const char* name;
         Rule rule;
-    } mutants[] = {{"blending counted on the masked target", &mutant_masked_blend_counts},
-                   {"unbound slots counted", &mutant_unbound_counts},
-                   {"a masked target alone", &mutant_masked_alone},
-                   {"blending alone", &mutant_blending_alone}};
+    } mutants[] = {{"an unwritten slot counted whatever slot 0 does", &mutant_unwritten_always},
+                   {"equations ignored", &mutant_no_eq},
+                   {"write masks ignored", &mutant_no_mask},
+                   {"a gap at slot 0 read as bound", &mutant_gap_bound}};
     for (const Mutant& m : mutants) {
         const int caught = run_checks(m.rule, false);
         std::printf("lvp_split_test: mutant '%s': %d combinations wrong%s\n", m.name, caught, caught ? " (caught)" : " - NOT CAUGHT");
