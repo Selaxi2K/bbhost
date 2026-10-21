@@ -299,7 +299,12 @@ for it; the rest run as at 30. `effect_steps = 30` runs them all on whole
 updates a second above 60); `frame` steps them by the frame's time. A
 bbhost.toml that sets `effect_steps` keeps its value; one without it gets
 smooth. `BBHOST_SFX_STEP=30|smooth|60|frame` overrides the setting, and
-`BBHOST_SFX_SMOOTH=0|1` turns the smooth steps off or on for a test run. Above 60 and
+`BBHOST_SFX_SMOOTH=0|1` turns the smooth steps off or on for a test run. The wakes
+characters leave in water (GX's water interaction, one wave step a frame) step
+at 30 a second of game time above 30 too, so they spread as fast as at 30, and
+the water shows the last step between steps
+(`decomp/gx/water_gate.cpp`; `BBHOST_WATER_GATE=0` steps them every frame,
+twice as fast at 60). Above 60 and
 Uncapped the game paces itself and its frames are shown as they come, so 90
 on a 60 Hz display shows 60 of them a second; a rate the machine cannot hold
 runs slower than real time in the few places that count frames.
