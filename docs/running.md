@@ -291,9 +291,10 @@ with 60 too). `[video] effect_steps = 60` steps the effects in whole 1/60 s
 instead (60 updates a second above 60); `frame` steps them by the frame's
 time. `smooth` keeps 30's whole steps
 for what the effects count and moves what they move by time - a particle's
-path, a motion's turn, the GPU particles' clock - by each frame's own time,
-in the effects whose every part has been converted for it; the rest run as
-at 30 (`BBHOST_SFX_SMOOTH=0|1` turns it off or on for a test run).
+path, a motion's turn, the GPU particles' clock, a ribbon's head (its points
+still inserted once a whole step), the wind sources' gusts - by each frame's
+own time, in the effects whose every part has been converted for it; the rest
+run as at 30 (`BBHOST_SFX_SMOOTH=0|1` turns it off or on for a test run).
 `BBHOST_SFX_STEP=30|smooth|60|frame` overrides the setting. Above 60 and
 Uncapped the game paces itself and its frames are shown as they come, so 90
 on a 60 Hz display shows 60 of them a second; a rate the machine cannot hold

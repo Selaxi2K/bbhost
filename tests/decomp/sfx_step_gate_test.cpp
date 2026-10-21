@@ -54,6 +54,12 @@
 //     between whole steps none of that moves and no point is smoothed; on
 //     every frame the last drawn point the emitter at the frame's own time, the
 //     record's times as the game's one call leaves them, the definition back;
+//   - the wind sources' registry step, 0x1314660, with the game's own wind
+//     sources (0x56ec140, stepped by 0x2d552d0) and default objects: the
+//     smooth steps off, the game's own still frame or a step not the effect
+//     manager's, the game's call; on, the game's call with the frame's own
+//     time on the manager's scale; over a second of frames the sources' ages
+//     and gust phases as 30 whole steps leave them;
 // and each of the source's mutants caught. Skips without the 1.09 eboot.
 #define DECOMP_SFX_STEP_GATE_MUTANTS
 int g_sfx_gate_mutant = 0;
@@ -1222,6 +1228,143 @@ int check_records(int cases, u64 sfx) {
     return bad;
 }
 
+// --- the wind sources' registry step ---------------------------------------------------
+
+// A registry (*0x58b0bb0): +0x28 a list's sentinel, each node's +0 the next and +0x10 its entry, an entry's +0x48 its
+// object - a wind source (0x56ec140, stepped by sub_2d552d0), a default object (0x56ebf70, steps nothing) or none.
+struct WindRegistry {
+    u64 registry;
+    std::vector<u64> sources;
+};
+WindRegistry make_wind_registry() {
+    WindRegistry w;
+    w.registry = block(0x110);
+    const u64 head = block(0x20);
+    store<u64>(w.registry + 0x28, head);
+    u64 last = head;
+    for (int i = g_rng.range(0, 8); i > 0; --i) {
+        const u64 node = block(0x20), entry = block(0x60);
+        store<u64>(last, node);
+        last = node;
+        store<u64>(node + 0x10, entry);
+        const double kind = g_rng.value(0, 1);
+        if (kind < 0.6) {
+            const u64 src = block(0x240);
+            for (int k = 8; k < 0x240; k += 4) store<float>(src + k, value(-50, 50));
+            store<u64>(src, game_address(0x56ec140));
+            store<float>(src + 0x1a8, value(0, 3));
+            store<float>(src + 0x1f4, value(0, 100));
+            store<u64>(entry + 0x48, src);
+            w.sources.push_back(src);
+        } else if (kind < 0.8) {
+            const u64 obj = block(0xd0);
+            store<u64>(obj, game_address(0x56ebf70));
+            store<u64>(entry + 0x48, obj);
+        } else {
+            store<u64>(entry + 0x48, 0);
+        }
+    }
+    store<u64>(last, head);  // circular: the last node's next the sentinel
+    return w;
+}
+std::vector<u8> wind_bytes(const WindRegistry& w) {
+    std::vector<u8> v;
+    for (const u64 src : w.sources) {
+        const std::size_t at = v.size();
+        v.resize(at + 0x240);
+        std::memcpy(v.data() + at, reinterpret_cast<void*>(src), 0x240);
+    }
+    return v;
+}
+void put_wind(const WindRegistry& w, const std::vector<u8>& v) {
+    std::size_t at = 0;
+    for (const u64 src : w.sources) {
+        std::memcpy(reinterpret_cast<void*>(src), v.data() + at, 0x240);
+        at += 0x240;
+    }
+}
+struct WindSeen {
+    long cases = 0, smooth = 0, other = 0, seconds = 0;
+} g_seen_wind;
+
+// The registry step (sub_1314660 as ours) against the game's: the smooth steps off, the game's own still frame, or a
+// step that is not the manager's (its whole step on its time scale, or none), the game's call as it is; on, the game's
+// call with the frame's own time on the manager's scale - every byte of every source. And over a second, the sources'
+// ages and gust phases the same at 60, 120, 144 and jittered rates as at 30, within the adds' rounding.
+int check_wind_sources(int cases, u64 sfx, u64 manager) {
+    const auto game = eboot_kit::fn<WindStepFn>(kWindSourcesStep);
+    int bad = 0;
+    for (int c = 0; c < cases; ++c) {
+        g_blocks.clear();
+        const WindRegistry w = make_wind_registry();
+        const bool smooth = g_rng.chance(0.8), still = g_rng.chance(0.1), between = g_rng.chance(0.6), other = g_rng.chance(0.1);
+        const float time_scale = g_rng.chance(0.6) ? 1.0f : value(0.25f, 2.0f), frame = value(1.0f / 240, 1.0f / 30);
+        store<float>(manager + 0x5d8, time_scale);
+        store<u32>(sfx + 0x8c, still ? 1u : 0u);
+        decomp_sfx_smooth(smooth);
+        decomp_sfx_step_frame(between);
+        decomp_sfx_frame_time(frame, 0.0f, 0.0f);
+        const float manager_step = (between ? 0.0f : 1.0f / 30.0f) * time_scale;
+        const float step = other ? value(-1, 1) : manager_step;
+        const bool takes = smooth && !still && bits(step) == bits(manager_step);
+        const float want = takes ? frame * time_scale : step;
+        const std::vector<u8> before = wind_bytes(w);
+        game(w.registry, want);
+        const std::vector<u8> theirs = wind_bytes(w);
+        put_wind(w, before);
+        sfx_wind_sources_step(w.registry, step);
+        const std::vector<u8> ours = wind_bytes(w);
+        ++g_seen_wind.cases;
+        g_seen_wind.smooth += takes;
+        g_seen_wind.other += smooth && !still && !takes;
+        if (ours != theirs && ++bad <= 6 && !g_quiet)
+            std::printf("wind sources case %d (%zu sources, smooth %d, still %d, between %d, another's step %d, scale %g): the step differs\n", c,
+                        w.sources.size(), smooth, still, between, other, time_scale);
+    }
+    // a second of frames against 30 whole steps
+    store<u32>(sfx + 0x8c, 0);
+    for (int c = 0; c < cases / 10; ++c) {
+        g_blocks.clear();
+        const WindRegistry w = make_wind_registry();
+        if (w.sources.empty()) continue;
+        const float time_scale = g_rng.chance(0.6) ? 1.0f : value(0.25f, 2.0f);
+        store<float>(manager + 0x5d8, time_scale);
+        const std::vector<u8> before = wind_bytes(w);
+        decomp_sfx_smooth(false);
+        for (int k = 0; k < 30; ++k) game(w.registry, 1.0f / 30.0f * time_scale);
+        const std::vector<u8> at30 = wind_bytes(w);
+        put_wind(w, before);
+        decomp_sfx_smooth(true);
+        const int rate_kind = g_rng.range(0, 3);
+        double carry = 0.0, total = 0.0;
+        int frames = 0;
+        while (total < 1.0 - 1e-9 && frames < 1000) {
+            double dt = rate_kind == 0 ? 1.0 / 60 : rate_kind == 1 ? 1.0 / 120 : rate_kind == 2 ? 1.0 / 144 : g_rng.value(1.0f / 150, 1.0f / 40);
+            if (total + dt > 1.0) dt = 1.0 - total;
+            const sfx_schedule::Frame fr = sfx_schedule::next(carry, dt, 30);
+            total += dt;
+            ++frames;
+            decomp_sfx_step_frame(fr.whole == 0);
+            decomp_sfx_frame_time(fr.frame, fr.from, fr.into);
+            sfx_wind_sources_step(w.registry, static_cast<float>(fr.whole) / 30.0f * time_scale);
+        }
+        decomp_sfx_smooth(false);
+        decomp_sfx_step_frame(false);
+        ++g_seen_wind.seconds;
+        for (std::size_t i = 0; i < w.sources.size(); ++i) {
+            const u64 at = 0x240 * i;
+            for (const u64 off : {0x1f4ull, 0x1b4ull}) {
+                const double a = load<float>(reinterpret_cast<u64>(at30.data()) + at + off), b = load<float>(w.sources[i] + off);
+                const double scale = std::fabs(a) + 1.0;
+                if (std::fabs(a - b) > 2e-6 * frames * scale && ++bad <= 6 && !g_quiet)
+                    std::printf("wind sources second %d (rate kind %d, %d frames): +0x%llx %.9g against 30's %.9g\n", c, rate_kind, frames,
+                                static_cast<unsigned long long>(off), b, a);
+            }
+        }
+    }
+    return bad;
+}
+
 // --- the ribbon (FFX-format GX type 0x28) under the smooth steps --------------------------
 
 // The ribbon's set-up allocates its point arrays from an allocator (vtable +0x58: (allocator, size, alignment)).
@@ -1608,8 +1751,9 @@ int main() {
         std::memcmp(eboot_kit::at(kWobbleB), kWobbleEntry, sizeof kWobbleEntry) != 0 ||
         std::memcmp(eboot_kit::at(kWobbleFollow), kFollowEntry, sizeof kFollowEntry) != 0 ||
         std::memcmp(eboot_kit::at(kGxRecordUpdate), kGxRecordEntry, sizeof kGxRecordEntry) != 0 ||
-        std::memcmp(eboot_kit::at(kLightFades), kLightFadesEntry, sizeof kLightFadesEntry) != 0) {
-        std::printf("decomp_sfx_step_gate: the seven entries are not where the gate expects them\n");
+        std::memcmp(eboot_kit::at(kLightFades), kLightFadesEntry, sizeof kLightFadesEntry) != 0 ||
+        std::memcmp(eboot_kit::at(kWindSourcesStep), kWindStepEntry, sizeof kWindStepEntry) != 0) {
+        std::printf("decomp_sfx_step_gate: the eight entries are not where the gate expects them\n");
         return 1;
     }
     // The singletons: SprjSfx (its still-frame word +0x8c), the node pool, and
@@ -1795,6 +1939,24 @@ int main() {
         }
     }
     g_sfx_gate_mutant = 0;
+    // The wind sources' registry step.
+    g_game_wind_step = eboot_kit::at(kWindSourcesStep);
+    g_quiet = false;
+    g_rng.specials = false;
+    const int wsbad = check_wind_sources(kCases, sfx, manager);
+    std::printf("decomp_sfx_step_gate: %d wind source registry cases (%ld by the frame's time, %ld another caller's step) and %ld seconds of frames "
+                "against 30's whole steps, %d differ\n",
+                kCases, g_seen_wind.smooth, g_seen_wind.other, g_seen_wind.seconds, wsbad);
+    if (wsbad) return 1;
+    g_quiet = true;
+    for (const int m : {38, 39}) {
+        g_sfx_gate_mutant = m;
+        if (!check_wind_sources(2000, sfx, manager)) {
+            std::printf("decomp_sfx_step_gate: mutant %d not caught by the wind sources\n", m);
+            ++missed;
+        }
+    }
+    g_sfx_gate_mutant = 0;
     // The ribbon last: its set-up's allocator the test's; the manager's time scale per case.
     store<u64>(reinterpret_cast<u64>(g_ribbon_alloc_vt) + 0x58, reinterpret_cast<u64>(&stub_ribbon_alloc));
     store<u64>(reinterpret_cast<u64>(g_ribbon_alloc), reinterpret_cast<u64>(g_ribbon_alloc_vt));
@@ -1842,6 +2004,6 @@ int main() {
         }
     }
     g_sfx_gate_mutant = 0;
-    std::printf("decomp_sfx_step_gate: %d of 35 mutants caught\n", 35 - missed);
+    std::printf("decomp_sfx_step_gate: %d of 37 mutants caught\n", 37 - missed);
     return missed ? 1 : 0;
 }

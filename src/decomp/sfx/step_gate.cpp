@@ -72,6 +72,7 @@ constexpr u64 kWobbleB = 0x2e8e430;            // motion 0x570e8d0's update: cou
 constexpr u64 kWobbleBBase = 0x2e8bfd0;        //   its base motion
 constexpr u64 kWobbleFollow = 0x2e896f0;       // motion 0x570e690's update: the lerp toward the parent, then kWobbleA
 constexpr u64 kLightFades = 0x12e5500;         // the effect manager's fading GX lights (+0x118): (list, step)
+constexpr u64 kWindSourcesStep = 0x1314660;    // the wind sources' registry (*0x58b0bb0) stepped: (registry, step)
 
 using InstanceUpdate = GUEST_ABI u8 (*)(u64 instance, u64 context, float step);
 using LightUpdate = GUEST_ABI void (*)(u64 module, u64 params, u64 context);
@@ -83,6 +84,7 @@ using ControllerFn = GUEST_ABI u64 (*)(u64 controller, u64 instance, float step)
 using MotionFn = GUEST_ABI void (*)(u64 motion, u64 node, const float* step, u64 local);
 using GxRecordFn = GUEST_ABI void (*)(u64 record, u64 item);
 using LightFadesFn = GUEST_ABI void (*)(u64 list, float step);
+using WindStepFn = GUEST_ABI void (*)(u64 registry, float step);
 
 void* g_game_instance = nullptr;
 void* g_game_light = nullptr;
@@ -91,6 +93,7 @@ void* g_game_wobble_b = nullptr;
 void* g_game_wobble_follow = nullptr;
 void* g_game_gx_record = nullptr;
 void* g_game_light_fades = nullptr;
+void* g_game_wind_step = nullptr;
 
 std::atomic<u32> g_between{0};
 std::atomic<u32> g_step_between{0};  // a frame between whole effect steps, the gate on or off (decomp_sfx_step_frame)
@@ -102,6 +105,7 @@ std::atomic<u64> g_smooth_updates{0}, g_smooth_kept{0};
 std::atomic<u64> g_lights_smooth{0}, g_lights_counted{0}, g_fades_smooth{0};
 std::atomic<u64> g_frames_between{0}, g_instances_held{0}, g_lights_held{0}, g_motions_held{0}, g_still_frames{0}, g_records_held{0};
 std::atomic<u64> g_ribbons_between{0}, g_ribbons_whole{0}, g_ribbons_unmarked{0};
+std::atomic<u64> g_wind_steps_smooth{0}, g_wind_steps_other{0};
 
 // The ribbons (their GX types) of the instances the smooth steps run this frame, marked as smooth_update takes an
 // instance, for the record update: it runs later from the render context's queue, and a pre-roll's (sub_2c500e0's
@@ -495,6 +499,38 @@ DECOMP_LEAF void sfx_light_fades(u64 list, float step) {
     game(list, s);
 }
 
+// sub_1314660(the wind sources' registry *0x58b0bb0, step): every registered
+// wind source - the map's wind areas (WindIns, sub_210ec40) and the effects'
+// wind types 0x283c / 0x283d alike, class 0x56ec140 - stepped through its
+// vtable +0x58, sub_2d552d0: its last step (+0x38), its age (+0x1f4 += step)
+// and its gust phase (+0x1b4 += step x its rate +0x1a8 x 10), nothing counted
+// (an entry's default object, 0x56ebf70, steps nothing). The effect manager's
+// update (0x26ff3ee) hands it the effects' step times its time scale (+0x5d8),
+// so above 30 the gusts moved in whole 1/30 s, held between. The smooth steps
+// give it the frame's own time on the same scale instead: the same seconds of
+// gusts, a change each frame. Only the manager's call (its step: the whole
+// step's, or none, on its scale) is taken; another caller's, and the game's own
+// still frame (SprjSfx+0x8c), are the game's.
+DECOMP_LEAF void sfx_wind_sources_step(u64 registry, float step) {
+    const auto game = reinterpret_cast<WindStepFn>(g_game_wind_step);
+    float s = step;
+    if (g_smooth.load(std::memory_order_relaxed) && !MUTANT(38)) {
+        const u64 sfx = load<u64>(game_address(kSprjSfx));
+        const u64 manager = sfx ? load<u64>(sfx + kManagerOf) : 0;
+        if (manager && !load<u32>(sfx + 0x8c)) {
+            const float time_scale = load<float>(manager + 0x5d8);
+            const float whole = g_step_between.load(std::memory_order_relaxed) ? 0.0f : 1.0f / 30.0f;
+            if (std::bit_cast<u32>(whole * time_scale) == std::bit_cast<u32>(step)) {
+                g_wind_steps_smooth.fetch_add(1, std::memory_order_relaxed);
+                s = g_frame_step.load(std::memory_order_relaxed) * (MUTANT(39) ? 1.0f : time_scale);
+            } else {
+                g_wind_steps_other.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+    game(registry, s);
+}
+
 // The wobble motions. Motion classes 0x570e6d0 and 0x570e690 (whose update,
 // sub_2e896f0, ends in the first's, sub_2e89d10) and 0x570e8d0 (sub_2e8e430)
 // run their base motion and then count their calls - +0x6c against the
@@ -735,6 +771,8 @@ constexpr std::uint8_t kFollowEntry[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x4
 constexpr std::uint8_t kGxRecordEntry[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x68};
 // The light fades' (sub rsp, 0x18).
 constexpr std::uint8_t kLightFadesEntry[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x18};
+// The wind sources' step: push rbp; mov rbp, rsp; push r14, rbx; sub rsp, 0x10; vmovss [rbp-0x14], xmm0.
+constexpr std::uint8_t kWindStepEntry[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x56, 0x53, 0x48, 0x83, 0xec, 0x10, 0xc5, 0xfa, 0x11, 0x45, 0xec};
 
 void report() {
     if (!decomp_sfx_gate_placed()) return;
@@ -751,6 +789,8 @@ void report() {
     host_log("decomp:   ribbon updates: %llu between whole steps (the head by the frame's time, nothing inserted), %llu on frames with one, "
              "%llu not a smooth instance's (a pre-roll's or a held one's: the game's)",
              static_cast<ull>(g_ribbons_between.load()), static_cast<ull>(g_ribbons_whole.load()), static_cast<ull>(g_ribbons_unmarked.load()));
+    host_log("decomp:   wind source steps by the frame's time: %llu (%llu another caller's, the game's)", static_cast<ull>(g_wind_steps_smooth.load()),
+             static_cast<ull>(g_wind_steps_other.load()));
     for (std::size_t i = 0; i < kKeptSlots; ++i) {
         const u64 vt = g_kept_class[i].load();
         if (!vt) break;
@@ -780,4 +820,6 @@ void decomp_sfx_step_gate_add() {
                 DecompKind::Leaf, &g_game_gx_record});
     decomp_add({"sub_12e5500", area, kLightFades, kLightFadesEntry, sizeof(kLightFadesEntry), reinterpret_cast<void*>(&sfx_light_fades),
                 DecompKind::Leaf, &g_game_light_fades});
+    decomp_add({"sub_1314660", area, kWindSourcesStep, kWindStepEntry, sizeof(kWindStepEntry), reinterpret_cast<void*>(&sfx_wind_sources_step),
+                DecompKind::Leaf, &g_game_wind_step});
 }
