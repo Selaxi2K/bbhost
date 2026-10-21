@@ -784,6 +784,16 @@ struct VramCensus {
     VramKind gpu_written_in_tex, tex_in_targets;
     // depth_copy.cpp and other images with memory of their own in video
     // memory: counted by gpu_memtrack's owners instead.
+    // By image heap block (ImageMemory::block), bytes of each kind: colour
+    // targets, depth targets, snapshots, GPU-written surfaces, textures,
+    // copies of targets' regions and levels - what keeps a block from emptying.
+    enum : int { kBlockColour, kBlockDepth, kBlockSnapshot, kBlockGpuWritten, kBlockTexture, kBlockRegion, kBlockKinds };
+    std::vector<std::array<std::uint64_t, kBlockKinds>> by_block;
+    void note_block(std::int32_t block, int kind, std::uint64_t bytes) {
+        if (block < 0 || block > 4096) return;
+        if (by_block.size() <= static_cast<std::size_t>(block)) by_block.resize(static_cast<std::size_t>(block) + 1, {});
+        by_block[static_cast<std::size_t>(block)][static_cast<std::size_t>(kind)] += bytes;
+    }
 };
 // display_w x display_h: the display buffers' size (0 x 0: not known).
 void render_vram_census_locked(VramCensus& c, std::uint32_t display_w, std::uint32_t display_h);  // render.cpp

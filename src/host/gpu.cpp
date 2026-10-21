@@ -6930,6 +6930,27 @@ std::string video_memory_report_locked(bool at_exit) {
                       static_cast<ull>(c.tex_in_targets.n), static_cast<ull>(drained[0]), static_cast<ull>(drained[1]), mib(drained[2]),
                       static_cast<ull>(drained[3]));
         out += buf;
+        // The targets' blocks one by one: what each holds (MiB of colour,
+        // depth, snapshots, GPU-written surfaces, textures, region copies)
+        // and its free room - all of it, the largest hole, the holes.
+        std::string tb;
+        for (std::size_t k = 0; k < g_heap.size(); ++k) {
+            const HeapBlock& b = g_heap[k];
+            if (b.memory == VK_NULL_HANDLE || b.cls != kHeapTargets || g.mem_props.memoryTypes[b.type].heapIndex != g.local_heap) continue;
+            VkDeviceSize largest = 0;
+            for (const auto& [o, sz] : b.free) largest = std::max(largest, sz);
+            std::array<std::uint64_t, VramCensus::kBlockKinds> by{};
+            if (k < c.by_block.size()) by = c.by_block[k];
+            char one[160];
+            std::snprintf(one, sizeof(one), "%s#%zu %llu/%llu/%llu/%llu/%llu/%llu free %llu (largest %llu, %zu holes)", tb.empty() ? "" : "; ", k,
+                          mib(by[0]), mib(by[1]), mib(by[2]), mib(by[3]), mib(by[4]), mib(by[5]), mib(kHeapBlock - b.used), mib(largest),
+                          b.free.size());
+            tb += one;
+        }
+        if (!tb.empty()) {
+            out += "\n[bbhost]   video memory, the targets' blocks (MiB of colour/depth/snapshots/GPU-written/textures/region copies): ";
+            out += tb;
+        }
     }
     if (c.rt_host.n || c.tex_host.n) {
         std::snprintf(buf, sizeof(buf), "; in host memory for want of video memory: targets and snapshots %llu (%llu), textures %llu (%llu)",

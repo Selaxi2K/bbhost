@@ -10441,6 +10441,7 @@ void render_vram_census_locked(VramCensus& c, std::uint32_t display_w, std::uint
             continue;
         }
         if (r.written_ms && now - r.written_ms >= kIdleMs) c.rt_idle.add(bytes);
+        c.note_block(r.memory.block, r.depth ? VramCensus::kBlockDepth : VramCensus::kBlockColour, bytes);
         if (r.depth) c.rt_depth.add(bytes);
         else if (display_w && r.width == display_w && r.height == display_h) c.rt_display.add(bytes);
         else c.rt_colour.add(bytes);
@@ -10453,6 +10454,7 @@ void render_vram_census_locked(VramCensus& c, std::uint32_t display_w, std::uint
             continue;
         }
         c.snapshots.add(bytes);
+        c.note_block(r.memory.block, VramCensus::kBlockSnapshot, bytes);
         if (r.written_ms && now - r.written_ms >= kIdleMs) c.snap_idle.add(bytes);
     }
 }

@@ -4184,6 +4184,7 @@ void textures_vram_census_locked(VramCensus& c) {
             continue;
         }
         const int cls = image_memory_class_locked(sf.memory);
+        c.note_block(sf.memory.block, sf.gpu_written || sf.copied_mips ? VramCensus::kBlockGpuWritten : VramCensus::kBlockTexture, bytes);
         if (sf.gpu_written || sf.copied_mips) {
             (sf.written_ms && now - sf.written_ms >= 10000 ? c.gpu_written_idle : c.gpu_written).add(bytes);
             if (cls == kHeapTextures) c.gpu_written_in_tex.add(bytes);
@@ -4200,9 +4201,11 @@ void textures_vram_census_locked(VramCensus& c) {
     }
     for (const auto& [key, reg] : g_rt_regions) {
         if (reg.img.image) (image_memory_in_vram(reg.img.memory) ? c.regions : c.tex_host).add(reg.img.memory.size);
+        if (reg.img.image) c.note_block(reg.img.memory.block, VramCensus::kBlockRegion, reg.img.memory.size);
     }
     for (const auto& [key, al] : g_level_aliases) {
         if (al.img.image) (image_memory_in_vram(al.img.memory) ? c.regions : c.tex_host).add(al.img.memory.size);
+        if (al.img.image) c.note_block(al.img.memory.block, VramCensus::kBlockRegion, al.img.memory.size);
     }
 }
 
