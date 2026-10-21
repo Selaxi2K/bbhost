@@ -490,9 +490,10 @@ void set_oob_count(bool on);
 bool oob_count();
 // The counters' control (BBHOST_OOB_COUNT=2): every limit halved - a typed
 // load by index counts as past the records from half of them on, an image
-// access past half the view's size, levels or layers - so a run shows each
-// kind reaches the host where the game reads nothing past them. Keyed with
-// the rest.
+// access past half the view's size, levels or layers - and of those accesses
+// one in 256 counted (by a hash of the index or the first coordinate), so a
+// run shows each kind reaches the host where the game reads nothing past
+// them, at a small part of the draws' time. Keyed with the rest.
 void set_oob_control(bool on);
 bool oob_control();
 constexpr std::uint32_t kOobSlots = 4096, kOobKinds = 9;

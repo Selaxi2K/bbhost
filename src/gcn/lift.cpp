@@ -3317,7 +3317,7 @@ private:
             // num_records, and a read past the binding.
             const Id records = as_u(read(static_cast<std::uint16_t>(in.srsrc + 2), in));
             const Id limit = oob_control() ? shift(spv::OpShiftRightLogical, records, cu(1)) : records;  // gcn::set_oob_control
-            oob_note(m.emit(spv::OpLogicalNot, t_bool, {m.emit(spv::OpULessThan, t_bool, {vindex, limit})}), kOobPastRecords);
+            oob_note(oob_sampled(m.emit(spv::OpLogicalNot, t_bool, {m.emit(spv::OpULessThan, t_bool, {vindex, limit})}), vindex), kOobPastRecords);
             int total_bits = 0;
             for (int k = 0; k < count; ++k) total_bits += bits[k];
             const Id length = m.emit(spv::OpArrayLength, t_u32, {buffer_vars[index], 0u});
@@ -4631,6 +4631,13 @@ private:
             cur_label = m.label(l_merge);
         });
     }
+    // gcn::set_oob_control, as the reference's oob_sampled: of the accesses past
+    // a halved limit, those whose `key` hashes to 0 in its top eight bits.
+    Id oob_sampled(Id cond, Id key) {
+        if (!oob_control()) return cond;
+        const Id h = shift(spv::OpShiftRightLogical, ibin(spv::OpIMul, key, cu(0x9e3779b1u)), cu(24));
+        return m.emit(spv::OpLogicalAnd, t_bool, {cond, ieq(h, cu(0))});
+    }
     // gcn::set_oob_count, as the reference's oob_image: an image access at
     // integer coordinates (`coords`, signed, the layer last where `b` is
     // arrayed) against the view bound for the reference's image `ii` - a load
@@ -4643,7 +4650,8 @@ private:
         const Id size_type = n == 1 ? t_i32 : n == 2 ? t_v2i : n == 3 ? t_v3i : m.type_vector(t_i32, 4);
         const auto limit = [&](Id v) { return oob_control() ? shift(spv::OpShiftRightLogical, v, cu(1)) : v; };
         const auto below = [&](Id v, Id lim) { return m.emit(spv::OpULessThan, t_bool, {v, lim}); };
-        const auto past = [&](Id v, Id lim) { return m.emit(spv::OpLogicalNot, t_bool, {below(v, limit(lim))}); };
+        const Id key = from_i(coords[0]);
+        const auto past = [&](Id v, Id lim) { return oob_sampled(m.emit(spv::OpLogicalNot, t_bool, {below(v, limit(lim))}), key); };
         Id size, level_in = 0;
         if (store) {
             size = m.emit(spv::OpImageQuerySize, size_type, {image});

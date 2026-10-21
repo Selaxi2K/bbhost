@@ -756,6 +756,14 @@ struct Translator {
                                               cu(spv::MsNone), c_one_u});
         });
     }
+    // gcn::set_oob_control: of the accesses past a halved limit, one in 256 -
+    // those whose `key` (a coordinate or an index) hashes to 0 in its top eight
+    // bits - so the control's adds stay a small part of the draws' time; `cond`
+    // as it is otherwise.
+    Id oob_sampled(Id cond, Id key) {
+        if (!oob_control()) return cond;
+        return band(cond, ieq(shr(imul(key, cu(0x9e3779b1u)), cu(24)), c_zero_u));
+    }
     // gcn::set_oob_count: an image access at integer coordinates (`coords`,
     // signed, the layer last where `arrayed`) against the view the host binds
     // for `img` - a load (OpImageFetch at `level`, 0 for none) or a store
@@ -770,7 +778,8 @@ struct Translator {
         const std::size_t n = coords.size();
         const Id size_type = n == 1 ? t_i32 : n == 2 ? t_v2i : n == 3 ? t_v3i : t_v4i;
         const auto limit = [&](Id v) { return oob_control() ? shr(v, c_one_u) : v; };
-        const auto past = [&](Id v, Id lim) { return m.emit(spv::OpLogicalNot, t_bool, {ult(v, limit(lim))}); };
+        const Id key = ui(coords[0]);
+        const auto past = [&](Id v, Id lim) { return oob_sampled(m.emit(spv::OpLogicalNot, t_bool, {ult(v, limit(lim))}), key); };
         Id size, level_in = 0;
         if (store) {
             size = m.emit(spv::OpImageQuerySize, size_type, {image});
@@ -2803,7 +2812,8 @@ struct Translator {
         // the binding (its last dword at or past the array's length).
         if (oob_base64) {
             const Id records = read_s(static_cast<std::uint16_t>(in.srsrc + 2), in);
-            oob_note(m.emit(spv::OpLogicalNot, t_bool, {ult(vindex, oob_control() ? shr(records, c_one_u) : records)}), kOobPastRecords);
+            oob_note(oob_sampled(m.emit(spv::OpLogicalNot, t_bool, {ult(vindex, oob_control() ? shr(records, c_one_u) : records)}), vindex),
+                     kOobPastRecords);
             const Id length = m.emit(spv::OpArrayLength, t_u32, {buffer_vars[index], 0u});
             const Id last = iadd(cb_bias(index), iadd(first, cu(static_cast<std::uint32_t>(nwords - 1))));
             oob_note(m.emit(spv::OpLogicalNot, t_bool, {ult(last, length)}), kOobPastBinding);

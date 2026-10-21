@@ -3719,7 +3719,8 @@ bool init_locked() {
     // detail lines and the exit report read it (oob_totals). The counters
     // live in the lifter's SPIR-V, so the HLSL path is off while they count
     // (hlsl_mode). =2: the control (gcn::set_oob_control) - every limit
-    // halved, to show each kind reaches the host.
+    // halved and one access in 256 past it counted, to show each kind reaches
+    // the host at a small part of the draws' time.
     if (const char* e = std::getenv("BBHOST_OOB_COUNT"); e && (e[0] == '1' || e[0] == '2')) {
         if (create_dev_buffer(g.oob, std::uint64_t{gcn::kOobSlots} * gcn::kOobKinds * 4, true, true)) {
             std::memset(g.oob.map, 0, g.oob.size);
@@ -3728,7 +3729,7 @@ bool init_locked() {
             host_log("gpu: out-of-range accesses counted (BBHOST_OOB_COUNT=%c): buffers past their records or binding, images at integer "
                      "coordinates outside the bound view's size, levels or layers; vertex, pixel and compute stages without a "
                      "tessellation or GS role, translated or lifted; the HLSL path off%s",
-                     e[0], e[0] == '2' ? "; the control: every limit halved" : "");
+                     e[0], e[0] == '2' ? "; the control: every limit halved, one access in 256 past it counted" : "");
         }
     }
 
