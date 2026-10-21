@@ -215,9 +215,11 @@ the game needs now (render targets, textures in use, buffers by owner) and
 `video memory caches` what bbhost keeps because the card has room (the
 vertex data's mirrors, textures not used for a while, free room in the image
 heap), which it gives back when memory runs short. At exit the log gives each
-owner's highest. Render targets and textures go in blocks of their own so
-that a block of textures can empty and be given back
-(`BBHOST_HEAP_CLASSES=0`, `BBHOST_HEAP_DRAIN=0` turn that off);
+owner's highest. Render targets never go in the textures' blocks, so that a
+block of textures can empty and be given back; a texture still takes free
+room between the targets before a new block is made
+(`BBHOST_HEAP_CLASSES=strict` keeps the two apart; `BBHOST_HEAP_CLASSES=0`
+and `BBHOST_HEAP_DRAIN=0` turn the split and the draining off);
 `BBHOST_TESS_RING=whole` and `BBHOST_SCRATCH_RETURN=0` keep the tessellation
 ring and the texture upload scratch at their largest from the start. On a GPU
 without sparse binding (AMD, integrated GPUs) the vertex data's mirrors are

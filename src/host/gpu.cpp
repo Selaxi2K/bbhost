@@ -6308,10 +6308,26 @@ std::size_t heap_live_blocks_locked() {
 // emptied for the keeper to give back - after ten places 9 blocks (2.3 GiB)
 // held 1.3-1.9 GiB of images (render/next22 at 1080p). Apart, the textures'
 // blocks empty as the game lets an area's textures go. 0: one class.
+// A texture still takes free room in the targets' blocks before an empty
+// block or a new one: kept apart, the targets' holes held 330-360 MiB at a
+// lamp that no texture could use, and a Radeon 680M's run ended with 9 blocks
+// where one class had needed 6. A target never goes in the textures' blocks,
+// so those still empty. strict: each class in its own blocks only.
 const bool g_heap_classes = [] {
     const char* e = std::getenv("BBHOST_HEAP_CLASSES");
     return !(e && e[0] == '0');
 }();
+const bool g_heap_overflow = [] {
+    const char* e = std::getenv("BBHOST_HEAP_CLASSES");
+    return !(e && std::strcmp(e, "strict") == 0);
+}();
+
+// Whether an image of class `cls` may go in a block of class `block_cls`
+// (-1: empty).
+bool heap_class_fits(int block_cls, int cls) {
+    if (!g_heap_classes || block_cls < 0 || block_cls == cls) return true;
+    return g_heap_overflow && cls == kHeapTextures && block_cls == kHeapTargets;
+}
 
 VkDeviceSize heap_free_locked(std::uint32_t type, std::size_t* live) {
     VkDeviceSize free = 0;
@@ -6326,11 +6342,12 @@ VkDeviceSize heap_free_locked(std::uint32_t type, std::size_t* live) {
 }
 
 // The room the memory keeper counts as its spare in memory type `type`: with
-// the image heap's classes, the empty blocks and the least free room either
-// class has in its own blocks - room only the targets' blocks have is no
-// spare for the next texture, which would make a block on the command
-// processor (5-10 ms on NVIDIA, ~190 ms on a Radeon 680M). Without them every
-// block's free room, as before.
+// the image heap's classes, the empty blocks and the least free room the next
+// target or the next texture can take (a target the targets' blocks only, a
+// texture its own blocks and, unless strict, the targets' holes) - room the
+// next image cannot use makes a block on the command processor (5-10 ms on
+// NVIDIA, ~190 ms on a Radeon 680M). Without them every block's free room, as
+// before.
 VkDeviceSize heap_spare_room_locked(std::uint32_t type) {
     if (!g_heap_classes) return heap_free_locked(type, nullptr);
     VkDeviceSize empty = 0, holes[2] = {};
@@ -6339,7 +6356,8 @@ VkDeviceSize heap_spare_room_locked(std::uint32_t type) {
         if (b.cls < 0) empty += kHeapBlock - b.used;
         else holes[b.cls == kHeapTextures ? 1 : 0] += kHeapBlock - b.used;
     }
-    return empty + std::min(holes[0], holes[1]);
+    const VkDeviceSize for_textures = holes[1] + (g_heap_overflow ? holes[0] : 0);
+    return empty + std::min(holes[0], for_textures);
 }
 
 void heap_release(const ImageMemory& m) {
@@ -6400,11 +6418,17 @@ bool heap_place_locked(const VkMemoryRequirements& req, std::uint32_t type, bool
             order.clear();
             for (std::size_t k = 0; k < g_heap.size(); ++k) {
                 const HeapBlock& b = g_heap[k];
-                if (b.memory != VK_NULL_HANDLE && b.type == type && kHeapBlock - b.used >= req.size && (b.cls == cls || b.cls < 0))
+                if (b.memory != VK_NULL_HANDLE && b.type == type && kHeapBlock - b.used >= req.size && heap_class_fits(b.cls, cls))
                     order.push_back(k);
             }
             if (g_heap_fullest) {
-                std::stable_sort(order.begin(), order.end(), [](std::size_t a, std::size_t c) { return g_heap[a].used > g_heap[c].used; });
+                // Its own class's blocks, then (a texture) the targets' holes,
+                // then an empty block; fullest first in each.
+                const auto rank = [cls](const HeapBlock& b) { return b.cls == cls ? 0 : b.cls >= 0 ? 1 : 2; };
+                std::stable_sort(order.begin(), order.end(), [&rank](std::size_t a, std::size_t c) {
+                    const int ra = rank(g_heap[a]), rc = rank(g_heap[c]);
+                    return ra != rc ? ra < rc : g_heap[a].used > g_heap[c].used;
+                });
             }
             for (const std::size_t k : order) {
                 HeapBlock& b = g_heap[k];
@@ -6416,7 +6440,7 @@ bool heap_place_locked(const VkMemoryRequirements& req, std::uint32_t type, bool
                     if (at > lo) b.free[lo] = at - lo;
                     if (at + req.size < hi) b.free[at + req.size] = hi - (at + req.size);
                     b.used += req.size;
-                    b.cls = static_cast<std::int8_t>(cls);
+                    if (b.cls < 0) b.cls = static_cast<std::int8_t>(cls);
                     out = {b.memory, at, req.size, static_cast<std::int32_t>(k), type};
                     ++g_heap_allocs;
                     return true;
@@ -6466,7 +6490,7 @@ std::uint64_t image_heap_vram_free_locked(int cls) {
     std::uint64_t free = 0;
     for (const HeapBlock& b : g_heap) {
         if (b.memory == VK_NULL_HANDLE || g.mem_props.memoryTypes[b.type].heapIndex != g.local_heap) continue;
-        if (cls >= 0 && g_heap_classes && b.cls >= 0 && b.cls != cls) continue;
+        if (cls >= 0 && !heap_class_fits(b.cls, cls)) continue;
         free += kHeapBlock - b.used;
     }
     return free;
