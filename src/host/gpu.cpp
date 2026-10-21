@@ -6263,6 +6263,9 @@ struct HeapBlock {
     std::map<VkDeviceSize, VkDeviceSize> free;  // offset -> size, coalesced
     VkDeviceSize used = 0;
     std::chrono::steady_clock::time_point empty_since{};  // when used last fell to 0
+    // What it holds (HeapClass, gpu_internal.h): set by its first image,
+    // cleared when it empties (-1: nothing yet, any class may take it).
+    std::int8_t cls = -1;
 };
 std::vector<HeapBlock> g_heap;  // under g.mu; an image's ImageMemory::block indexes it
 std::uint64_t g_heap_allocs = 0, g_heap_own = 0, g_heap_released = 0, g_heap_cp_blocks = 0;
@@ -6290,6 +6293,18 @@ std::size_t heap_live_blocks_locked() {
     return n;
 }
 
+// Render targets and textures in blocks of their own (BBHOST_HEAP_CLASSES,
+// on unless 0). An area's targets are made as it loads and live as long as
+// it does, its textures come and go as the game streams them: placed in the
+// same blocks, every block kept some of an area's targets, so none ever
+// emptied for the keeper to give back - after ten places 9 blocks (2.3 GiB)
+// held 1.3-1.9 GiB of images (render/next22 at 1080p). Apart, the textures'
+// blocks empty as the game lets an area's textures go. 0: one class.
+const bool g_heap_classes = [] {
+    const char* e = std::getenv("BBHOST_HEAP_CLASSES");
+    return !(e && e[0] == '0');
+}();
+
 VkDeviceSize heap_free_locked(std::uint32_t type, std::size_t* live) {
     VkDeviceSize free = 0;
     std::size_t n = 0;
@@ -6305,7 +6320,10 @@ VkDeviceSize heap_free_locked(std::uint32_t type, std::size_t* live) {
 void heap_release(const ImageMemory& m) {
     HeapBlock& b = g_heap[static_cast<std::size_t>(m.block)];
     b.used -= m.size;
-    if (b.used == 0) b.empty_since = std::chrono::steady_clock::now();
+    if (b.used == 0) {
+        b.empty_since = std::chrono::steady_clock::now();
+        b.cls = -1;
+    }
     auto next = b.free.lower_bound(m.offset);
     VkDeviceSize off = m.offset, size = m.size;
     if (next != b.free.begin()) {
@@ -6348,15 +6366,17 @@ const bool g_heap_fullest = [] {
     return !(e && e[0] == '0');
 }();
 
-bool heap_place_locked(const VkMemoryRequirements& req, std::uint32_t type, bool grow, ImageMemory& out) {
+bool heap_place_locked(const VkMemoryRequirements& req, std::uint32_t type, bool grow, ImageMemory& out, int cls) {
     const VkDeviceSize align = std::max<VkDeviceSize>(req.alignment, 256);
+    if (!g_heap_classes) cls = kHeapTargets;
     if (req.size <= kHeapLargest) {
         for (int pass = 0; pass < 2; ++pass) {
             thread_local std::vector<std::size_t> order;
             order.clear();
             for (std::size_t k = 0; k < g_heap.size(); ++k) {
                 const HeapBlock& b = g_heap[k];
-                if (b.memory != VK_NULL_HANDLE && b.type == type && kHeapBlock - b.used >= req.size) order.push_back(k);
+                if (b.memory != VK_NULL_HANDLE && b.type == type && kHeapBlock - b.used >= req.size && (b.cls == cls || b.cls < 0))
+                    order.push_back(k);
             }
             if (g_heap_fullest) {
                 std::stable_sort(order.begin(), order.end(), [](std::size_t a, std::size_t c) { return g_heap[a].used > g_heap[c].used; });
@@ -6371,6 +6391,7 @@ bool heap_place_locked(const VkMemoryRequirements& req, std::uint32_t type, bool
                     if (at > lo) b.free[lo] = at - lo;
                     if (at + req.size < hi) b.free[at + req.size] = hi - (at + req.size);
                     b.used += req.size;
+                    b.cls = static_cast<std::int8_t>(cls);
                     out = {b.memory, at, req.size, static_cast<std::int32_t>(k), type};
                     ++g_heap_allocs;
                     return true;
@@ -6416,12 +6437,19 @@ std::uint64_t g_vram_reserve = 0;          // vram_reserve_init
 std::atomic<std::uint64_t> g_reserve_refusals{0};
 }  // namespace
 
-std::uint64_t image_heap_vram_free_locked() {
+std::uint64_t image_heap_vram_free_locked(int cls) {
     std::uint64_t free = 0;
     for (const HeapBlock& b : g_heap) {
-        if (b.memory != VK_NULL_HANDLE && g.mem_props.memoryTypes[b.type].heapIndex == g.local_heap) free += kHeapBlock - b.used;
+        if (b.memory == VK_NULL_HANDLE || g.mem_props.memoryTypes[b.type].heapIndex != g.local_heap) continue;
+        if (cls >= 0 && g_heap_classes && b.cls >= 0 && b.cls != cls) continue;
+        free += kHeapBlock - b.used;
     }
     return free;
+}
+
+int image_memory_class_locked(const ImageMemory& m) {
+    if (m.block < 0 || static_cast<std::size_t>(m.block) >= g_heap.size()) return -2;
+    return g_heap[static_cast<std::size_t>(m.block)].cls;
 }
 
 bool image_memory_in_vram(const ImageMemory& m) {
@@ -6495,8 +6523,9 @@ std::string vram_return_report() {
     return textures_return_report() + render_return_report();
 }
 
-bool image_memory_alloc(const VkMemoryRequirements& req, ImageMemory& out, bool texture) {
+bool image_memory_alloc(const VkMemoryRequirements& req, ImageMemory& out, bool texture, int cls) {
     out = ImageMemory{};
+    if (cls < 0) cls = texture ? kHeapTextures : kHeapTargets;
     const std::uint32_t local = find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     const std::int64_t now = steady_ms();
     bool may_grow = now - g_vram_refused_ms.load(std::memory_order_relaxed) >= 1000;
@@ -6510,10 +6539,10 @@ bool image_memory_alloc(const VkMemoryRequirements& req, ImageMemory& out, bool 
         may_grow = false;
         held_back = true;
     }
-    if (local != UINT32_MAX && heap_place_locked(req, local, may_grow, out)) return true;
+    if (local != UINT32_MAX && heap_place_locked(req, local, may_grow, out, cls)) return true;
     if (held_back) {
         const std::uint32_t host = host_memory_type(req.memoryTypeBits);
-        if (host != UINT32_MAX && heap_place_locked(req, host, true, out)) {
+        if (host != UINT32_MAX && heap_place_locked(req, host, true, out, cls)) {
             if (g_reserve_refusals.fetch_add(1, std::memory_order_relaxed) == 0)
                 host_log("gpu: video memory is down to the reserve (%lld MiB left): textures go to host memory until there is room",
                          static_cast<long long>(vram_headroom() >> 20));
@@ -6542,7 +6571,7 @@ bool image_memory_alloc(const VkMemoryRequirements& req, ImageMemory& out, bool 
             if (!budget.empty()) host_log("  %s", budget.c_str());
         }
     }
-    if (!heap_place_locked(req, host, true, out)) return false;
+    if (!heap_place_locked(req, host, true, out, cls)) return false;
     ++g_heap_host;
     return true;
 }
@@ -6689,11 +6718,17 @@ std::string video_memory_report_locked(bool at_exit) {
     textures_vram_census_locked(c);
     VkDeviceSize used_vram = 0, free_vram = 0;
     std::size_t blocks_vram = 0;
+    VkDeviceSize cls_used[3] = {}, cls_free[3] = {};  // targets, textures, none yet
+    std::size_t cls_blocks[3] = {};
     for (const HeapBlock& b : g_heap) {
         if (b.memory == VK_NULL_HANDLE || g.mem_props.memoryTypes[b.type].heapIndex != g.local_heap) continue;
         used_vram += b.used;
         free_vram += kHeapBlock - b.used;
         ++blocks_vram;
+        const int k = b.cls == kHeapTargets ? 0 : b.cls == kHeapTextures ? 1 : 2;
+        cls_used[k] += b.used;
+        cls_free[k] += kHeapBlock - b.used;
+        ++cls_blocks[k];
     }
     ShadowCensus sc;
     shadow_vram_census_locked(sc);
@@ -6791,6 +6826,16 @@ std::string video_memory_report_locked(bool at_exit) {
                   mib(c.tex_cold.bytes), static_cast<ull>(c.tex_cold.n), mib(c.tex_ahead.bytes), static_cast<ull>(c.tex_ahead.n), mib(free_vram),
                   blocks_vram, mib(used_vram), static_cast<ull>(g_spare_play_blocks.load(std::memory_order_relaxed)), mib(scratch_kept));
     out += buf;
+    if (g_heap_classes) {
+        std::snprintf(buf, sizeof(buf),
+                      "\n[bbhost]   video memory, the image heap's blocks by what they hold (BBHOST_HEAP_CLASSES): targets %zu (%llu in use, %llu free), textures %zu "
+                      "(%llu in use, %llu free), empty %zu; GPU-written surfaces in the textures' blocks %llu (%llu), uploaded textures in the "
+                      "targets' %llu (%llu)",
+                      cls_blocks[0], mib(cls_used[0]), mib(cls_free[0]), cls_blocks[1], mib(cls_used[1]), mib(cls_free[1]), cls_blocks[2],
+                      mib(c.gpu_written_in_tex.bytes), static_cast<ull>(c.gpu_written_in_tex.n), mib(c.tex_in_targets.bytes),
+                      static_cast<ull>(c.tex_in_targets.n));
+        out += buf;
+    }
     if (c.rt_host.n || c.tex_host.n) {
         std::snprintf(buf, sizeof(buf), "; in host memory for want of video memory: targets and snapshots %llu (%llu), textures %llu (%llu)",
                       mib(c.rt_host.bytes), static_cast<ull>(c.rt_host.n), mib(c.tex_host.bytes), static_cast<ull>(c.tex_host.n));

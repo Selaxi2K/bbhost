@@ -2792,7 +2792,18 @@ VkImageView texture_view_uncached(const std::uint32_t* w, bool storage, bool& di
         }
         VkMemoryRequirements req{};
         vkGetImageMemoryRequirements(g.device, sf.image, &req);
-        if (!image_memory_alloc(req, sf.memory, true)) {
+        // A texture the GPU writes - its resource bound as a render target,
+        // depth or unordered-access view (D3D11's bind flags 0x20, 0x40,
+        // 0x80), or the GPU-written one it replaces - lives as long as an
+        // area's targets do: in their blocks (image_memory_alloc's cls).
+        int cls = kHeapTextures;
+        {
+            GxResourceInfo r;
+            if ((have_replaced && replaced.gpu_written) ||
+                (gx_resource_at(base, std::max<std::size_t>(sf.total_src, 1), &r) && (r.bind & 0xe0) != 0))
+                cls = kHeapTargets;
+        }
+        if (!image_memory_alloc(req, sf.memory, true, cls)) {
             vkDestroyImage(g.device, sf.image, nullptr);
             sf.image = VK_NULL_HANDLE;
             sf.failed = true;
@@ -3954,7 +3965,7 @@ void evict_cold_surfaces_locked() {
     last_ms = now;
     constexpr std::uint64_t kWant = 256ull << 20;
     if (!vram_within_reserve(kWant)) return;
-    const std::uint64_t free_in_blocks = image_heap_vram_free_locked();
+    const std::uint64_t free_in_blocks = image_heap_vram_free_locked(kHeapTextures);
     if (free_in_blocks >= kWant) return;
     const std::uint64_t target = kWant - free_in_blocks;
     struct Cold {
@@ -4053,9 +4064,14 @@ void textures_vram_census_locked(VramCensus& c) {
             c.tex_host.add(bytes);
             continue;
         }
+        const int cls = image_memory_class_locked(sf.memory);
         if (sf.gpu_written || sf.copied_mips) {
             (sf.written_ms && now - sf.written_ms >= 10000 ? c.gpu_written_idle : c.gpu_written).add(bytes);
-        } else if (sf.ahead && !sf.ahead_used) {
+            if (cls == kHeapTextures) c.gpu_written_in_tex.add(bytes);
+            continue;
+        }
+        if (cls == kHeapTargets) c.tex_in_targets.add(bytes);
+        if (sf.ahead && !sf.ahead_used) {
             c.tex_ahead.add(bytes);
         } else if (sf.used_ms && now - sf.used_ms >= kColdMs) {
             c.tex_cold.add(bytes);

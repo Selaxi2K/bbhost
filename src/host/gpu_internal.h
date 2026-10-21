@@ -701,7 +701,14 @@ void defer_destroy_image(VkImage image, VkDeviceMemory memory);
 // texture: a sampled image or a copy made for one, which the video memory
 // reserve keeps out of the last of video memory (vram_reserve_bytes);
 // otherwise a render target or snapshot, which may take the reserve.
-bool image_memory_alloc(const VkMemoryRequirements& req, ImageMemory& out, bool texture = false);
+// cls: the blocks it goes in (HeapClass; -1: kHeapTextures for a texture,
+// kHeapTargets otherwise) - render targets, snapshots and what the GPU
+// writes live as long as an area does, textures come and go as the game
+// streams them, and apart the textures' blocks empty (BBHOST_HEAP_CLASSES).
+enum HeapClass : int { kHeapTargets = 0, kHeapTextures = 1 };
+bool image_memory_alloc(const VkMemoryRequirements& req, ImageMemory& out, bool texture = false, int cls = -1);
+// The class of the block `m` was placed in (-1: none, -2: memory of its own).
+int image_memory_class_locked(const ImageMemory& m);
 // The video memory this process may still take, in bytes (negative: over
 // budget): BBHOST_TEST_VRAM_MB's limit less what our allocations hold against
 // it, else the driver's budget for the heap less its usage
@@ -735,7 +742,9 @@ void textures_return_from_host_locked();
 // BBHOST_VRAM_EVICT_S).
 void evict_cold_surfaces_locked();
 // Free room in the image heap's blocks of video memory (gpu.cpp).
-std::uint64_t image_heap_vram_free_locked();
+// cls (HeapClass): only the room that class may take - its blocks' and the
+// empty ones'; -1 every block's.
+std::uint64_t image_heap_vram_free_locked(int cls = -1);
 std::string vram_return_report();  // the 5-second report's counts
 // What the image heap's images hold by kind, for the video memory report
 // (video_memory_report, gpu.cpp). Under g.mu. Bytes in video memory, and
@@ -757,6 +766,10 @@ struct VramCensus {
     // up for 20 s (what the cold eviction takes when video memory is down to
     // the reserve), the rest; copies of targets' regions and level aliases.
     VramKind gpu_written, gpu_written_idle, tex_ahead, tex_cold, tex_bound, regions, tex_host;
+    // The image heap's classes (BBHOST_HEAP_CLASSES): surfaces that turned
+    // out GPU-written but sit in the textures' blocks, and uploaded ones in
+    // the targets' - the guess at creation missed both.
+    VramKind gpu_written_in_tex, tex_in_targets;
     // depth_copy.cpp and other images with memory of their own in video
     // memory: counted by gpu_memtrack's owners instead.
 };
