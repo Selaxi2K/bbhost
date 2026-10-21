@@ -1153,7 +1153,7 @@ bool live_resolution_install(ElfImage* image) {
         max_h = std::min<std::uint32_t>(static_cast<std::uint32_t>(desk_h), kMaxH);
         max_why = "the largest display";
     } else if (live && host_gpu_small_vram()) {
-        // No display size to go by (only Windows reads it) and little video
+        // No display size to go by (a headless run) and little video
         // memory: the starting size, or 1080p if smaller, instead of
         // 5120x2160 - four display buffers of 42 MiB, a depth target and
         // their clears for sizes the run may never reach. Larger sizes apply
