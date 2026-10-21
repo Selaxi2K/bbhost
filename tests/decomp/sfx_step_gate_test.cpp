@@ -87,6 +87,7 @@ int g_sfx_gate_mutant = 0;
 #include <string>
 #include <vector>
 
+#include <sys/mman.h>
 #include <xmmintrin.h>
 
 namespace {
@@ -1137,24 +1138,75 @@ int check_wobbles(int cases, u64 sfx) {
 
 // --- the wobble motions under the smooth steps -------------------------------------------
 
-// The wobble motions 0x570e6d0 (sub_2e89d10, ours sfx_wobble_a) and 0x570e690 (sub_2e896f0, ours sfx_wobble_follow) in a
-// staged node's real update (sfx_node::update, its container call published), frame sequences at 60, 120, 144 and
-// jittered rates, the parent moving on every frame, against the game's function once a whole step (at 30): after
-// every whole step the count +0x6c and the FX RNG bit-equal to the game's at 30 (the re-rolls on the same steps with the
-// same draws); between whole steps neither moves; on every frame the base motion called once with the frame's step;
-// and between whole steps 0x570e690's call every byte the game's own with its count held (the follow's share of the
-// parent's move since the last frame, its parent's rows kept up to the frame).
+// 0x570e890's update (sub_2e8de10) as the patched image runs it: its follow, then a call of sub_2e8e430 with its own four
+// arguments (at 0x2e8e19f), which the image sends to ours, sfx_wobble_b. The test runs the game's function with that call
+// caught - a stub over sub_2e8e430's entry for the call, its bytes put back after - and then ours with the arguments caught.
+constexpr u64 kFollowB = 0x2e8de10;
+struct Caught {
+    u64 motion = 0, node = 0, local = 0;
+    const float* step = nullptr;
+    int n = 0;
+} g_caught;
+GUEST_ABI void catch_wobble_b(u64 motion, u64 node, const float* step, u64 local) {
+    g_caught.motion = motion, g_caught.node = node, g_caught.step = step, g_caught.local = local;
+    ++g_caught.n;
+}
+u8 g_wobble_b_entry[14];
+void put_code(u64 bn, const u8* bytes, std::size_t n) {
+    const u64 page = bn & ~0xfffull, end = (bn + n + 0xfff) & ~0xfffull;
+    mprotect(reinterpret_cast<void*>(page), end - page, PROT_READ | PROT_WRITE | PROT_EXEC);
+    std::memcpy(eboot_kit::at(bn), bytes, n);
+    mprotect(reinterpret_cast<void*>(page), end - page, PROT_READ | PROT_EXEC);
+}
+GUEST_ABI void follow_b_patched(u64 motion, u64 node, const float* step, u64 local) {
+    g_caught = {};
+    eboot_kit::stub(kWobbleB, reinterpret_cast<const void*>(&catch_wobble_b));
+    eboot_kit::fn<MotionUpdate>(kFollowB)(motion, node, step, local);
+    put_code(kWobbleB, g_wobble_b_entry, sizeof g_wobble_b_entry);
+    if (g_caught.n == 1 && g_caught.motion == motion && g_caught.node == node && g_caught.step == step && g_caught.local == local)
+        sfx_wobble_b(motion, node, step, local);
+    else
+        rec(99, motion, node, local, static_cast<u64>(g_caught.n), 0.0f);  // not the call the disassembly shows
+}
+
+// The wobble motions in a staged node's real update (sfx_node::update, its container call published), frame sequences at
+// 60, 120, 144 and jittered rates, the parent moving on every frame, against the game's function once a whole step (at 30):
+//   - 0x570e6d0 (sub_2e89d10, ours sfx_wobble_a): count +0x6c, period +0x68, the re-roll's curve +0x60, base 0x2e866f0;
+//   - 0x570e690 (sub_2e896f0, ours sfx_wobble_follow): a share (curve +0xa8, or +0xb0) of the parent's move since its last
+//     call (the parent's rows kept at +0x70, the parent seen at +0xa0), then 0x570e6d0's work;
+//   - 0x570e8d0 (sub_2e8e430, ours sfx_wobble_b): count +0x7c, period +0x78, the re-roll's curve +0x70, base 0x2e8bfd0;
+//   - 0x570e890 (sub_2e8de10, the game's, its call of sub_2e8e430 ours): a share (curve +0xb8) of the parent's move since its
+//     last call (rows kept at +0x80, the parent seen at +0xb0), its direction +0x10 turned with it, then 0x570e8d0's work.
+// After every whole step the count and the FX RNG bit-equal to the game's at 30 (the re-rolls on the same steps with the
+// same draws); between whole steps neither moves; on every frame the base motion called once with the frame's step; and
+// between whole steps a follow's call every byte the game's own with its count held (the follow's share of the parent's
+// move since the last frame, its parent's rows kept up to the frame).
+struct WobbleKind {
+    const char* name;
+    u64 game;                       // the game's update
+    MotionUpdate ours;              // what the patched image runs for it
+    u64 count, period, curve;       // the call count, its period, the re-roll's curve
+    int base;                       // the base motion's call record
+    u64 rows, seen, share, fixed;   // a follow: the parent's rows kept, the parent seen, the share's curve, a fixed share (0: none)
+};
+const WobbleKind kWobbleKinds[] = {
+    {"wobble 0x570e6d0", kWobbleA, &sfx_wobble_a, 0x6c, 0x68, 0x60, 10, 0, 0, 0, 0},
+    {"follow 0x570e690", kWobbleFollow, &sfx_wobble_follow, 0x6c, 0x68, 0x60, 10, 0x70, 0xa0, 0xa8, 0xb0},
+    {"wobble 0x570e8d0", kWobbleB, &sfx_wobble_b, 0x7c, 0x78, 0x70, 11, 0, 0, 0, 0},
+    {"follow 0x570e890", kFollowB, &follow_b_patched, 0x7c, 0x78, 0x70, 11, 0x80, 0xb0, 0xb8, 0},
+};
 struct SeenSW {
     long cases = 0, frames = 0, ticks = 0, rerolls = 0, follows = 0;
+    long kinds[4] = {0, 0, 0, 0};
 } g_seen_sw;
 int check_smooth_wobbles(int cases, u64 sfx) {
     store<u32>(sfx + 0x8c, 0);
     int bad = 0;
     for (int c = 0; c < cases; ++c) {
         g_blocks.clear();
-        const bool follow = g_rng.chance(0.6);
-        const u64 addr = follow ? kWobbleFollow : kWobbleA;
-        const auto game = eboot_kit::fn<MotionUpdate>(addr);
+        const WobbleKind& K = kWobbleKinds[g_rng.range(0, 3)];
+        const bool follow = K.rows != 0;
+        const auto game = eboot_kit::fn<MotionUpdate>(K.game);
         const u64 inst = block(0x98);
         store<u64>(inst + 0x78, block(8));  // not this node: no root-node stop
         const u64 def = definition(4);
@@ -1167,9 +1219,9 @@ int check_smooth_wobbles(int cases, u64 sfx) {
         for (int k = 0; k < 0x40; k += 4) store<float>(local + k, value(-2, 2));
         for (int k = 0x20; k < 0x50; k += 4) store<float>(n + k, value(-50, 50));
         const u32 per = static_cast<u32>(g_rng.range(1, 6));
-        store<u32>(motion + 0x68, per);
-        store<u32>(motion + 0x6c, static_cast<u32>(g_rng.range(0, static_cast<int>(per) - 1)));
-        store<u64>(motion + 0x60, g_rng.chance(0.85) ? curve() : 0);
+        store<u32>(motion + K.period, per);
+        store<u32>(motion + K.count, static_cast<u32>(g_rng.range(0, static_cast<int>(per) - 1)));
+        store<u64>(motion + K.curve, g_rng.chance(0.85) ? curve() : 0);
         // the parent: its rows a rotation and a place moving along a path
         double p0[3], v[3], w0 = value(-1, 1), wr = value(-3, 3);
         for (int i = 0; i < 3; ++i) p0[i] = value(-20, 20), v[i] = value(-8, 8);
@@ -1181,11 +1233,11 @@ int check_smooth_wobbles(int cases, u64 sfx) {
         };
         if (follow) {
             store<u64>(n + 0x60, parent);
-            store<u64>(motion + 0xa0, parent);
+            store<u64>(motion + K.seen, parent);
             put_parent(0.0);
-            for (int k = 0; k < 0x30; k += 4) store<u32>(motion + 0x70 + k, load<u32>(parent + 0x20 + k));
-            store<u64>(motion + 0xa8, g_rng.chance(0.5) ? curve() : 0);
-            store<float>(motion + 0xb0, value(0, 1));
+            for (int k = 0; k < 0x30; k += 4) store<u32>(motion + K.rows + k, load<u32>(parent + 0x20 + k));
+            store<u64>(motion + K.share, !K.fixed || g_rng.chance(0.5) ? curve() : 0);
+            if (K.fixed) store<float>(motion + K.fixed, value(0, 1));
         }
         for (int k = 0; k < 0x20; k += 4) store<u32>(reinterpret_cast<u64>(g_rng_state) + k, g_rng.u32() | 1);
         // the game at 30: a copy of the motion, the node and the RNG
@@ -1194,7 +1246,7 @@ int check_smooth_wobbles(int cases, u64 sfx) {
         std::memcpy(reinterpret_cast<void*>(n30), reinterpret_cast<void*>(n), 0x100);
         if (follow) {
             store<u64>(n30 + 0x60, parent30);
-            store<u64>(motion30 + 0xa0, parent30);
+            store<u64>(motion30 + K.seen, parent30);
         }
         u8 rng30[0x20], rng[0x20];
         std::memcpy(rng30, g_rng_state, sizeof rng30);
@@ -1205,6 +1257,7 @@ int check_smooth_wobbles(int cases, u64 sfx) {
         const char* why = nullptr;
         int at = -1;
         ++g_seen_sw.cases;
+        ++g_seen_sw.kinds[&K - kWobbleKinds];
         for (int f = 0; f < frames && !why; ++f) {
             const double dt = rate_kind == 0 ? 1.0 / 60 : rate_kind == 1 ? 1.0 / 120 : rate_kind == 2 ? 1.0 / 144 : g_rng.value(1.0f / 150, 1.0f / 40);
             const sfx_schedule::Frame fr = sfx_schedule::next(carry, dt, 30);
@@ -1218,7 +1271,7 @@ int check_smooth_wobbles(int cases, u64 sfx) {
             st.into = fr.into;
             decomp_sfx_gate_frame(!st.tick);
             if (follow) put_parent(tau);
-            const u32 count_before = load<u32>(motion + 0x6c);
+            const u32 count_before = load<u32>(motion + K.count);
             u8 rng_before[0x20];
             std::memcpy(rng_before, rng, sizeof rng_before);
             // between whole steps, the follow's call as the game's own with its count held, on copies
@@ -1227,7 +1280,7 @@ int check_smooth_wobbles(int cases, u64 sfx) {
                 const u64 m2 = block(0x100), n2 = block(0x100);
                 std::memcpy(reinterpret_cast<void*>(m2), reinterpret_cast<void*>(motion), 0x100);
                 std::memcpy(reinterpret_cast<void*>(n2), reinterpret_cast<void*>(n), 0x100);
-                store<u32>(m2 + 0x68, 0xffffffffu);
+                store<u32>(m2 + K.period, 0xffffffffu);
                 // the container call's node time: the frame's start past its whole step (the curves read at it)
                 if (st.from != 0.0f) store<float>(n2 + 0x7c, add_ss(load<float>(n + 0x7c), st.from));
                 float s2 = st.frame;
@@ -1237,8 +1290,8 @@ int check_smooth_wobbles(int cases, u64 sfx) {
                 g_calls.clear();
                 game(m2, n2, &s2, local);
                 std::memcpy(g_rng_state, keep, sizeof keep);
-                store<u32>(m2 + 0x68, per);
-                store<u32>(m2 + 0x6c, count_before);
+                store<u32>(m2 + K.period, per);
+                store<u32>(m2 + K.count, count_before);
                 want_motion.assign(reinterpret_cast<u8*>(m2), reinterpret_cast<u8*>(m2) + 0x100);
                 want_node.assign(reinterpret_cast<u8*>(n2), reinterpret_cast<u8*>(n2) + 0x100);
             }
@@ -1246,7 +1299,7 @@ int check_smooth_wobbles(int cases, u64 sfx) {
             g_wobble_node = n;
             g_wobble_motion = motion;
             g_wobble_local = local;
-            g_wobble_fn = follow ? &sfx_wobble_follow : &sfx_wobble_a;
+            g_wobble_fn = K.ours;
             std::memcpy(g_rng_state, rng, sizeof rng);
             g_calls.clear();
             const u32 time_before = load<u32>(n + 0x7c);
@@ -1256,14 +1309,16 @@ int check_smooth_wobbles(int cases, u64 sfx) {
             ++g_seen_sw.frames;
             // the base motion: once, with the frame's step
             long bases = 0;
-            for (const Call& k : g_calls)
-                if (k.what == 10) {
+            for (const Call& k : g_calls) {
+                if (k.what == K.base) {
                     ++bases;
                     if (k.step != bits(st.frame)) why = "the base motion's step (the frame's)";
                 }
+                if (k.what == 99) why = "sub_2e8de10's call of sub_2e8e430 (not once, with its own arguments)";
+            }
             if (!why && bases != 1) why = "the base motion called once a frame";
             if (!why && !st.tick) {
-                if (load<u32>(motion + 0x6c) != count_before) why = "between whole steps: the count";
+                if (load<u32>(motion + K.count) != count_before) why = "between whole steps: the count";
                 else if (std::memcmp(rng, rng_before, sizeof rng) != 0) why = "between whole steps: a draw of the FX RNG";
                 else if (follow) {
                     ++g_seen_sw.follows;
@@ -1272,32 +1327,29 @@ int check_smooth_wobbles(int cases, u64 sfx) {
                     std::memcpy(got.data() + 0x7c, want_node.data() + 0x7c, 4);
                     if (std::memcmp(reinterpret_cast<void*>(motion), want_motion.data(), 0x100) != 0) why = "between whole steps: the follow's motion";
                     else if (got != want_node) why = "between whole steps: the follow's node";
-                    else if (std::memcmp(reinterpret_cast<void*>(motion + 0x70), reinterpret_cast<void*>(parent + 0x20), 0x30) != 0)
+                    else if (std::memcmp(reinterpret_cast<void*>(motion + K.rows), reinterpret_cast<void*>(parent + 0x20), 0x30) != 0)
                         why = "between whole steps: the parent's rows kept up to the frame";
                 }
             }
             if (!why && st.tick) {
                 // the game at 30, once this whole step: its parent at the step's time
                 ++g_seen_sw.ticks;
-                if (follow) {
-                    std::memcpy(reinterpret_cast<void*>(parent30 + 0x20), reinterpret_cast<void*>(parent + 0x20), 0x30);
-                }
+                if (follow) std::memcpy(reinterpret_cast<void*>(parent30 + 0x20), reinterpret_cast<void*>(parent + 0x20), 0x30);
                 store<u32>(n30 + 0x7c, time_before);
                 float h = fr.seconds;
                 std::memcpy(g_rng_state, rng30, sizeof rng30);
-                const u32 c30 = load<u32>(motion30 + 0x6c);
+                const u32 c30 = load<u32>(motion30 + K.count);
                 game(motion30, n30, &h, local);
                 std::memcpy(rng30, g_rng_state, sizeof rng30);
-                g_seen_sw.rerolls += load<u32>(motion30 + 0x6c) != c30 + 1;
-                if (load<u32>(motion + 0x6c) != load<u32>(motion30 + 0x6c)) why = "after a whole step: the count";
+                g_seen_sw.rerolls += load<u32>(motion30 + K.count) != c30 + 1;
+                if (load<u32>(motion + K.count) != load<u32>(motion30 + K.count)) why = "after a whole step: the count";
                 else if (std::memcmp(rng, rng30, sizeof rng) != 0) why = "after a whole step: the FX RNG";
             }
             if (why) at = f;
         }
         decomp_sfx_gate_frame(false);
         if (why && ++bad <= 6 && !g_quiet)
-            std::printf("smooth wobble case %d (%s, period %u, rate kind %d): %s differs at frame %d\n", c, follow ? "the follow" : "wobble A", per,
-                        rate_kind, why, at);
+            std::printf("smooth wobble case %d (%s, period %u, rate kind %d): %s differs at frame %d\n", c, K.name, per, rate_kind, why, at);
     }
     return bad;
 }
@@ -2035,6 +2087,7 @@ int main() {
     g_game_instance = eboot_kit::at(0x2c4ff30);
     g_game_wobble_a = eboot_kit::at(kWobbleA);
     g_game_wobble_b = eboot_kit::at(kWobbleB);
+    std::memcpy(g_wobble_b_entry, eboot_kit::at(kWobbleB), sizeof g_wobble_b_entry);  // follow_b_patched puts it back
     g_game_wobble_follow = eboot_kit::at(kWobbleFollow);
     g_game_gx_record = eboot_kit::at(kGxRecordUpdate);
 
@@ -2096,11 +2149,11 @@ int main() {
     total += 2 * kCases;
     std::printf("decomp_sfx_step_gate: %d cases (nodes, lights, instances; ordinary values, then special ones), %d differ\n", total, bad);
     if (bad) return 1;
-    // The build's converted list: never the composite motion (it is its parts), nor the wobble whose base is not
-    // converted (0x570e8d0) or the grid simulation. (The FFX light and the wobbles 0x570e6d0 / 0x570e690 are on it:
-    // their leaves count once a whole step themselves, checked here.)
+    // The build's converted list: never the composite motion (it is its parts), nor the grid simulation. (The FFX light
+    // and the wobbles 0x570e6d0 / 0x570e690 / 0x570e8d0 / 0x570e890 are on it: their leaves count once a whole step
+    // themselves, checked here.)
     for (const u64 vt : kConverted)
-        for (const u64 off : {0x570e750ull, 0x570e8d0ull, 0x56eb030ull})
+        for (const u64 off : {0x570e750ull, 0x56eb030ull})
             if (vt == off) {
                 std::printf("decomp_sfx_step_gate: 0x%llx is on the converted list\n", static_cast<unsigned long long>(vt));
                 return 1;
@@ -2157,7 +2210,7 @@ int main() {
     std::printf("decomp_sfx_step_gate: %d wobble motion cases (ordinary values, then special ones), %d differ\n", 2 * kCases, wbad);
     if (wbad) return 1;
     g_quiet = true;
-    for (const int m : {1, 9, 10, 11, 12}) {
+    for (const int m : {1, 9, 10, 11, 12, 44, 45}) {
         g_sfx_gate_mutant = m;
         g_rng.specials = false;
         if (!check_wobbles(2000, sfx)) {
@@ -2170,12 +2223,13 @@ int main() {
     g_quiet = false;
     g_rng.specials = false;
     const int swbad = check_smooth_wobbles(kCases / 2, sfx);
-    std::printf("decomp_sfx_step_gate: %d smooth wobble motion cases (%ld frames, %ld whole steps, %ld re-rolls at 30, %ld follows between whole "
-                "steps), %d differ\n",
-                kCases / 2, g_seen_sw.frames, g_seen_sw.ticks, g_seen_sw.rerolls, g_seen_sw.follows, swbad);
+    std::printf("decomp_sfx_step_gate: %d smooth wobble motion cases (0x570e6d0 %ld, 0x570e690 %ld, 0x570e8d0 %ld, 0x570e890 %ld; %ld frames, %ld "
+                "whole steps, %ld re-rolls at 30, %ld follows between whole steps), %d differ\n",
+                kCases / 2, g_seen_sw.kinds[0], g_seen_sw.kinds[1], g_seen_sw.kinds[2], g_seen_sw.kinds[3], g_seen_sw.frames, g_seen_sw.ticks,
+                g_seen_sw.rerolls, g_seen_sw.follows, swbad);
     if (swbad) return 1;
     g_quiet = true;
-    for (const int m : {42, 43}) {
+    for (const int m : {42, 43, 44, 45}) {
         g_sfx_gate_mutant = m;
         if (!check_smooth_wobbles(2000, sfx)) {
             std::printf("decomp_sfx_step_gate: mutant %d not caught by the smooth wobble motions\n", m);
@@ -2288,6 +2342,6 @@ int main() {
         }
     }
     g_sfx_gate_mutant = 0;
-    std::printf("decomp_sfx_step_gate: %d of 41 mutants caught\n", 41 - missed);
+    std::printf("decomp_sfx_step_gate: %d of 43 mutants caught\n", 43 - missed);
     return missed ? 1 : 0;
 }

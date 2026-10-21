@@ -229,12 +229,12 @@ constexpr u64 kManagerOf = 0x70;  // SprjSfx +0x70: the effect manager (its time
 // whole step against the frame domain's frames) - and the FFX light, whose one
 // counted part sfx_light_update runs once a whole step
 // (tests/decomp/sfx_step_gate_test.cpp). Off the list, and so on the held
-// frames as with 30: the wobble motion 0x570e8d0 (it counts its updates over a
-// base motion, 0x570e7d0's, not read yet), the module 0x5760f20 and the GPU
-// particle type 0x2712 (0x56eb030: whole grid passes of elapsed x 30). The
-// wobbles 0x570e6d0 and 0x570e690 are on it: their counts and re-rolls held
-// between whole steps by sfx_wobble_a and sfx_wobble_follow, their base motion
-// (0x570e5d0's) and the follow by the frame's own time. The ribbon, FFX-format
+// frames as with 30: the module 0x5760f20 and the GPU particle type 0x2712
+// (0x56eb030: whole grid passes of elapsed x 30). The wobbles are on it: their
+// counts and re-rolls held between whole steps by sfx_wobble_a, sfx_wobble_b and
+// sfx_wobble_follow, their base motions (0x570e5d0's, 0x570e7d0's) and the
+// follows by the frame's own time - 0x570e890's follow is the game's own, its
+// call of sub_2e8e430 at its end reaching sfx_wobble_b. The ribbon, FFX-format
 // GX type 0x28, and the GPU particle type 0x2713 (its parameters curves read at
 // the elapsed time) are on it for sfx_gx_record_update, which inserts the
 // ribbon's points once a whole step at the whole step's time and gives 0x2713's
@@ -245,6 +245,11 @@ constexpr u64 kConverted[] = {
     0x570e5d0,  // motion: the same with the effects' wind world's force by step, and its drift added to the move
     0x570e6d0,  // motion: 0x570e5d0's, then a count and a re-roll every +0x68 calls - held between whole steps (sfx_wobble_a)
     0x570e690,  // motion: a share of the parent's move, then 0x570e6d0's - its count held between whole steps (sfx_wobble_follow)
+    0x570e850,  // motion: the velocity plus the speed curve x a direction, the position by step x that, facing the move
+    0x570e810,  // motion: the same with gravity (a curve at the node's time) by step, in the parent's frame
+    0x570e7d0,  // motion: the same with the wind world's force by step and its drift added to the move
+    0x570e8d0,  // motion: 0x570e7d0's, then a count and a re-roll of the direction every +0x78 calls - held between whole steps (sfx_wobble_b)
+    0x570e890,  // motion: a share of the parent's move (the direction turned with it), then 0x570e8d0's (its call of sub_2e8e430 ours)
     0x570e790,  // motion: turned by step x its rates (or three curves)
     0x570e710,  // motion: a transform; never reads its step
     0x570e910,  // motion: its position a curve's value at the node's time; never reads its step
@@ -576,12 +581,13 @@ DECOMP_LEAF void sfx_wobble_a(u64 motion, u64 node, const float* step, u64 local
 }
 
 DECOMP_LEAF void sfx_wobble_b(u64 motion, u64 node, const float* step, u64 local) {
-    if (!held()) {
+    if (!held() || MUTANT(44)) {
         reinterpret_cast<MotionFn>(g_game_wobble_b)(motion, node, step, local);
         return;
     }
     g_motions_held.fetch_add(1, std::memory_order_relaxed);
     game_function<MotionFn>(kWobbleBBase)(motion, node, step, local);
+    if (MUTANT(45)) store<u32>(motion + 0x7c, load<u32>(motion + 0x7c) + 1);  // counted anyway
 }
 
 // With the smooth steps, a smooth instance's container call (sfx_node::smooth_call
