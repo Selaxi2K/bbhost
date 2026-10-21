@@ -38,9 +38,7 @@
 #include <atomic>
 #include <bit>
 #include <cstdint>
-#include <cmath>
 #include <cstring>
-#include <limits>
 
 #include "log.h"
 
@@ -150,6 +148,14 @@ inline float add_ss(float x, float y) {
 inline float sub_ss(float x, float y) {
     __asm__("subss %1, %0" : "+x"(x) : "x"(y));
     return x;
+}
+// The next float up (or down) from a finite x, by its bits (no libm: nextafter may set errno, the host's TLS).
+inline float ulp_toward(float x, bool up) {
+    u32 b = std::bit_cast<u32>(x);
+    if ((b & 0x7fffffffu) == 0) return std::bit_cast<float>(up ? 1u : 0x80000001u);
+    const bool positive = !(b & 0x80000000u);
+    b = positive == up ? b + 1 : b - 1;
+    return std::bit_cast<float>(b);
 }
 
 // A frame bbhost put between whole steps that is not the game's own still frame.
@@ -745,8 +751,7 @@ DECOMP_LEAF void sfx_gx_record_update(u64 record, u64 item) {
             if (MUTANT(40)) return;
             const float elapsed = sub_ss(load<float>(record + 0x28), before), cur = add_ss(before, step);
             float prev = sub_ss(cur, elapsed);
-            for (int k = 0; k < 8 && sub_ss(cur, prev) != elapsed; ++k)
-                prev = std::nextafter(prev, sub_ss(cur, prev) > elapsed ? std::numeric_limits<float>::infinity() : -std::numeric_limits<float>::infinity());
+            for (int k = 0; k < 8 && sub_ss(cur, prev) != elapsed; ++k) prev = ulp_toward(prev, sub_ss(cur, prev) > elapsed);
             store<float>(record + 0x24, MUTANT(41) ? before : prev);
             store<float>(record + 0x28, cur);
             return;
