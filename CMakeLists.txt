@@ -639,6 +639,10 @@ if(UNIX)
   add_executable(masked_blend_test tests/masked_blend_test.cpp)
   target_include_directories(masked_blend_test PRIVATE src)
   add_test(NAME masked_blend_test COMMAND masked_blend_test)
+  # Which draws start a command buffer of their own on lavapipe (tests/lvp_split_test.cpp).
+  add_executable(lvp_split_test tests/lvp_split_test.cpp)
+  target_include_directories(lvp_split_test PRIVATE src)
+  add_test(NAME lvp_split_test COMMAND lvp_split_test)
   # PA_CL_CLIP_CNTL as depth clamp and rasterizer discard (tests/clip_control_test.cpp).
   add_executable(clip_control_test tests/clip_control_test.cpp)
   target_include_directories(clip_control_test PRIVATE src)

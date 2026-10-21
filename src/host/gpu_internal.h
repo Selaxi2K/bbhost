@@ -433,6 +433,7 @@ struct Gpu {
     // PIPELINE_COMPILE_REQUIRED_BIT), which answers without compiling.
     bool cache_control = false;
     std::uint32_t vendor_id = 0;  // VkPhysicalDeviceProperties::vendorID (0x10de NVIDIA, 0x1002 AMD)
+    VkDriverId driver_id = {};    // VkPhysicalDeviceDriverProperties::driverID (VK_DRIVER_ID_MESA_LLVMPIPE: lavapipe)
     bool integrated = false;      // VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: its device-local memory is system RAM
     bool tight = false;           // little memory in all its heaps (gpu.cpp, memory_tight)
     // A discrete GPU with under 7.5 GiB of video memory free at the start

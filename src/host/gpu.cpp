@@ -3385,6 +3385,7 @@ bool init_locked() {
         VkPhysicalDeviceProperties2 dp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
         dp.pNext = &drv;
         vkGetPhysicalDeviceProperties2(g.phys, &dp);
+        g.driver_id = drv.driverID;
         gcn::set_legacy_mul_select(drv.driverID == VK_DRIVER_ID_AMD_PROPRIETARY || drv.driverID == VK_DRIVER_ID_AMD_OPEN_SOURCE);
         host_log("gpu: legacy multiplies' zero rule as %s", gcn::legacy_mul_plain() ? "nothing (BBHOST_LEGACY_MUL=plain)"
                                                              : gcn::legacy_mul_min_form() ? "min(|a|, |b|) == 0" : "a == 0 || b == 0");
