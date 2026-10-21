@@ -6325,6 +6325,23 @@ VkDeviceSize heap_free_locked(std::uint32_t type, std::size_t* live) {
     return free;
 }
 
+// The room the memory keeper counts as its spare in memory type `type`: with
+// the image heap's classes, the empty blocks and the least free room either
+// class has in its own blocks - room only the targets' blocks have is no
+// spare for the next texture, which would make a block on the command
+// processor (5-10 ms on NVIDIA, ~190 ms on a Radeon 680M). Without them every
+// block's free room, as before.
+VkDeviceSize heap_spare_room_locked(std::uint32_t type) {
+    if (!g_heap_classes) return heap_free_locked(type, nullptr);
+    VkDeviceSize empty = 0, holes[2] = {};
+    for (const HeapBlock& b : g_heap) {
+        if (b.memory == VK_NULL_HANDLE || b.type != type) continue;
+        if (b.cls < 0) empty += kHeapBlock - b.used;
+        else holes[b.cls == kHeapTextures ? 1 : 0] += kHeapBlock - b.used;
+    }
+    return empty + std::min(holes[0], holes[1]);
+}
+
 void heap_release(const ImageMemory& m) {
     HeapBlock& b = g_heap[static_cast<std::size_t>(m.block)];
     b.used -= m.size;
@@ -6972,7 +6989,7 @@ void start_memory_reserve() {
             for (;;) {
                 {
                     std::lock_guard<GpuMutex> lk(g.mu);
-                    if (type == UINT32_MAX || heap_free_locked(type, nullptr) >= spare_blocks * kHeapBlock) break;
+                    if (type == UINT32_MAX || heap_spare_room_locked(type) >= spare_blocks * kHeapBlock) break;
                 }
                 if (steady_ms() - g_vram_refused_ms.load(std::memory_order_relaxed) < 10000) break;  // video memory is full
                 // No spare out of the reserve, during a load either: the
@@ -7093,7 +7110,7 @@ void start_memory_reserve() {
             {
                 std::lock_guard<GpuMutex> lk(g.mu);
                 if (type != UINT32_MAX && may_give) {
-                    const VkDeviceSize free = heap_free_locked(type, nullptr);
+                    const VkDeviceSize free = heap_spare_room_locked(type);
                     for (HeapBlock& b : g_heap) {
                         if (b.memory == VK_NULL_HANDLE || b.used != 0) continue;
                         if (!short_now && now - b.empty_since < std::chrono::seconds(10)) continue;
