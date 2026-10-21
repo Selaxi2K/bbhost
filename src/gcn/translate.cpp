@@ -756,6 +756,48 @@ struct Translator {
                                               cu(spv::MsNone), c_one_u});
         });
     }
+    // gcn::set_oob_count: an image access at integer coordinates (`coords`,
+    // signed, the layer last where `arrayed`) against the view the host binds
+    // for `img` - a load (OpImageFetch at `level`, 0 for none) or a store
+    // (OpImageWrite, level 0 of the view; `level` the image_store_mip's).
+    // The size counts where the level is one the view has (the size is read at
+    // level 0 elsewhere, and the level counts instead). The control halves
+    // every limit.
+    void oob_image(const ImageVar& img, bool arrayed, const std::vector<Id>& coords, Id level, bool store) {
+        if (!oob_base64 || coords.empty()) return;
+        m.capability(spv::CapImageQuery);
+        const Id image = load_image(img);
+        const std::size_t n = coords.size();
+        const Id size_type = n == 1 ? t_i32 : n == 2 ? t_v2i : n == 3 ? t_v3i : t_v4i;
+        const auto limit = [&](Id v) { return oob_control() ? shr(v, c_one_u) : v; };
+        const auto past = [&](Id v, Id lim) { return m.emit(spv::OpLogicalNot, t_bool, {ult(v, limit(lim))}); };
+        Id size, level_in = 0;
+        if (store) {
+            size = m.emit(spv::OpImageQuerySize, size_type, {image});
+            if (level) oob_note(ine(ui(level), c_zero_u), kOobImageStoreLevel);
+        } else {
+            Id at = c_zero_u;
+            if (level) {
+                const Id levels = ui(m.emit(spv::OpImageQueryLevels, t_i32, {image}));
+                level_in = ult(ui(level), levels);
+                oob_note(past(ui(level), levels), kOobImageLoadLevel);
+                at = sel(level_in, ui(level), c_zero_u);
+            }
+            size = m.emit(spv::OpImageQuerySizeLod, size_type, {image, i(at)});
+        }
+        const std::size_t axes = arrayed ? n - 1 : n;
+        Id outside = 0;
+        for (std::size_t k = 0; k < axes; ++k) {
+            const Id s = ui(n == 1 ? size : extract(t_i32, size, static_cast<std::uint32_t>(k)));
+            const Id bad = past(ui(coords[k]), s);
+            outside = outside ? bor(outside, bad) : bad;
+        }
+        if (outside) oob_note(level_in ? band(outside, level_in) : outside, store ? kOobImageStoreSize : kOobImageLoadSize);
+        if (arrayed) {
+            const Id layers = ui(extract(t_i32, size, static_cast<std::uint32_t>(n - 1)));
+            oob_note(past(ui(coords[n - 1]), layers), store ? kOobImageStoreLayer : kOobImageLoadLayer);
+        }
+    }
     Id guest_ptr(Id guest_u64) {
         const Id host = m.emit(spv::OpFunctionCall, t_u64, {fn_xlate, guest_u64});
         const Id block = m.emit(spv::OpConvertUToPtr, p_psb_block, {host});
@@ -3416,6 +3458,7 @@ struct Translator {
             std::vector<Id> vals;
             for (const Id raw : raws) vals.push_back(img.kind == 1 ? raw : img.kind == 2 ? i(raw) : f(raw));
             const Id texel = img.kind ? m.emit(spv::OpCompositeConstruct, texel_type(img), vals) : vec4f(vals[0], vals[1], vals[2], vals[3]);
+            if (oob_base64) oob_image(img, arrayed, coords, op == 9 ? i(ld(vgpr_var(in.vaddr + ncoord))) : 0, true);
             exec_guard([&] {
                 const Id image = load_image(img);
                 m.emit_void(spv::OpImageWrite, {image, coord, texel});
@@ -3435,6 +3478,7 @@ struct Translator {
                 ops.push_back(spv::IoLod);
                 ops.push_back(i(ld(vgpr_var(in.vaddr + ncoord))));
             }
+            if (oob_base64) oob_image(img, arrayed, coords, op == 1 ? ops.back() : 0, false);
             const Id texel = texel_as_v4f(img, m.emit(spv::OpImageFetch, texel_type(img), ops));
             write_texel(in, texel);
             return;
@@ -4222,9 +4266,9 @@ struct Translator {
         }
         sym_user_data();
         Id lds_bytes = 0;
-        // gcn::set_oob_count: a vertex or pixel stage with no LDS of its own
-        // finds the counters where a tessellation stage finds its LDS.
-        if (oob_count() && !lds_in_buffer && (opt.stage == Stage::Vertex || opt.stage == Stage::Pixel) &&
+        // gcn::set_oob_count: a vertex, pixel or compute stage with no LDS in a
+        // buffer finds the counters where a tessellation stage finds its LDS.
+        if (oob_count() && !lds_in_buffer && (opt.stage == Stage::Vertex || opt.stage == Stage::Pixel || opt.stage == Stage::Compute) &&
             opt.tess_role == TranslateOptions::TessRole::None && opt.gs_role == TranslateOptions::GsRole::None) {
             oob_base64 = m.load(t_u64, m.access_chain(p_uni_u64, ubo_var, {cu(1)}));  // StageParams::lds_address
             std::uint32_t h = 2166136261u;  // the program's slot: FNV-1a of its words

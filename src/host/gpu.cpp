@@ -3711,20 +3711,24 @@ bool init_locked() {
     }
     for (std::uint32_t k = 0; k < gcn::kL2Entries; ++k) static_cast<std::uint64_t*>(g.sink_l2.map)[k] = g.sink.address;
     for (std::uint32_t k = 0; k < gcn::kL1Entries; ++k) static_cast<std::uint64_t*>(g.l1.map)[k] = g.sink_l2.address;
-    // BBHOST_OOB_COUNT=1 (a diagnostic): translated vertex and pixel stages
-    // count the buffer accesses that leave what GCN would read into this
-    // buffer (gcn::set_oob_count; StageParams::lds_address points at it);
-    // the frame detail line and the exit report read it. Lifts do not count:
-    // run with BBHOST_DECOMP=0 for every stage.
-    // =2: the control (gcn::set_oob_control) - a load by index counts as past
-    // the records from half of them on, to show the counters reach the host.
+    // BBHOST_OOB_COUNT=1 (a diagnostic): vertex, pixel and compute stages
+    // with no tessellation or GS role, translated or lifted, count into this
+    // buffer the buffer accesses that leave what GCN would read and the image
+    // accesses at integer coordinates outside the view bound for them
+    // (gcn::set_oob_count; StageParams::lds_address points at it); the frame
+    // detail lines and the exit report read it (oob_totals). The counters
+    // live in the lifter's SPIR-V, so the HLSL path is off while they count
+    // (hlsl_mode). =2: the control (gcn::set_oob_control) - every limit
+    // halved, to show each kind reaches the host.
     if (const char* e = std::getenv("BBHOST_OOB_COUNT"); e && (e[0] == '1' || e[0] == '2')) {
         if (create_dev_buffer(g.oob, std::uint64_t{gcn::kOobSlots} * gcn::kOobKinds * 4, true, true)) {
             std::memset(g.oob.map, 0, g.oob.size);
             gcn::set_oob_count(true);
             gcn::set_oob_control(e[0] == '2');
-            host_log("gpu: out-of-range buffer accesses counted (BBHOST_OOB_COUNT=%c; vertex and pixel stages%s)", e[0],
-                     e[0] == '2' ? "; the control: loads by index from half the records on count as past them" : "");
+            host_log("gpu: out-of-range accesses counted (BBHOST_OOB_COUNT=%c): buffers past their records or binding, images at integer "
+                     "coordinates outside the bound view's size, levels or layers; vertex, pixel and compute stages without a "
+                     "tessellation or GS role, translated or lifted; the HLSL path off%s",
+                     e[0], e[0] == '2' ? "; the control: every limit halved" : "");
         }
     }
 
@@ -7734,12 +7738,38 @@ GpuStats host_gpu_stats() {
     st.draws_clip_discard = g.draws_clip_discard.load(std::memory_order_relaxed);
     if (g.oob.map) {
         st.oob_on = true;
-        const auto* c = static_cast<const volatile std::uint32_t*>(g.oob.map);
+        const std::vector<std::uint64_t> totals = oob_totals();
         for (std::uint32_t slot = 0; slot < gcn::kOobSlots; ++slot) {
-            for (std::uint32_t k = 0; k < 3; ++k) st.oob[k] += c[slot * gcn::kOobKinds + k];
+            for (std::uint32_t k = 0; k < gcn::kOobKinds; ++k) st.oob[k] += totals[slot * gcn::kOobKinds + k];
         }
     }
     return st;
+}
+
+static_assert(sizeof(GpuStats::oob) / sizeof(std::uint64_t) == gcn::kOobKinds, "GpuStats::oob holds every counter kind");
+namespace {
+std::mutex g_oob_mu;
+std::vector<std::uint64_t> g_oob_total;  // under g_oob_mu: by slot and kind
+std::vector<std::uint32_t> g_oob_seen;   // under g_oob_mu: each counter as last read
+}  // namespace
+
+std::vector<std::uint64_t> gpu::oob_totals() {
+    if (!g.oob.map) return {};
+    const std::size_t n = std::size_t{gcn::kOobSlots} * gcn::kOobKinds;
+    std::lock_guard<std::mutex> lk(g_oob_mu);
+    if (g_oob_total.size() != n) {
+        g_oob_total.assign(n, 0);
+        g_oob_seen.assign(n, 0);
+    }
+    // Each 32-bit counter's change since the last read, modulo 2^32: a counter
+    // that wraps between two reads (2^32 lanes in a second) still adds up.
+    const auto* c = static_cast<const volatile std::uint32_t*>(g.oob.map);
+    for (std::size_t i = 0; i < n; ++i) {
+        const std::uint32_t now = c[i];
+        g_oob_total[i] += static_cast<std::uint32_t>(now - g_oob_seen[i]);
+        g_oob_seen[i] = now;
+    }
+    return g_oob_total;
 }
 
 const char* host_gpu_draw_fail_name(int reason) {
@@ -8125,6 +8155,10 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
     stamp.to(kDpPaths);
     const std::uint64_t key = compute_key(code_hash, d.rsrc1, d.rsrc2, d.threads, dims, sampler_modes);
     ComputePipeline& pl = pipeline_for(d, key, words, name, dims, sampler_modes);
+    if (g.oob.map && !pl.failed && !pl.oob_named) {  // BBHOST_OOB_COUNT: the slot's name, once
+        pl.oob_named = true;
+        note_oob_compute_slot(pl.meta.oob_slot, pl.name);
+    }
     t_dispatch_user_reads = 0xffff;
     if (d.want_user_reads && !pl.failed) {
         if (!pl.user_reads_known) {
@@ -8420,6 +8454,7 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
     }
     gcn::StageParams params{};
     params.l1_table = g.l1.address;
+    params.lds_address = g.oob.address;  // BBHOST_OOB_COUNT=1: the counters (gcn::set_oob_count); 0 otherwise
     std::memcpy(params.user_sgpr, d.user_data, sizeof(params.user_sgpr));
     if (gds_bound) {
         params.gds_base = d.gds_base;

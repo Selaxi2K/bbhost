@@ -7003,6 +7003,13 @@ void apply_relinks_locked() {
 // pipeline, then the optimized relink with the specialization that draw gave
 // it - and kept, by its content key, for the draw that needs it.
 }  // namespace
+// BBHOST_OOB_COUNT: a compute program's counter slot (TranslateResult::
+// oob_slot), named for the exit report as note_oob_slots names a draw's.
+void note_oob_compute_slot(std::uint32_t slot, const std::string& name) {
+    if (!g.oob.map || slot >= gcn::kOobSlots) return;
+    std::lock_guard<std::mutex> lk(g_oob_names_mu);
+    g_oob_names[slot].insert("CS " + name);
+}
 }  // namespace gpu
 namespace {
 void replan_recorded_vertex_input(gpu::VertexInputPlan& p, bool tess_native);  // defined with pack_vertex_input
@@ -10816,20 +10823,29 @@ void cross_vendor_report() {
              static_cast<ull>(g_raster_census[0].load()), static_cast<ull>(g_raster_census[1].load()));
     if (g.oob.map) {
         // BBHOST_OOB_COUNT=1: the totals, then the programs with the most.
-        const auto* c = static_cast<const volatile std::uint32_t*>(g.oob.map);
-        std::uint64_t total[3] = {};
+        const std::vector<std::uint64_t> c = oob_totals();
+        constexpr std::uint32_t K = gcn::kOobKinds;
+        std::uint64_t total[K] = {};
         std::vector<std::pair<std::uint64_t, std::uint32_t>> slots;
         for (std::uint32_t slot = 0; slot < gcn::kOobSlots; ++slot) {
             std::uint64_t n = 0;
-            for (std::uint32_t k = 0; k < 3; ++k) {
-                total[k] += c[slot * gcn::kOobKinds + k];
-                n += c[slot * gcn::kOobKinds + k];
+            for (std::uint32_t k = 0; k < K; ++k) {
+                total[k] += c[slot * K + k];
+                n += c[slot * K + k];
             }
             if (n) slots.push_back({n, slot});
         }
         host_log("render: out-of-range buffer accesses (BBHOST_OOB_COUNT): typed loads by index at or past num_records %llu, reaching past "
-                 "their binding %llu; page-table walks by index at or past num_records %llu (lanes EXEC holds, translated stages)",
-                 static_cast<ull>(total[0]), static_cast<ull>(total[1]), static_cast<ull>(total[2]));
+                 "their binding %llu; page-table walks by index at or past num_records %llu (lanes EXEC holds; vertex, pixel and compute "
+                 "stages, translated or lifted)",
+                 static_cast<ull>(total[gcn::kOobPastRecords]), static_cast<ull>(total[gcn::kOobPastBinding]),
+                 static_cast<ull>(total[gcn::kOobWalkPastRecords]));
+        host_log("render: out-of-range image accesses (BBHOST_OOB_COUNT): loads at integer coordinates outside the bound view's size at "
+                 "their level %llu, at or past its level count %llu, at or past its layer count %llu; stores outside its size %llu, past "
+                 "its layers %llu, at a level other than 0 %llu (lanes EXEC holds)",
+                 static_cast<ull>(total[gcn::kOobImageLoadSize]), static_cast<ull>(total[gcn::kOobImageLoadLevel]),
+                 static_cast<ull>(total[gcn::kOobImageLoadLayer]), static_cast<ull>(total[gcn::kOobImageStoreSize]),
+                 static_cast<ull>(total[gcn::kOobImageStoreLayer]), static_cast<ull>(total[gcn::kOobImageStoreLevel]));
         std::sort(slots.rbegin(), slots.rend());
         std::lock_guard<std::mutex> lk(g_oob_names_mu);
         for (std::size_t i = 0; i < slots.size() && i < 24; ++i) {
@@ -10838,8 +10854,12 @@ void cross_vendor_report() {
             if (auto it = g_oob_names.find(slot); it != g_oob_names.end()) {
                 for (const std::string& n : it->second) names += (names.empty() ? "" : ", ") + n;
             }
-            host_log("render:   slot %u (%s): past records %u, past the binding %u, walks past records %u", slot, names.empty() ? "?" : names.c_str(),
-                     c[slot * gcn::kOobKinds], c[slot * gcn::kOobKinds + 1], c[slot * gcn::kOobKinds + 2]);
+            const std::uint64_t* s = &c[slot * K];
+            host_log("render:   slot %u (%s): past records %llu, past the binding %llu, walks past records %llu; image loads outside %llu, "
+                     "past levels %llu, past layers %llu; stores outside %llu, past layers %llu, at another level %llu",
+                     slot, names.empty() ? "?" : names.c_str(), static_cast<ull>(s[0]), static_cast<ull>(s[1]), static_cast<ull>(s[2]),
+                     static_cast<ull>(s[3]), static_cast<ull>(s[4]), static_cast<ull>(s[5]), static_cast<ull>(s[6]), static_cast<ull>(s[7]),
+                     static_cast<ull>(s[8]));
         }
     }
     host_log("render: depth targets whose first pass loads bytes nothing wrote: %llu test depth or stencil against them, %llu do not",

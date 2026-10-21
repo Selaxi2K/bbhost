@@ -3479,6 +3479,71 @@ void oob_counting() {
     gcn::set_oob_count(false);
 }
 
+// gcn::set_oob_count's image kinds: an image_load_mip from a 2D array (its
+// T# loaded from the table at s[2:3]) counts a coordinate outside the bound
+// view's size at the level, a level past its level count and a layer past
+// its layer count - three adds, the view's levels and its size at the level
+// queried - in the translation and its lift alike. Valid modules either way;
+// nothing counted or queried when off; the control's modules differ.
+void oob_image_counting() {
+    const auto program = [] {
+        Asm a;
+        a.smrd(kLoadX8, 8, 2, 0);  // s_load_dwordx8 s[8:15], s[2:3], 0: the T#
+        a.sopp(kWaitcnt, 0);
+        a.interp(2, 0, 0);
+        a.interp(3, 0, 1);
+        a.vop1(kCvtU32F32, 2, kV + 2);  // integer coordinates
+        a.vop1(kCvtU32F32, 3, kV + 3);
+        a.vop1(kVMov, 4, kC0);          // the layer
+        a.vop1(kVMov, 5, kC0 + 1);      // the level
+        a.mimg(1, 0xf, 8, 2, 8, 0);     // image_load_mip v[8:11], v[2:5], s[8:15]
+        a.sopp(kWaitcnt, 0);
+        a.exp_mrt0(8, 9, 10, 11);
+        a.endpgm();
+        return a.w;
+    };
+    const auto lift_array = [&](gcn::TranslateResult& ref) {
+        const std::vector<std::uint32_t> w = program();
+        const gcn::Program p = gcn::decode(w.data(), w.size());
+        CHECK(p.errors.empty());
+        gcn::TranslateOptions o;
+        o.stage = gcn::Stage::Pixel;
+        o.rsrc2 = 4u << 1;
+        o.ps_input_ena = 2;
+        o.descriptor_set = 1;
+        o.cb_ssbo = true;
+        o.cb_no_fallback = true;
+        o.image_dims = {{1 /* 2D */, true}};
+        ref = gcn::translate(p, o);
+        if (!ref.ok()) std::fprintf(stderr, "reference failed: %s\n", ref.errors[0].c_str());
+        CHECK(ref.ok());
+        return gcn::lift_pixel_shader(p, o, ref);
+    };
+    for (const bool on : {true, false}) {
+        gcn::set_oob_count(on);
+        gcn::TranslateResult ref;
+        const gcn::LiftResult l = lift_array(ref);
+        CHECK(spirv_valid(ref.spirv));
+        CHECK(lifted_valid(l));
+        CHECK(count_op(ref.spirv, 234) == (on ? 3u : 0u));  // OpAtomicIAdd: the size, the level, the layer
+        CHECK(count_op(l.spirv, 234) == (on ? 3u : 0u));
+        CHECK(count_op(ref.spirv, 103) == (on ? 1u : 0u));  // OpImageQuerySizeLod
+        CHECK(count_op(ref.spirv, 106) == (on ? 1u : 0u));  // OpImageQueryLevels
+        CHECK(count_op(l.spirv, 103) == (on ? 1u : 0u));
+        CHECK(count_op(l.spirv, 106) == (on ? 1u : 0u));
+    }
+    gcn::set_oob_count(true);
+    gcn::TranslateResult counting, control;
+    const gcn::LiftResult lc = lift_array(counting);
+    gcn::set_oob_control(true);
+    const gcn::LiftResult lk = lift_array(control);
+    gcn::set_oob_control(false);
+    gcn::set_oob_count(false);
+    CHECK(spirv_valid(control.spirv) && lifted_valid(lk));
+    CHECK(control.spirv != counting.spirv && lk.spirv != lc.spirv);
+    CHECK(count_op(control.spirv, 234) == 3 && count_op(lk.spirv, 234) == 3);
+}
+
 // Copies of a V#: a spill to lanes of a VGPR and back (v_writelane_b32 /
 // v_readlane_b32 of a spill cell), or s_mov, define what they copy, so a
 // constant buffer read through a copy of its V# is bound - where every copy
@@ -3671,6 +3736,7 @@ void run() {
     typed_loads();
     index_bounds();
     oob_counting();
+    oob_image_counting();
     copies();
     cselect();
     lshl_b64();
@@ -4442,6 +4508,41 @@ std::size_t decorated(const std::vector<std::uint32_t>& spv, std::uint32_t decor
     return n;
 }
 
+// gcn::set_oob_count in a compute shader: an image_store to a 2D storage
+// image (its T# in s[8:15]) counts a coordinate outside the bound view's size
+// (one add, the view's size queried), and a buffer_store_dword by index
+// walked through the page table counts an index past num_records (one add) -
+// in the translation and its lift alike; valid either way, nothing when off.
+void oob_counting() {
+    Asm a;
+    a.vop1(kVMov, 1, kV + 0);  // v1 = v0: the image's y
+    for (std::uint32_t k = 4; k < 8; ++k) a.vop1(kVMov, k, kC0 + k);
+    a.w.push_back(0xf0000000u | 8u << 18 | 0xfu << 8);       // image_store v[4:7], v[0:1], s[8:15] dmask 0xf
+    a.w.push_back(0u | 4u << 8 | (8u / 4) << 16);
+    a.w.push_back(0xe0000000u | 28u << 18 | 1u << 13);       // buffer_store_dword v4, v0, s[0:3], 0 idxen
+    a.w.push_back(0u | 4u << 8 | (0u / 4) << 16 | 128u << 24);
+    a.endpgm();
+    gcn::TranslateOptions o = options();
+    o.rsrc2 = 16u << 1;  // s0-s15: the V# in s[0:3], the T# in s[8:15]
+    o.image_dims = {{1 /* 2D */, false}};
+    const gcn::Program p = gcn::decode(a.w.data(), a.w.size());
+    CHECK(p.errors.empty());
+    for (const bool on : {true, false}) {
+        gcn::set_oob_count(on);
+        const gcn::TranslateResult ref = gcn::translate(p, o);
+        if (!ref.ok()) std::fprintf(stderr, "reference failed: %s\n", ref.errors.empty() ? "?" : ref.errors[0].c_str());
+        CHECK(ref.ok() && spirv_valid(ref.spirv));
+        CHECK((ref.oob_slot < gcn::kOobSlots) == on);
+        const gcn::LiftResult l = gcn::lift_compute_shader(p, o, ref);
+        CHECK(lifted_valid(l, "the counting compute shader"));
+        CHECK(count_op(ref.spirv, 234) == (on ? 2u : 0u));  // OpAtomicIAdd: the store's size, the walk past the records
+        CHECK(count_op(l.spirv, 234) == (on ? 2u : 0u));
+        CHECK(count_op(ref.spirv, 104) == (on ? 1u : 0u));  // OpImageQuerySize
+        CHECK(count_op(l.spirv, 104) == (on ? 1u : 0u));
+    }
+    gcn::set_oob_count(false);
+}
+
 // A lean reference (ComputeLean: cb_ssbo, cb_no_fallback, its buffers in set
 // 1): the lift reads what the reference bound from that storage buffer and
 // walks the rest as the reference does; a store at the V#'s base plus a
@@ -4693,6 +4794,7 @@ void run() {
         if (barrier) CHECK(proof_has(r, "1 s_barrier"));
     }
     lean_reference();
+    oob_counting();
 }
 
 }  // namespace compute

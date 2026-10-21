@@ -193,8 +193,9 @@ void hash_options(KeyHasher& h, const gcn::TranslateOptions& o) {
     if (!gcn::subgroup_ops_in(o)) h.u32(0x5b01u);
     // A clip-discarding pixel shader that demotes the pixel rather than ending it.
     if (o.stage == gcn::Stage::Pixel && o.ps_clip_discard && gcn::clip_demote()) h.u32(0xde40u);
-    // The out-of-range counters (gcn::set_oob_count, a diagnostic).
-    if (gcn::oob_count()) h.u32(gcn::oob_control() ? 0x00bdu : 0x00bcu);
+    // The out-of-range counters (gcn::set_oob_count, a diagnostic): buffers,
+    // images and compute stages since 0x00be.
+    if (gcn::oob_count()) h.u32(gcn::oob_control() ? 0x00bfu : 0x00beu);
 }
 
 // ---- an entry: the TranslateResult, every field ----
@@ -949,6 +950,9 @@ int hlsl_mode() {
     // at use, 2 behind the game), then the Shaders setting, then the default -
     // DXC's modules from the cache, the rest compiled behind the game.
     static const int mode = [] {
+        // BBHOST_OOB_COUNT (gpu.cpp): the counters live in the lifter's
+        // SPIR-V, not in DXC's modules - the lift only while they count.
+        if (const char* o = std::getenv("BBHOST_OOB_COUNT"); o && (o[0] == '1' || o[0] == '2')) return 0;
         const char* e = std::getenv("BBHOST_HLSL");
         if (e && (e[0] >= '0' && e[0] <= '2') && !e[1]) return e[0] - '0';
         const int s = g_hlsl_setting.load();

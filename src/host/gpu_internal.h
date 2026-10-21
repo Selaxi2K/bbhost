@@ -213,6 +213,7 @@ struct ComputePipeline {
     // (GpuDispatch::want_user_reads: the dispatch-token shadow).
     std::uint32_t user_reads = 0xffff;
     bool user_reads_known = false;
+    bool oob_named = false;  // BBHOST_OOB_COUNT: its counter slot named (note_oob_compute_slot)
 };
 
 // Guest VA -> (VkBuffer, offset) for index buffers.
@@ -828,6 +829,14 @@ std::uint32_t alloc_params_slot_locked(const gcn::StageParams& params, VkDescrip
 VkDescriptorSet alloc_set_locked(VkDescriptorSetLayout layout = VK_NULL_HANDLE);  // the shared layout when null
 bool rebuild_page_tables();
 bool create_dev_buffer(DevBuffer& b, std::uint64_t size, bool host_visible, bool cached = false);  // cached: host-cached memory, for readbacks
+// BBHOST_OOB_COUNT (gcn::set_oob_count): the counters' totals by slot and kind
+// (kOobSlots x kOobKinds) in 64 bits - each 32-bit counter's change since the
+// last call added, so one that wraps between calls still adds up; called once
+// a second (host_gpu_stats) and at exit. Empty when not counting.
+std::vector<std::uint64_t> oob_totals();
+// The same: a compute program's slot named for the exit report, as render.cpp
+// names a draw's stages (note_oob_slots).
+void note_oob_compute_slot(std::uint32_t slot, const std::string& name);
 // A host-visible buffer the CPU writes and shaders read every draw: in video
 // memory the CPU can write on a discrete GPU (rings_in_vram), else as
 // create_dev_buffer(b, size, true). `what` names it in the log.
