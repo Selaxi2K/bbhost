@@ -1965,6 +1965,29 @@ bool shadow_snapshot_locked(std::uint64_t va, std::uint64_t bytes, Located& loc)
     return true;
 }
 
+int shadow_place_class_locked(std::uint64_t va, std::uint64_t bytes) {
+    if (!buffer_shadow_on() || !bytes) return kPlaceNone;
+    std::uint32_t chunk = 0;
+    std::uint64_t off = 0;
+    if (!phys_of(va, bytes, chunk, off)) return kPlaceNone;
+    const Mirror& m = g_mirrors[chunk];
+    const std::uint32_t p0 = static_cast<std::uint32_t>(off >> kPageShift), p1 = static_cast<std::uint32_t>((off + bytes - 1) >> kPageShift);
+    if (m.pages.empty() || p1 >= m.pages.size()) return kPlaceNone;
+    // The least placeable page decides; a long range by its first 256 pages.
+    int cls = kPlacePlaced;
+    for (std::uint32_t p = p0; p <= p1 && p < p0 + 256; ++p) {
+        const Page& pg = m.pages[p];
+        const int c = pg.dynamic               ? kPlaceDynamic
+                      : page_handed(chunk, p)  ? kPlaceHanded
+                      : pg.placed              ? kPlacePlaced
+                      : pg.valid && pg.told    ? kPlaceTold
+                      : pg.valid               ? kPlaceWatched
+                                               : kPlaceUntracked;
+        cls = std::max(cls, c);
+    }
+    return cls;
+}
+
 void shadow_probe_locked(std::uint64_t va, std::uint64_t bytes, char* out, std::size_t n) {
     if (!out || !n) return;
     out[0] = 0;

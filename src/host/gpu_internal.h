@@ -1058,6 +1058,12 @@ bool shadow_snapshot_locked(std::uint64_t va, std::uint64_t bytes, Located& loc)
 // the game rewrites, or a range this cannot tell cheaply - before the caller
 // works out how much of it a draw reads.
 bool shadow_snapshot_maybe_locked(std::uint64_t va, std::uint64_t bytes);
+// What the pages of [va, va+bytes) are to the buffer shadow now, the least
+// placeable page deciding (BBHOST_VB_RACE=2's census): read in place, told
+// and never handed out (what in place reads; mirrored), under renamed copies
+// GX hands out, write-watched, rewritten (host memory for good), not tracked.
+enum : int { kPlaceNone = 0, kPlacePlaced, kPlaceTold, kPlaceHanded, kPlaceWatched, kPlaceDynamic, kPlaceUntracked, kPlaceClasses };
+int shadow_place_class_locked(std::uint64_t va, std::uint64_t bytes);
 void shadow_written_locked(std::uint64_t va, std::uint64_t bytes, bool by_gpu);
 // BBHOST_INDIRECT_STATS=1: an indirect dispatch (kind 0) or draw (1, 2
 // indexed) recorded now, whose arguments are read once its submission is
@@ -1352,10 +1358,15 @@ constexpr std::size_t kDrawRecs = 16384;
 extern DrawRec g_draw_recs[kDrawRecs];
 // BBHOST_VB_RACE=1 (render.cpp): each non-indexed draw's vertex range hashed
 // when recorded and again when its submission retires - memory rewritten while
-// the draw waited for the GPU. Caller holds the lock.
+// the draw waited for the GPU. =2: the ranges the buffer shadow's mirrors
+// serve too (`mirrored`), hashed at their ends - what reading them in place
+// would have raced - counted by page class (shadow_place_class_locked).
+// Caller holds the lock.
 bool vb_race_on();
-void vb_race_note_locked(const char* name, std::uint64_t va, std::uint64_t bytes);
+bool vb_race_mirrored_on();
+void vb_race_note_locked(const char* name, std::uint64_t va, std::uint64_t bytes, bool mirrored = false);
 void vb_race_retired_locked(std::uint64_t serial);
+void vb_race_exit_report_locked();  // the counts at exit, by page class too (a short run's only line)
 // buffer_shadow.cpp: GPU writes by page (every shadow_written_locked by the
 // GPU, the shadow on or off), and whether one over [va, va+bytes) is still to
 // land - recorded in a submission that has not retired. Caller holds the lock.

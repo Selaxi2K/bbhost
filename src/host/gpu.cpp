@@ -11204,5 +11204,9 @@ void host_gpu_report() {
     if (glitch_on()) host_log("%s", glitch_report().c_str());
     if (occlusion_on()) host_log("%s", occlusion_report(true).c_str());
     host_gpu_log_video_memory(true);
+    if (vb_race_on()) {
+        std::lock_guard<GpuMutex> lock(g.mu);
+        vb_race_exit_report_locked();
+    }
     render_report();
 }
