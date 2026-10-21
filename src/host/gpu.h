@@ -611,9 +611,9 @@ struct GpuStats {
     // (gcn::kOobKinds, in its order) - typed loads by index past num_records,
     // past their binding, walks by index past num_records; image loads outside
     // the bound view's size, past its levels, past its layers; image stores
-    // outside its size, past its layers, at a level other than 0; oob_on
-    // whether they count.
-    std::uint64_t oob[9];
+    // outside its size, past its layers, at a level other than 0; the view
+    // smaller than the T#, larger; oob_on whether they count.
+    std::uint64_t oob[11];
     bool oob_on;
 };
 // A draw on the host's tessellator: counted, and by which of its stages ran as

@@ -497,8 +497,14 @@ inline bool image_store_inst(const Inst& in) { return in.enc == Enc::MIMG && (in
 // arrayed load (a 2D array's, a cube's face) at or past its layer count,
 // [kOobImageStoreSize] and [kOobImageStoreLayer] the same of an
 // image_store(_mip) (lanes set_image_store_bounds skips), [kOobImageStoreLevel]
-// an image_store_mip at a level other than 0 (mimg writes level 0 of the view).
-// Only lanes EXEC holds count. Set
+// an image_store_mip at a level other than 0 (mimg writes level 0 of the view);
+// and of those loads and stores against the T#'s own size at the level
+// (width, height, a 3D image's depth: the game's image), where the view and
+// the T# disagree - [kOobViewSmaller] inside the T#'s size but outside the
+// view's (the host bound a smaller view than the game's image: what GCN
+// reads or writes, the host does not), [kOobViewLarger] outside the T#'s but
+// inside the view's (GCN reads 0 or drops it, the host reads or writes). Only
+// lanes EXEC holds count. Set
 // once before the first translation; part of every key while on.
 void set_oob_count(bool on);
 bool oob_count();
@@ -510,10 +516,11 @@ bool oob_count();
 // them, at a small part of the draws' time. Keyed with the rest.
 void set_oob_control(bool on);
 bool oob_control();
-constexpr std::uint32_t kOobSlots = 4096, kOobKinds = 9;
+constexpr std::uint32_t kOobSlots = 4096, kOobKinds = 11;
 constexpr std::uint32_t kOobPastRecords = 0, kOobPastBinding = 1, kOobWalkPastRecords = 2;
 constexpr std::uint32_t kOobImageLoadSize = 3, kOobImageLoadLevel = 4, kOobImageLoadLayer = 5;
 constexpr std::uint32_t kOobImageStoreSize = 6, kOobImageStoreLayer = 7, kOobImageStoreLevel = 8;
+constexpr std::uint32_t kOobViewSmaller = 9, kOobViewLarger = 10;
 // The Vulkan stage a translation or lift with these options runs in.
 std::uint32_t vk_stage_of(const TranslateOptions& o);
 inline bool subgroup_ops_in(const TranslateOptions& o) { return (subgroup_stages() & vk_stage_of(o)) != 0; }

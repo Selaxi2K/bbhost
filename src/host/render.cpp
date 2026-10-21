@@ -10848,6 +10848,10 @@ void cross_vendor_report() {
                  static_cast<ull>(total[gcn::kOobImageStoreLayer]),
                  gcn::image_store_bounds() ? "skipped, BBHOST_IMAGE_STORE_BOUNDS" : "written, BBHOST_IMAGE_STORE_BOUNDS=0",
                  static_cast<ull>(total[gcn::kOobImageStoreLevel]));
+        host_log("render: image accesses where the bound view and the game's T# disagree (BBHOST_OOB_COUNT): inside the T#'s size but "
+                 "outside the view's %llu (the host's view smaller than the game's image), outside the T#'s but inside the view's %llu "
+                 "(larger) - loads and stores, lanes EXEC holds",
+                 static_cast<ull>(total[gcn::kOobViewSmaller]), static_cast<ull>(total[gcn::kOobViewLarger]));
         std::sort(slots.rbegin(), slots.rend());
         std::lock_guard<std::mutex> lk(g_oob_names_mu);
         for (std::size_t i = 0; i < slots.size() && i < 24; ++i) {
@@ -10858,10 +10862,11 @@ void cross_vendor_report() {
             }
             const std::uint64_t* s = &c[slot * K];
             host_log("render:   slot %u (%s): past records %llu, past the binding %llu, walks past records %llu; image loads outside %llu, "
-                     "past levels %llu, past layers %llu; stores outside %llu, past layers %llu, at another level %llu",
+                     "past levels %llu, past layers %llu; stores outside %llu, past layers %llu, at another level %llu; the view smaller "
+                     "than the T# %llu, larger %llu",
                      slot, names.empty() ? "?" : names.c_str(), static_cast<ull>(s[0]), static_cast<ull>(s[1]), static_cast<ull>(s[2]),
                      static_cast<ull>(s[3]), static_cast<ull>(s[4]), static_cast<ull>(s[5]), static_cast<ull>(s[6]), static_cast<ull>(s[7]),
-                     static_cast<ull>(s[8]));
+                     static_cast<ull>(s[8]), static_cast<ull>(s[9]), static_cast<ull>(s[10]));
         }
     }
     host_log("render: depth targets whose first pass loads bytes nothing wrote: %llu test depth or stencil against them, %llu do not",

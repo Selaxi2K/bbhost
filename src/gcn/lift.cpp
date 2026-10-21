@@ -3106,7 +3106,7 @@ private:
         for (const Id r : raws) vals.push_back(b.kind == 1 ? r : b.kind == 2 ? to_i(r) : as_f(word(r)));
         const Id texel = m.emit(spv::OpCompositeConstruct, b.kind == 1 ? t_v4u : b.kind == 2 ? m.type_vector(t_i32, 4) : t_v4f, vals);
         if (!res.rejections.empty()) return;
-        if (oob_base64) oob_image(ii->second, b, coords, in.op == 9 ? to_i(as_u(value(256 + in.vaddr + ncoord))) : 0, true);  // gcn::set_oob_count
+        if (oob_base64) oob_image(ii->second, b, coords, in.op == 9 ? to_i(as_u(value(256 + in.vaddr + ncoord))) : 0, true, in);  // gcn::set_oob_count
         // gcn::set_image_store_bounds, as the reference: the lanes outside the
         // view's size and layers skip the store, as GCN writes nothing there.
         Id inside = 0;
@@ -4179,7 +4179,7 @@ private:
             ops.push_back(spv::IoLod);
             ops.push_back(to_i(as_u(vgpr(in.vaddr + ncoord))));
         }
-        if (oob_base64) oob_image(ii->second, b, coords, in.op == 1 ? ops.back() : 0, false);  // gcn::set_oob_count
+        if (oob_base64) oob_image(ii->second, b, coords, in.op == 1 ? ops.back() : 0, false, in);  // gcn::set_oob_count
         const Id texel_type = b.kind == 1 ? t_v4u : b.kind == 2 ? m.type_vector(t_i32, 4) : t_v4f;
         Id texel = m.emit(spv::OpImageFetch, texel_type, ops);
         if (b.kind) texel = m.emit(spv::OpBitcast, t_v4f, {texel});
@@ -4661,8 +4661,9 @@ private:
     // gcn::set_oob_count, as the reference's oob_image: an image access at
     // integer coordinates (`coords`, signed, the layer last where `b` is
     // arrayed) against the view bound for the reference's image `ii` - a load
-    // at `level` (0 for none) or a store (`level` the image_store_mip's).
-    void oob_image(std::uint32_t ii, const ImageBinding& b, const std::vector<Id>& coords, Id level, bool store) {
+    // at `level` (0 for none) or a store (`level` the image_store_mip's) - and
+    // that view against the T# in.srsrc names.
+    void oob_image(std::uint32_t ii, const ImageBinding& b, const std::vector<Id>& coords, Id level, bool store, const Inst& in) {
         if (!oob_base64 || coords.empty()) return;
         m.capability(spv::CapImageQuery);
         const Id image = image_only(ii);
@@ -4699,6 +4700,41 @@ private:
         if (b.arrayed) {
             const Id layers = from_i(extract(t_i32, size, static_cast<std::uint32_t>(n - 1)));
             oob_note(past(from_i(coords[n - 1]), layers), store ? kOobImageStoreLayer : kOobImageLoadLayer);
+        }
+        // The game's image, as the reference reads it: the T#'s size at
+        // BASE_LEVEL plus the level read.
+        const Id w2 = as_u(read(static_cast<std::uint16_t>(in.srsrc + 2), in)), w3 = as_u(read(static_cast<std::uint16_t>(in.srsrc + 3), in));
+        Id rel = cu(0);
+        if (level && !store) rel = m.emit(spv::OpSelect, t_u32, {level_in, from_i(level), cu(0)});
+        const Id at_level = ibin(spv::OpIAdd, ibin(spv::OpBitwiseAnd, shift(spv::OpShiftRightLogical, w3, cu(12)), cu(0xf)), rel);
+        const auto shrink = [&](Id full) {
+            const Id v = shift(spv::OpShiftRightLogical, full, at_level);
+            return m.emit(spv::OpSelect, t_u32, {m.emit(spv::OpINotEqual, t_bool, {v, cu(0)}), v, cu(1)});
+        };
+        std::vector<Id> tsize = {shrink(ibin(spv::OpIAdd, ibin(spv::OpBitwiseAnd, w2, cu(0x3fff)), cu(1))),
+                                 shrink(ibin(spv::OpIAdd, ibin(spv::OpBitwiseAnd, shift(spv::OpShiftRightLogical, w2, cu(14)), cu(0x3fff)), cu(1)))};
+        if (b.dim == spv::Dim3D && !b.r128) {
+            const Id w4 = as_u(read(static_cast<std::uint16_t>(in.srsrc + 4), in));
+            tsize.push_back(shrink(ibin(spv::OpIAdd, ibin(spv::OpBitwiseAnd, w4, cu(0x1fff)), cu(1))));
+        }
+        const std::size_t taxes = std::min<std::size_t>(b.dim == spv::Dim1D ? 1 : b.dim == spv::Dim3D ? tsize.size() : 2, axes);
+        Id in_t = 0, in_v = 0;
+        for (std::size_t k = 0; k < taxes; ++k) {
+            const Id c = from_i(coords[k]);
+            const Id t = below(c, limit(tsize[k]));
+            const Id v = below(c, from_i(n == 1 ? size : extract(t_i32, size, static_cast<std::uint32_t>(k))));
+            in_t = in_t ? m.emit(spv::OpLogicalAnd, t_bool, {in_t, t}) : t;
+            in_v = in_v ? m.emit(spv::OpLogicalAnd, t_bool, {in_v, v}) : v;
+        }
+        if (in_t) {
+            Id smaller = m.emit(spv::OpLogicalAnd, t_bool, {in_t, m.emit(spv::OpLogicalNot, t_bool, {in_v})});
+            Id larger = m.emit(spv::OpLogicalAnd, t_bool, {m.emit(spv::OpLogicalNot, t_bool, {in_t}), in_v});
+            if (level_in) {
+                smaller = m.emit(spv::OpLogicalAnd, t_bool, {smaller, level_in});
+                larger = m.emit(spv::OpLogicalAnd, t_bool, {larger, level_in});
+            }
+            oob_note(oob_sampled(smaller, key), kOobViewSmaller);
+            oob_note(oob_sampled(larger, key), kOobViewLarger);
         }
     }
     // `body` where `cond` holds (a selection, as where_exec's on a lane's EXEC bit).

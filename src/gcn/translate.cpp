@@ -773,8 +773,10 @@ struct Translator {
     // (OpImageWrite, level 0 of the view; `level` the image_store_mip's).
     // The size counts where the level is one the view has (the size is read at
     // level 0 elsewhere, and the level counts instead). The control halves
-    // every limit.
-    void oob_image(const ImageVar& img, bool arrayed, const std::vector<Id>& coords, Id level, bool store) {
+    // every limit. Then the view against the T# in.srsrc names (its width and
+    // height, a 3D image's depth, at its BASE_LEVEL plus the level read): where
+    // the two disagree about a lane (kOobViewSmaller, kOobViewLarger).
+    void oob_image(const ImageVar& img, std::uint32_t dim, bool arrayed, const std::vector<Id>& coords, Id level, bool store, const Inst& in) {
         if (!oob_base64 || coords.empty()) return;
         m.capability(spv::CapImageQuery);
         const Id image = load_image(img);
@@ -808,6 +810,36 @@ struct Translator {
         if (arrayed) {
             const Id layers = ui(extract(t_i32, size, static_cast<std::uint32_t>(n - 1)));
             oob_note(past(ui(coords[n - 1]), layers), store ? kOobImageStoreLayer : kOobImageLoadLayer);
+        }
+        // The game's image: the T#'s size at the level the access reads
+        // (BASE_LEVEL + the load's level; a store's, level 0 of the view).
+        const Id w2 = read_s(in.srsrc + 2, in), w3 = read_s(in.srsrc + 3, in);
+        Id rel = c_zero_u;
+        if (level && !store) rel = sel(level_in, ui(level), c_zero_u);
+        const Id at_level = iadd(iand(shr(w3, cu(12)), cu(0xf)), rel);
+        const auto shrink = [&](Id full) {
+            const Id v = shr(full, at_level);
+            return sel(ine(v, c_zero_u), v, c_one_u);
+        };
+        std::vector<Id> tsize = {shrink(iadd(iand(w2, cu(0x3fff)), c_one_u)), shrink(iadd(iand(shr(w2, cu(14)), cu(0x3fff)), c_one_u))};
+        if (dim == spv::Dim3D && !in.r128) tsize.push_back(shrink(iadd(iand(read_s(in.srsrc + 4, in), cu(0x1fff)), c_one_u)));
+        const std::size_t taxes = std::min<std::size_t>(dim == spv::Dim1D ? 1 : dim == spv::Dim3D ? tsize.size() : 2, axes);
+        Id in_t = 0, in_v = 0;
+        for (std::size_t k = 0; k < taxes; ++k) {
+            const Id c = ui(coords[k]);
+            const Id t = ult(c, limit(tsize[k]));
+            const Id v = ult(c, ui(n == 1 ? size : extract(t_i32, size, static_cast<std::uint32_t>(k))));
+            in_t = in_t ? band(in_t, t) : t;
+            in_v = in_v ? band(in_v, v) : v;
+        }
+        if (in_t) {
+            Id smaller = band(in_t, m.emit(spv::OpLogicalNot, t_bool, {in_v})), larger = band(m.emit(spv::OpLogicalNot, t_bool, {in_t}), in_v);
+            if (level_in) {
+                smaller = band(smaller, level_in);
+                larger = band(larger, level_in);
+            }
+            oob_note(oob_sampled(smaller, key), kOobViewSmaller);
+            oob_note(oob_sampled(larger, key), kOobViewLarger);
         }
     }
     Id guest_ptr(Id guest_u64) {
@@ -3471,7 +3503,7 @@ struct Translator {
             std::vector<Id> vals;
             for (const Id raw : raws) vals.push_back(img.kind == 1 ? raw : img.kind == 2 ? i(raw) : f(raw));
             const Id texel = img.kind ? m.emit(spv::OpCompositeConstruct, texel_type(img), vals) : vec4f(vals[0], vals[1], vals[2], vals[3]);
-            if (oob_base64) oob_image(img, arrayed, coords, op == 9 ? i(ld(vgpr_var(in.vaddr + ncoord))) : 0, true);
+            if (oob_base64) oob_image(img, dim, arrayed, coords, op == 9 ? i(ld(vgpr_var(in.vaddr + ncoord))) : 0, true, in);
             // gcn::set_image_store_bounds: GCN writes nothing outside the
             // image, so the lanes outside the view's size and layers skip it.
             Id inside = 0;
@@ -3506,7 +3538,7 @@ struct Translator {
                 ops.push_back(spv::IoLod);
                 ops.push_back(i(ld(vgpr_var(in.vaddr + ncoord))));
             }
-            if (oob_base64) oob_image(img, arrayed, coords, op == 1 ? ops.back() : 0, false);
+            if (oob_base64) oob_image(img, dim, arrayed, coords, op == 1 ? ops.back() : 0, false, in);
             const Id texel = texel_as_v4f(img, m.emit(spv::OpImageFetch, texel_type(img), ops));
             write_texel(in, texel);
             return;

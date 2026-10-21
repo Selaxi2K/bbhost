@@ -3525,8 +3525,9 @@ void oob_image_counting() {
         const gcn::LiftResult l = lift_array(ref);
         CHECK(spirv_valid(ref.spirv));
         CHECK(lifted_valid(l));
-        CHECK(count_op(ref.spirv, 234) == (on ? 3u : 0u));  // OpAtomicIAdd: the size, the level, the layer
-        CHECK(count_op(l.spirv, 234) == (on ? 3u : 0u));
+        // OpAtomicIAdd: the size, the level, the layer, and the view against the T# (smaller, larger).
+        CHECK(count_op(ref.spirv, 234) == (on ? 5u : 0u));
+        CHECK(count_op(l.spirv, 234) == (on ? 5u : 0u));
         CHECK(count_op(ref.spirv, 103) == (on ? 1u : 0u));  // OpImageQuerySizeLod
         CHECK(count_op(ref.spirv, 106) == (on ? 1u : 0u));  // OpImageQueryLevels
         CHECK(count_op(l.spirv, 103) == (on ? 1u : 0u));
@@ -3541,7 +3542,7 @@ void oob_image_counting() {
     gcn::set_oob_count(false);
     CHECK(spirv_valid(control.spirv) && lifted_valid(lk));
     CHECK(control.spirv != counting.spirv && lk.spirv != lc.spirv);
-    CHECK(count_op(control.spirv, 234) == 3 && count_op(lk.spirv, 234) == 3);
+    CHECK(count_op(control.spirv, 234) == 5 && count_op(lk.spirv, 234) == 5);
 }
 
 // Copies of a V#: a spill to lanes of a VGPR and back (v_writelane_b32 /
@@ -4880,8 +4881,9 @@ void oob_counting() {
         CHECK((ref.oob_slot < gcn::kOobSlots) == on);
         const gcn::LiftResult l = gcn::lift_compute_shader(p, o, ref);
         CHECK(lifted_valid(l, "the counting compute shader"));
-        CHECK(count_op(ref.spirv, 234) == (on ? 2u : 0u));  // OpAtomicIAdd: the store's size, the walk past the records
-        CHECK(count_op(l.spirv, 234) == (on ? 2u : 0u));
+        // OpAtomicIAdd: the store's size, the view against the T# (smaller, larger), the walk past the records.
+        CHECK(count_op(ref.spirv, 234) == (on ? 4u : 0u));
+        CHECK(count_op(l.spirv, 234) == (on ? 4u : 0u));
         CHECK(count_op(ref.spirv, 104) == (on ? 1u : 0u));  // OpImageQuerySize
         CHECK(count_op(l.spirv, 104) == (on ? 1u : 0u));
     }
