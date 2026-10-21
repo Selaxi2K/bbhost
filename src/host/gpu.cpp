@@ -6190,6 +6190,8 @@ namespace {
 constexpr std::uint64_t kScratchChunkBytes = 64ull << 20;
 constexpr std::uint64_t kScratchKeepBytes = 256ull << 20;
 std::atomic<std::uint64_t> g_scratch_created{0}, g_scratch_placed{0};
+std::atomic<std::int64_t> g_scratch_used_ms{0};      // when a chunk was last taken (steady ms)
+std::atomic<std::uint64_t> g_scratch_returned{0};  // chunks the memory keeper gave back in play
 std::atomic<std::uint64_t> g_scratch_refusals{0};  // chunks not made for want of room above the reserve
 void scratch_let_go_locked(const DevBuffer& b) {
     // Not kept while video memory is down to the reserve, nor one in host
@@ -6209,6 +6211,8 @@ void scratch_let_go_locked(const DevBuffer& b) {
 
 bool acquire_scratch_locked(DevBuffer& b, std::uint64_t size, VkDeviceSize& offset) {
     Gpu::Slot& sl = g.slots[g.slot];
+    g_scratch_used_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(),
+                            std::memory_order_relaxed);
     const std::uint64_t need = (size + 255) & ~255ull;
     if (g.scratch_cur.buffer && !g.scratch_users.count(g.scratch_cur.buffer)) g.scratch_cur_used = 0;
     if (!g.scratch_cur.buffer || g.scratch_cur_used + need > g.scratch_cur.size) {
@@ -6936,6 +6940,7 @@ void start_memory_reserve() {
     g_spare_play_blocks.store(spare_play, std::memory_order_relaxed);
     const bool keeper = env("BBHOST_MEMORY_KEEPER", 1) != 0;
     const bool staging_return = env("BBHOST_STAGING_RETURN", 0) != 0;
+    const bool scratch_return = env("BBHOST_SCRATCH_RETURN", 1) != 0;
     std::thread([=] {
         host_thread_set_name("bb-reserve");
         // The heap's blocks are of the memory type its first image asked for.
@@ -7076,6 +7081,7 @@ void start_memory_reserve() {
             // staging over the floor for 30 s, down to it, a chunk a turn).
             std::vector<VkDeviceMemory> gone;
             std::vector<DevBuffer> chunks;
+            DevBuffer scratch_gone;
             // Down to the reserve, an empty block goes back at once, spare or
             // not: the targets want the room more.
             const bool short_now = vram_within_reserve();
@@ -7098,6 +7104,17 @@ void start_memory_reserve() {
                         break;
                     }
                 }
+                // Untile scratch over one chunk, kept for a load's burst of
+                // uploads, goes back in play once no upload has taken a chunk
+                // for 10 s, a chunk a turn (BBHOST_SCRATCH_RETURN=0 keeps up
+                // to 256 MiB, as before).
+                if (scratch_return && gone.empty() && may_give && g.scratch_free_bytes > kScratchChunkBytes && !g.scratch_free.empty() &&
+                    steady_ms() - g_scratch_used_ms.load(std::memory_order_relaxed) >= 10000) {
+                    scratch_gone = g.scratch_free.back();
+                    g.scratch_free_bytes -= scratch_gone.size;
+                    g.scratch_free.pop_back();
+                    g_scratch_returned.fetch_add(1, std::memory_order_relaxed);
+                }
                 if (staging_return && g.staging_free_bytes > floor) {
                     if (over_floor_since == std::chrono::steady_clock::time_point{}) over_floor_since = now;
                     if (now - over_floor_since >= std::chrono::seconds(30) && may_give && gone.empty() && !g.staging_free.empty()) {
@@ -7108,6 +7125,15 @@ void start_memory_reserve() {
                 } else {
                     over_floor_since = {};
                 }
+            }
+            if (scratch_gone.buffer) {
+                vkDestroyBuffer(g.device, scratch_gone.buffer, nullptr);
+                vkFreeMemory(g.device, scratch_gone.memory, nullptr);
+                last_given = std::chrono::steady_clock::now();
+                static int said = 0;
+                if (said++ < 4)
+                    host_log("gpu: memory keeper: gave back %llu MiB of untile scratch no upload had used for 10 s (%llu MiB kept)",
+                             static_cast<unsigned long long>(scratch_gone.size >> 20), static_cast<unsigned long long>(g.scratch_free_bytes >> 20));
             }
             if (!gone.empty() || !chunks.empty()) {
                 const auto t0 = std::chrono::steady_clock::now();
