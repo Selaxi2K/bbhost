@@ -1875,6 +1875,103 @@ int check_wind_sources(int cases, u64 sfx, u64 manager) {
     return bad;
 }
 
+// --- the wind system's warm-up ---------------------------------------------------
+
+// The wind system (*0x5940e00) as its receivers' update (sub_27174e0, the game's own here) reads it, with no receivers:
+// its list +0x18 empty, its counts +0x20 and +0x38 0, the reset's one-shot +0x4c, the warm-up +0x4d and its count +0x50;
+// the thread's runtime heap (rel_dlruntime_obj_mb) and gettimeofday the test's. Frame sequences at 60, 120, 144 and
+// jittered rates through ours, the gate on or off, against the game's once a whole step (at 30): after every whole step
+// the system's bytes the game's at 30 after as many whole steps (the warm-up ends on the same whole step: 60 of them,
+// 2 s); between whole steps +0x4d and +0x50 untouched and every other byte the game's own call's (+0x4c cleared by the
+// first call, as the game clears it).
+u8* runtime_caps(u8* out, void*, int) {
+    std::memset(out, 0, 8);
+    out[0] = 0x20;  // a heap containers may use
+    return out;
+}
+void* runtime_alloc(void*, std::size_t size, std::size_t) { return std::malloc(size ? size : 1); }
+void runtime_free(void*, void* p) { std::free(p); }
+void* g_runtime_vt[16];
+alignas(16) u8 g_runtime[0x100];
+GUEST_ABI int stub_gettimeofday(void* tv, void*) {
+    std::memset(tv, 0, 16);
+    return 0;
+}
+struct SeenWarmup {
+    long cases = 0, frames = 0, held = 0, ended = 0;
+} g_seen_warmup;
+int check_wind_warmup(int cases) {
+    const auto game = eboot_kit::fn<WindReceiversFn>(kWindReceivers);
+    int bad = 0;
+    for (int c = 0; c < cases; ++c) {
+        g_blocks.clear();
+        u64 sys[2];
+        for (u64& w : sys) {
+            w = block(0x80);
+            const u64 head = block(0x20);
+            store<u64>(head, head);
+            store<u64>(head + 8, head);
+            store<u64>(w + 0x18, head);
+        }
+        // a reset just made, a warm-up partway, or none
+        const int kind = g_rng.range(0, 2);
+        const u8 reset = kind == 0 ? 1 : g_rng.chance(0.2) ? 1 : 0, on = kind == 2 ? 0 : 1;
+        const u32 left = kind == 0 ? 60u : static_cast<u32>(g_rng.range(0, 70));
+        for (const u64 w : sys) {
+            store<u8>(w + 0x4c, reset);
+            store<u8>(w + 0x4d, on);
+            store<u32>(w + 0x50, left);
+        }
+        const int rate_kind = g_rng.range(0, 3);
+        const int frames = g_rng.range(4, 400);
+        const bool gate = g_rng.chance(0.7);
+        double carry = 0.0;
+        const char* why = nullptr;
+        int at = -1;
+        ++g_seen_warmup.cases;
+        auto bytes = [](u64 w) {
+            std::vector<u8> v(reinterpret_cast<u8*>(w), reinterpret_cast<u8*>(w) + 0x80);
+            std::memset(v.data() + 0x18, 0, 8);  // the list heads are each one's own
+            return v;
+        };
+        for (int f = 0; f < frames && !why; ++f) {
+            const double dt = rate_kind == 0 ? 1.0 / 60 : rate_kind == 1 ? 1.0 / 120 : rate_kind == 2 ? 1.0 / 144 : g_rng.value(1.0f / 150, 1.0f / 40);
+            const sfx_schedule::Frame fr = sfx_schedule::next(carry, dt, 30);
+            const bool tick = fr.whole > 0;
+            const float step = tick ? 1.0f / 30.0f : 0.0f;
+            // the game's own call on a copy: what this frame's call would be as the game's
+            const u64 copy = block(0x80);
+            std::memcpy(reinterpret_cast<void*>(copy), reinterpret_cast<void*>(sys[0]), 0x80);
+            game(copy, step);
+            decomp_sfx_gate_frame(!tick && gate);
+            decomp_sfx_step_frame(!tick);
+            const u8 on0 = load<u8>(sys[0] + 0x4d);
+            const u32 left0 = load<u32>(sys[0] + 0x50);
+            sfx_wind_receivers(sys[0], step);
+            decomp_sfx_step_frame(false);
+            decomp_sfx_gate_frame(false);
+            ++g_seen_warmup.frames;
+            if (!tick) {
+                ++g_seen_warmup.held;
+                std::vector<u8> want = bytes(copy);
+                want[0x4d] = on0;
+                std::memcpy(want.data() + 0x50, &left0, 4);
+                if (bytes(sys[0]) != want) why = "between whole steps: the count held, the rest the game's own call's";
+            } else {
+                // the game at 30, once this whole step
+                game(sys[1], step);
+                if (bytes(sys[0]) != bytes(sys[1])) why = "after a whole step: the game's at 30";
+                g_seen_warmup.ended += on && !load<u8>(sys[1] + 0x4d) && load<u8>(sys[1] + 0x4c) == 0 && left == 0;
+            }
+            if (why) at = f;
+        }
+        if (why && ++bad <= 6 && !g_quiet)
+            std::printf("wind warm-up case %d (reset %u, on %u, left %u, rate kind %d, gate %d): %s differs at frame %d\n", c, reset, on, left, rate_kind,
+                        gate, why, at);
+    }
+    return bad;
+}
+
 // --- the ribbon (FFX-format GX type 0x28) under the smooth steps --------------------------
 
 // The ribbon's set-up allocates its point arrays from an allocator (vtable +0x58: (allocator, size, alignment)).
@@ -2536,6 +2633,37 @@ int main() {
         }
     }
     g_sfx_gate_mutant = 0;
+    // The wind system's warm-up: the thread's runtime heap and gettimeofday the test's.
+    g_runtime_vt[0x20 / 8] = reinterpret_cast<void*>(&runtime_caps);
+    g_runtime_vt[0x58 / 8] = reinterpret_cast<void*>(&runtime_alloc);
+    g_runtime_vt[0x70 / 8] = reinterpret_cast<void*>(&runtime_free);
+    {
+        void* const vt = g_runtime_vt;
+        std::memcpy(g_runtime + 0x28, &vt, 8);
+        u8* const runtime = g_runtime;
+        std::memcpy(static_cast<u8*>(eboot_kit::tcb()) - 0x730, &runtime, 8);  // rel_dlruntime_obj_mb
+    }
+    if (!eboot_kit::bind("gettimeofday", reinterpret_cast<const void*>(&stub_gettimeofday))) {
+        std::printf("decomp_sfx_step_gate: no gettimeofday import to bind\n");
+        return 1;
+    }
+    g_game_wind_receivers = eboot_kit::at(kWindReceivers);
+    g_quiet = false;
+    g_rng.specials = false;
+    const int wwbad = check_wind_warmup(kCases);
+    std::printf("decomp_sfx_step_gate: %d wind system warm-up cases (%ld frames, %ld between whole steps with the count held, %ld warm-ups ended), "
+                "%d differ\n",
+                kCases, g_seen_warmup.frames, g_seen_warmup.held, g_seen_warmup.ended, wwbad);
+    if (wwbad) return 1;
+    g_quiet = true;
+    for (const int m : {49, 50}) {
+        g_sfx_gate_mutant = m;
+        if (!check_wind_warmup(2000)) {
+            std::printf("decomp_sfx_step_gate: mutant %d not caught by the wind warm-up\n", m);
+            ++missed;
+        }
+    }
+    g_sfx_gate_mutant = 0;
     // The ribbon last: its set-up's allocator the test's; the manager's time scale per case.
     store<u64>(reinterpret_cast<u64>(g_ribbon_alloc_vt) + 0x58, reinterpret_cast<u64>(&stub_ribbon_alloc));
     store<u64>(reinterpret_cast<u64>(g_ribbon_alloc), reinterpret_cast<u64>(g_ribbon_alloc_vt));
@@ -2583,6 +2711,6 @@ int main() {
         }
     }
     g_sfx_gate_mutant = 0;
-    std::printf("decomp_sfx_step_gate: %d of 46 mutants caught\n", 46 - missed);
+    std::printf("decomp_sfx_step_gate: %d of 48 mutants caught\n", 48 - missed);
     return missed ? 1 : 0;
 }

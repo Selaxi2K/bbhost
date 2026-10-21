@@ -75,6 +75,7 @@ constexpr u64 kWobbleBBase = 0x2e8bfd0;        //   its base motion
 constexpr u64 kWobbleFollow = 0x2e896f0;       // motion 0x570e690's update: the lerp toward the parent, then kWobbleA
 constexpr u64 kLightFades = 0x12e5500;         // the effect manager's fading GX lights (+0x118): (list, step)
 constexpr u64 kWindSourcesStep = 0x1314660;    // the wind sources' registry (*0x58b0bb0) stepped: (registry, step)
+constexpr u64 kWindReceivers = 0x27174e0;      // the wind system's (*0x5940e00) receivers' update: (system, step)
 
 using InstanceUpdate = GUEST_ABI u8 (*)(u64 instance, u64 context, float step);
 using LightUpdate = GUEST_ABI void (*)(u64 module, u64 params, u64 context);
@@ -87,6 +88,7 @@ using MotionFn = GUEST_ABI void (*)(u64 motion, u64 node, const float* step, u64
 using GxRecordFn = GUEST_ABI void (*)(u64 record, u64 item);
 using LightFadesFn = GUEST_ABI void (*)(u64 list, float step);
 using WindStepFn = GUEST_ABI void (*)(u64 registry, float step);
+using WindReceiversFn = GUEST_ABI void (*)(u64 system, float step);
 
 void* g_game_instance = nullptr;
 void* g_game_light = nullptr;
@@ -96,6 +98,7 @@ void* g_game_wobble_follow = nullptr;
 void* g_game_gx_record = nullptr;
 void* g_game_light_fades = nullptr;
 void* g_game_wind_step = nullptr;
+void* g_game_wind_receivers = nullptr;
 
 std::atomic<u32> g_between{0};
 std::atomic<u32> g_step_between{0};  // a frame between whole effect steps, the gate on or off (decomp_sfx_step_frame)
@@ -108,7 +111,8 @@ std::atomic<u64> g_lights_smooth{0}, g_lights_counted{0}, g_fades_smooth{0};
 std::atomic<u64> g_frames_between{0}, g_instances_held{0}, g_lights_held{0}, g_motions_held{0}, g_still_frames{0}, g_records_held{0};
 std::atomic<u64> g_ribbons_between{0}, g_ribbons_whole{0}, g_ribbons_unmarked{0};
 std::atomic<u64> g_wind_steps_smooth{0}, g_wind_steps_other{0}, g_records_whole{0}, g_motions_smooth{0};
-std::atomic<u64> g_records_2712_held{0};
+std::atomic<u64> g_records_2712_held{0}, g_warmups_held{0};
+std::atomic<u32> g_hold_warmup{1};  // BBHOST_SFX_WIND_WARMUP_HOLD=0: the wind system's warm-up counts every frame, as before
 std::atomic<u32> g_hold_2712{1};  // BBHOST_SFX_2712_HOLD=0: type 0x2712's update runs on the frames between whole steps, as before
 
 // The ribbons (their GX types) of the instances the smooth steps run this frame, marked as smooth_update takes an
@@ -561,6 +565,36 @@ DECOMP_LEAF void sfx_wind_sources_step(u64 registry, float step) {
     game(registry, s);
 }
 
+// The wind system's receivers' update (sub_27174e0, read in Binary Ninja; the
+// effect manager's update calls it at 0x26ff41a with its step). After a reset
+// (sub_27136a0, sub_2717100: +0x4c = 1, +0x4d = 1, +0x50 = 60) it counts its
+// calls - +0x50 down by one a call while +0x4d is set, then +0x4d cleared - and
+// clears the reset's one-shot +0x4c; while either is set the grass and trees'
+// sway (sub_2713870) settles (each receiver's call count +0xc30, its first
+// call's damping of +0x6a0). The receivers' callbacks it hands the step to
+// (+0x180, sub_132c730) are never set - their set-up (sub_132c230) zeroes them
+// and nothing writes them - and the rest of the update (each receiver's
+// overlapping wind sources, sub_132c750; its own time +0x58) does not read the
+// step. So the count is the update's one counted part: 60 calls, 2 s at 30, and
+// 1 s at 60 or 0.5 s at 120 with the frames between whole steps counting too.
+// On such a frame - the gate on or off, not the game's own still frame - the
+// count (+0x4d, +0x50) waits for the whole step: the rest of the update runs as
+// the game's, +0x4c cleared by the first call as the game clears it.
+DECOMP_LEAF void sfx_wind_receivers(u64 system, float step) {
+    const auto game = reinterpret_cast<WindReceiversFn>(g_game_wind_receivers);
+    if (!g_hold_warmup.load(std::memory_order_relaxed) || MUTANT(49) || !between_steps()) {
+        game(system, step);
+        return;
+    }
+    g_warmups_held.fetch_add(1, std::memory_order_relaxed);
+    const u8 on = load<u8>(system + 0x4d);
+    const u32 left = load<u32>(system + 0x50);
+    game(system, step);
+    if (MUTANT(50)) return;
+    store<u8>(system + 0x4d, on);
+    store<u32>(system + 0x50, left);
+}
+
 // The wobble motions. Motion classes 0x570e6d0 and 0x570e690 (whose update,
 // sub_2e896f0, ends in the first's, sub_2e89d10) and 0x570e8d0 (sub_2e8e430)
 // run their base motion and then count their calls - +0x6c against the
@@ -881,6 +915,9 @@ constexpr std::uint8_t kGxRecordEntry[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0
 constexpr std::uint8_t kLightFadesEntry[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x18};
 // The wind sources' step: push rbp; mov rbp, rsp; push r14, rbx; sub rsp, 0x10; vmovss [rbp-0x14], xmm0.
 constexpr std::uint8_t kWindStepEntry[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x56, 0x53, 0x48, 0x83, 0xec, 0x10, 0xc5, 0xfa, 0x11, 0x45, 0xec};
+// The wind receivers' update: push rbp; mov rbp, rsp; push r15..rbx; sub rsp, 0x78; vmovss [rbp-0x8c], xmm0.
+constexpr std::uint8_t kWindReceiversEntry[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53,
+                                                0x48, 0x83, 0xec, 0x78, 0xc5, 0xfa, 0x11, 0x85, 0x74, 0xff, 0xff, 0xff};
 
 void report() {
     if (!decomp_sfx_gate_placed()) return;
@@ -890,6 +927,8 @@ void report() {
              static_cast<ull>(g_frames_between.load()), static_cast<ull>(g_instances_held.load()), static_cast<ull>(g_lights_held.load()),
              static_cast<ull>(g_motions_held.load()), static_cast<ull>(g_records_held.load()), static_cast<ull>(g_records_2712_held.load()),
              g_hold_2712.load(), static_cast<ull>(g_still_frames.load()));
+    host_log("decomp:   the wind system's warm-up count held for the whole step on %llu frames (BBHOST_SFX_WIND_WARMUP_HOLD=%u)",
+             static_cast<ull>(g_warmups_held.load()), g_hold_warmup.load());
     if (!g_smooth.load()) return;
     host_log("decomp: the smooth effect steps: %llu instance updates took them, %llu stayed on the held frames for a class off the converted "
              "list (%zu classes on it)",
@@ -917,6 +956,7 @@ void report() {
 void decomp_sfx_step_gate_add() {
     const char* area = "sfx";
     if (const char* e = std::getenv("BBHOST_SFX_2712_HOLD"); e && (e[0] == '0' || e[0] == '1')) g_hold_2712.store(e[0] == '1' ? 1u : 0u);
+    if (const char* e = std::getenv("BBHOST_SFX_WIND_WARMUP_HOLD"); e && (e[0] == '0' || e[0] == '1')) g_hold_warmup.store(e[0] == '1' ? 1u : 0u);
     if (!g_hold_2712.load())
         host_log("decomp: GPU type 0x2712's update runs on the frames between whole effect steps, as before (BBHOST_SFX_2712_HOLD=0): "
                  "its emissions there never reach its grid");
@@ -938,4 +978,6 @@ void decomp_sfx_step_gate_add() {
                 DecompKind::Leaf, &g_game_light_fades});
     decomp_add({"sub_1314660", area, kWindSourcesStep, kWindStepEntry, sizeof(kWindStepEntry), reinterpret_cast<void*>(&sfx_wind_sources_step),
                 DecompKind::Leaf, &g_game_wind_step});
+    decomp_add({"sub_27174e0", area, kWindReceivers, kWindReceiversEntry, sizeof(kWindReceiversEntry),
+                reinterpret_cast<void*>(&sfx_wind_receivers), DecompKind::Leaf, &g_game_wind_receivers});
 }
