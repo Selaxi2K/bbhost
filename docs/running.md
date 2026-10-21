@@ -223,7 +223,8 @@ and `BBHOST_HEAP_DRAIN=0` turn the split and the draining off);
 `BBHOST_TESS_RING=whole` and `BBHOST_SCRATCH_RETURN=0` keep the tessellation
 ring and the texture upload scratch at their largest from the start. On a GPU
 without sparse binding (AMD, integrated GPUs) the vertex data's mirrors are
-made 64 MiB at a time as the game's meshes need them, rather than a whole
+made 64 MiB at a time as the game's meshes need them (16 MiB on an
+integrated GPU; `BBHOST_SHADOW_WINDOW_MB` sets it), rather than a whole
 gigabyte each (`BBHOST_SHADOW_WINDOWS=0` goes back to whole ones).
 
 **AMD on Linux, no picture.** AMD's kernel driver only imports anonymous

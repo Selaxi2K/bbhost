@@ -171,18 +171,25 @@ struct Mirror {
     std::vector<Window> windows;
 };
 constexpr std::uint32_t kBlockPages = 1024;  // 64 MiB blocks
-// A window's pages (BBHOST_SHADOW_WINDOWS): 64 MiB, or BBHOST_SHADOW_WINDOW_MB
-// (a power of two from 16 to 512) - larger windows hold more pages no draw
-// reads, smaller ones send more ranges across a window's edge to host memory.
-const std::uint32_t kWindowPages = [] {
-    std::uint64_t mb = 64;
-    if (const char* e = std::getenv("BBHOST_SHADOW_WINDOW_MB"); e && *e) {
-        const std::uint64_t v = std::strtoull(e, nullptr, 10);
-        if (v >= 16 && v <= 512 && (v & (v - 1)) == 0) mb = v;
-    }
-    return static_cast<std::uint32_t>((mb << 20) / kPageBytes);
-}();
-const std::uint64_t kWindowBytes = static_cast<std::uint64_t>(kWindowPages) * kPageBytes;
+// A window's pages (BBHOST_SHADOW_WINDOWS): 64 MiB on a discrete GPU, 16 on an
+// integrated one, or BBHOST_SHADOW_WINDOW_MB (a power of two from 16 to 512).
+// Larger windows hold more pages no draw reads, smaller ones send more ranges
+// across a window's edge to host memory - on an integrated GPU the same RAM:
+// on the Radeon 680M at a lamp 16 MiB windows held 1,248 MiB where 64 MiB ones
+// held 1,728, at the same frame rate, with 6.8 M ranges read in place instead
+// of 1.6 M. Read when the first mirror is made, after the device is known.
+std::uint32_t window_pages() {
+    static const std::uint32_t pages = [] {
+        std::uint64_t mb = g.integrated ? 16 : 64;
+        if (const char* e = std::getenv("BBHOST_SHADOW_WINDOW_MB"); e && *e) {
+            const std::uint64_t v = std::strtoull(e, nullptr, 10);
+            if (v >= 16 && v <= 512 && (v & (v - 1)) == 0) mb = v;
+        }
+        return static_cast<std::uint32_t>((mb << 20) / kPageBytes);
+    }();
+    return pages;
+}
+std::uint64_t window_bytes() { return static_cast<std::uint64_t>(window_pages()) * kPageBytes; }
 VkSemaphore g_bind_sem[kSlots] = {};
 
 // Without sparse binding a mirror was a whole chunk: 1 GiB of video memory for
@@ -412,9 +419,9 @@ bool mirror_room(std::uint64_t bytes) {
 bool window_ready(Mirror& m, std::uint32_t w) {
     Mirror::Window& win = m.windows[w];
     if (win.buffer) return true;
-    if (!mirror_room(kWindowBytes)) return false;
+    if (!mirror_room(window_bytes())) return false;
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-    bci.size = kWindowBytes;
+    bci.size = window_bytes();
     bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
     if (vkCreateBuffer(g.device, &bci, nullptr, &win.buffer) != VK_SUCCESS) {
         win.buffer = VK_NULL_HANDLE;
@@ -475,14 +482,14 @@ Mirror* mirror_for(std::uint32_t chunk) {
     }
     if (g_windows_on) {
         m.windowed = true;
-        m.windows.assign(kChunkBytes / kWindowBytes, Mirror::Window{});
+        m.windows.assign(kChunkBytes / window_bytes(), Mirror::Window{});
         m.pages.resize(kPagesPerChunk);
         m.ok.assign(kPagesPerChunk / 64, 0);
         m.dyn.assign(kPagesPerChunk / 64, 0);
         m.gpu.assign(kPagesPerChunk / 64, 0);
         host_log("buffer shadow: mirror for chunk %u made %llu MiB window by window as its pages are copied (no sparse binding; "
                  "BBHOST_SHADOW_WINDOWS=0: whole)",
-                 chunk, static_cast<unsigned long long>(kWindowBytes >> 20));
+                 chunk, static_cast<unsigned long long>(window_bytes() >> 20));
         return &m;
     }
     if (g_live && g_mirror_bytes + kChunkBytes <= g_mirror_cap && !mirror_room(kChunkBytes)) {
@@ -1228,13 +1235,13 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
     // the end of its buffer.)
     if (p1 >= m->pages.size()) return;
     // A windowed mirror serves a range from one window's buffer.
-    const std::uint32_t win = m->windowed ? p0 / kWindowPages : 0;
-    if (m->windowed && p1 / kWindowPages != win) {
+    const std::uint32_t win = m->windowed ? p0 / window_pages() : 0;
+    if (m->windowed && p1 / window_pages() != win) {
         ++g_window_crossings;
         bump(g_imports);
         return;
     }
-    const VkDeviceSize win_base = static_cast<VkDeviceSize>(win) * kWindowBytes;
+    const VkDeviceSize win_base = static_cast<VkDeviceSize>(win) * window_bytes();
     const auto mirror_buffer = [&] { return m->windowed ? m->windows[win].buffer : m->buffer; };
     if (g_verify) {
         for (std::uint32_t p = p0; p <= p1; ++p) {
@@ -2408,7 +2415,7 @@ void shadow_vram_census_locked(ShadowCensus& c) {
         } else if (m.windowed) {
             for (const Mirror::Window& w : m.windows) {
                 if (!w.buffer) continue;
-                c.block_bytes += kWindowBytes;  // a window is a block of its own
+                c.block_bytes += window_bytes();  // a window is a block of its own
                 ++c.blocks;
             }
         } else if (m.memory) {
@@ -2463,7 +2470,7 @@ std::string shadow_report() {
     if (g_windows_made || g_window_crossings) {
         char wn[160];
         std::snprintf(wn, sizeof(wn), "; mirror windows of %llu MiB made %llu, ranges across two windows read from host memory %llu",
-                      static_cast<unsigned long long>(kWindowBytes >> 20), static_cast<unsigned long long>(g_windows_made),
+                      static_cast<unsigned long long>(window_bytes() >> 20), static_cast<unsigned long long>(g_windows_made),
                       static_cast<unsigned long long>(g_window_crossings));
         out += wn;
     }
