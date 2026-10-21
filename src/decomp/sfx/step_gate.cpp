@@ -171,15 +171,15 @@ constexpr u64 kManagerOf = 0x70;  // SprjSfx +0x70: the effect manager (its time
 // counted part sfx_light_update runs once a whole step
 // (tests/decomp/sfx_step_gate_test.cpp). Off the list, and so on the held
 // frames as with 30: the wobble motions 0x570e6d0, 0x570e690 and 0x570e8d0
-// (they count their updates), the motions 0x570e5d0 and 0x570e610 (Euler
-// steps under the effects' gravity and wind, read but not yet held to the
-// game's code), the module 0x5760f20, the GPU particle types 0x2712
+// (they count their updates), the module 0x5760f20, the GPU particle types 0x2712
 // (0x56eb030: whole grid passes of elapsed x 30) and 0x2713 (0x56eb0d0: its
 // parameters are curves read at the elapsed time), and the FFX-format GX type
 // 0x28 (0x56e3620: a ribbon, its points added an update with a draw of the FX
 // RNG).
 constexpr u64 kConverted[] = {
     0x570e650,  // motion: velocity along itself by step x speed curve x +0x24, position by step x velocity, facing the move
+    0x570e610,  // motion: the same with gravity (data_5ad1150 x a curve at the node's time, in the parent's frame) by step
+    0x570e5d0,  // motion: the same with the effects' wind world's force by step, and its drift added to the move
     0x570e790,  // motion: turned by step x its rates (or three curves)
     0x570e710,  // motion: a transform; never reads its step
     0x570e910,  // motion: its position a curve's value at the node's time; never reads its step
