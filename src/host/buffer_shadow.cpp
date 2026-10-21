@@ -2269,6 +2269,8 @@ void shadow_flush_at_load_locked(Gpu::Slot& slot) {
     }
 }
 
+std::uint64_t shadow_room_refusals_locked() { return g_room_refusals + g_room_skips; }
+
 void shadow_vram_census_locked(ShadowCensus& c) {
     c = ShadowCensus{};
     c.live = g_live;

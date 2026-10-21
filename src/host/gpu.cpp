@@ -6447,6 +6447,25 @@ std::uint64_t image_heap_vram_free_locked(int cls) {
     return free;
 }
 
+bool image_heap_classes_on() { return g_heap_classes; }
+
+int image_heap_drain_candidate_locked(std::uint64_t* class_free, std::uint64_t* used, const std::vector<int>& skip) {
+    std::uint64_t free = 0;
+    int best = -1;
+    std::size_t blocks = 0;
+    for (std::size_t k = 0; k < g_heap.size(); ++k) {
+        const HeapBlock& b = g_heap[k];
+        if (b.memory == VK_NULL_HANDLE || b.cls != kHeapTextures || g.mem_props.memoryTypes[b.type].heapIndex != g.local_heap) continue;
+        free += kHeapBlock - b.used;
+        ++blocks;
+        if (std::find(skip.begin(), skip.end(), static_cast<int>(k)) != skip.end()) continue;
+        if (best < 0 || b.used < g_heap[static_cast<std::size_t>(best)].used) best = static_cast<int>(k);
+    }
+    if (class_free) *class_free = free;
+    if (used) *used = best >= 0 ? g_heap[static_cast<std::size_t>(best)].used : 0;
+    return blocks >= 2 ? best : -1;  // the last texture block is never drained into nothing
+}
+
 int image_memory_class_locked(const ImageMemory& m) {
     if (m.block < 0 || static_cast<std::size_t>(m.block) >= g_heap.size()) return -2;
     return g_heap[static_cast<std::size_t>(m.block)].cls;
@@ -6827,13 +6846,16 @@ std::string video_memory_report_locked(bool at_exit) {
                   blocks_vram, mib(used_vram), static_cast<ull>(g_spare_play_blocks.load(std::memory_order_relaxed)), mib(scratch_kept));
     out += buf;
     if (g_heap_classes) {
+        std::uint64_t drained[4] = {};
+        textures_drain_counts(drained);
         std::snprintf(buf, sizeof(buf),
                       "\n[bbhost]   video memory, the image heap's blocks by what they hold (BBHOST_HEAP_CLASSES): targets %zu (%llu in use, %llu free), textures %zu "
                       "(%llu in use, %llu free), empty %zu; GPU-written surfaces in the textures' blocks %llu (%llu), uploaded textures in the "
-                      "targets' %llu (%llu)",
+                      "targets' %llu (%llu); drained so far %llu block(s), %llu textures (%llu MiB), %llu left for a GPU-written surface",
                       cls_blocks[0], mib(cls_used[0]), mib(cls_free[0]), cls_blocks[1], mib(cls_used[1]), mib(cls_free[1]), cls_blocks[2],
                       mib(c.gpu_written_in_tex.bytes), static_cast<ull>(c.gpu_written_in_tex.n), mib(c.tex_in_targets.bytes),
-                      static_cast<ull>(c.tex_in_targets.n));
+                      static_cast<ull>(c.tex_in_targets.n), static_cast<ull>(drained[0]), static_cast<ull>(drained[1]), mib(drained[2]),
+                      static_cast<ull>(drained[3]));
         out += buf;
     }
     if (c.rt_host.n || c.tex_host.n) {

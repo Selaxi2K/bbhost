@@ -709,6 +709,16 @@ enum HeapClass : int { kHeapTargets = 0, kHeapTextures = 1 };
 bool image_memory_alloc(const VkMemoryRequirements& req, ImageMemory& out, bool texture = false, int cls = -1);
 // The class of the block `m` was placed in (-1: none, -2: memory of its own).
 int image_memory_class_locked(const ImageMemory& m);
+bool image_heap_classes_on();  // BBHOST_HEAP_CLASSES
+// The textures' block in video memory with the least in use, not one in
+// `skip` (-1: none, or only one texture block), what it has in use, and the
+// free room in all the textures' blocks together.
+int image_heap_drain_candidate_locked(std::uint64_t* class_free, std::uint64_t* used, const std::vector<int>& skip);
+// The textures' blocks drain (textures.cpp, BBHOST_HEAP_DRAIN): see there.
+void drain_texture_blocks_locked();
+// The drain so far: blocks emptied, textures and MiB taken out, blocks left
+// because a surface the GPU wrote sits in them.
+void textures_drain_counts(std::uint64_t out[4]);
 // The video memory this process may still take, in bytes (negative: over
 // budget): BBHOST_TEST_VRAM_MB's limit less what our allocations hold against
 // it, else the driver's budget for the heap less its usage
@@ -1092,6 +1102,10 @@ struct ShadowCensus {
     std::uint32_t windows = 0;  // 64 MiB windows of the chunks that hold a page copy or a bound page
 };
 void shadow_vram_census_locked(ShadowCensus& c);
+// Draws the mirrors' live share refused room so far (refused copies and the
+// draws read from host memory while refused): a sign that video memory the
+// image heap's blocks hold idle would be better used by the mirrors.
+std::uint64_t shadow_room_refusals_locked();
 std::uint64_t fnv1a(const void* data, std::size_t n, std::uint64_t h = 1469598103934665603ull);
 void bind_dummy_images(VkDescriptorSet set, const gcn::TranslateResult& meta, std::vector<VkWriteDescriptorSet>& writes,
                        std::vector<VkDescriptorImageInfo>& infos, VkDescriptorImageInfo& smp_info);

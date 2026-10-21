@@ -3939,6 +3939,7 @@ void textures_before_submit() {
     retire_surfaces_locked();
     image_reuse_sweep_locked();
     evict_cold_surfaces_locked();
+    drain_texture_blocks_locked();
     textures_return_from_host_locked();
 }
 
@@ -4007,6 +4008,124 @@ void evict_cold_surfaces_locked() {
                  static_cast<unsigned long long>(n), static_cast<unsigned long long>(idle_ms / 1000),
                  static_cast<unsigned long long>(freed >> 20), static_cast<unsigned long long>(g_evicted_surfaces),
                  static_cast<unsigned long long>(g_evicted_bytes >> 20), static_cast<unsigned long long>(g_evicted_ahead));
+}
+
+// The textures' blocks drain (BBHOST_HEAP_DRAIN, on unless 0, with the
+// image heap's classes): a block goes back to the memory keeper only once
+// nothing is left in it, and the textures an area leaves behind keep most
+// blocks a little used. In play, once a second, while the textures' blocks
+// hold more than a block and a half of free room between them, the textures
+// in the one with the least in use (half of it at most) go - those no bind
+// has looked up for 2 s at once, the others 16 MiB a turn, since a texture
+// a draw still binds is made again at its next bind, in a fuller block. A
+// block holding a surface the GPU wrote (its image holds what guest memory
+// does not) is left as it is. The emptied block is the keeper's to give
+// back, as any empty one. While the mirrors' live share is refused room
+// (a card with little video memory, where every mirror page the image heap
+// holds idle sends vertex reads across the bus), half a block of free room
+// is enough, a block with up to 192 MiB in use is drained, 32 MiB a turn.
+std::uint64_t g_drained_blocks = 0, g_drained_surfaces = 0, g_drained_bytes = 0, g_drain_skipped = 0;
+
+void drain_texture_blocks_locked() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_HEAP_DRAIN");
+        return !(e && e[0] == '0');
+    }();
+    if (!on || !image_heap_classes_on() || loading_screen_now()) return;
+    static std::uint64_t last_ms = 0;
+    const std::uint64_t now = now_ms();
+    if (now - last_ms < 1000) return;
+    last_ms = now;
+    static std::uint64_t refusals_seen = 0;
+    const std::uint64_t refusals = shadow_room_refusals_locked();
+    const bool pressed = refusals != refusals_seen;
+    refusals_seen = refusals;
+    constexpr std::uint64_t kBlock = 256ull << 20, kHotMs = 2000;
+    const std::uint64_t holes_at = pressed ? kBlock / 2 : kBlock * 3 / 2, most_used = pressed ? 192ull << 20 : 128ull << 20,
+                        hot_per_turn = pressed ? 32ull << 20 : 16ull << 20;
+    std::vector<int> skip;
+    for (int tries = 0; tries < 4; ++tries) {
+        std::uint64_t holes = 0, used = 0;
+        const int block = image_heap_drain_candidate_locked(&holes, &used, skip);
+        if (block < 0 || holes < holes_at || used > most_used) return;
+        // What the block holds, and whether all of it can be made again.
+        std::vector<std::uint64_t> bases;
+        bool pinned = false;
+        for (const auto& [base, sf] : g_surfaces) {
+            if (!sf.image || sf.memory.block != block || surface_in_host(sf)) continue;
+            if (sf.gpu_written || sf.copied_mips || sf.failed) {
+                pinned = true;
+                break;
+            }
+            bases.push_back(base);
+        }
+        bool other = false;  // copies of targets' regions and level aliases are made again at their next bind too
+        for (const auto& [key, reg] : g_rt_regions) other |= reg.img.image && reg.img.memory.block == block;
+        for (const auto& [key, al] : g_level_aliases) other |= al.img.image && al.img.memory.block == block;
+        if (pinned) {
+            ++g_drain_skipped;
+            skip.push_back(block);
+            continue;
+        }
+        std::uint64_t hot = 0, n = 0, bytes = 0;
+        for (const std::uint64_t base : bases) {
+            auto it = g_surfaces.find(base);
+            if (it == g_surfaces.end()) continue;
+            Surface& sf = it->second;
+            const bool recent = sf.used_ms && now - sf.used_ms < kHotMs;
+            if (recent && hot >= hot_per_turn) continue;
+            if (recent) hot += sf.memory.size;
+            bytes += sf.memory.size;
+            ++n;
+            for (auto& v : sf.views) defer_destroy_view(v.second);
+            defer_destroy_image(sf.image, sf.memory);
+            if (g_last_view_surface == &sf) g_last_view_surface = nullptr;
+            note_surface_erased(sf);
+            g_surfaces.erase(it);
+        }
+        if (other) {
+            for (auto it = g_rt_regions.begin(); it != g_rt_regions.end();) {
+                if (it->second.img.image && it->second.img.memory.block == block) {
+                    bytes += it->second.img.memory.size;
+                    drop_rt_region(it->second);
+                    it = g_rt_regions.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            for (auto it = g_level_aliases.begin(); it != g_level_aliases.end();) {
+                if (it->second.img.image && it->second.img.memory.block == block) {
+                    bytes += it->second.img.memory.size;
+                    invalidate_rt_views(it->second.img.base);
+                    defer_destroy_view(it->second.img.view);
+                    defer_destroy_image(it->second.img.image, it->second.img.memory);
+                    it = g_level_aliases.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        if (!bytes) return;
+        bump_view_epoch();
+        g_drained_surfaces += n;
+        g_drained_bytes += bytes;
+        if (bytes >= used) ++g_drained_blocks;
+        static int logs = 0;
+        if (logs++ < 12)
+            host_log("texture: the textures' image heap blocks hold %llu MiB of free room: %llu textures (%llu MiB, %llu MiB of them bound "
+                     "in the last 2 s) out of the block with the least in use (%llu MiB), made again at their next bind (BBHOST_HEAP_DRAIN=0 "
+                     "keeps them)",
+                     static_cast<unsigned long long>(holes >> 20), static_cast<unsigned long long>(n), static_cast<unsigned long long>(bytes >> 20),
+                     static_cast<unsigned long long>(hot >> 20), static_cast<unsigned long long>(used >> 20));
+        return;
+    }
+}
+
+void textures_drain_counts(std::uint64_t out[4]) {
+    out[0] = g_drained_blocks;
+    out[1] = g_drained_surfaces;
+    out[2] = g_drained_bytes;
+    out[3] = g_drain_skipped;
 }
 
 // Textures a shortage (or the reserve) put in host memory come back once
