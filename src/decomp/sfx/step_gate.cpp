@@ -105,7 +105,7 @@ std::atomic<u64> g_smooth_updates{0}, g_smooth_kept{0};
 std::atomic<u64> g_lights_smooth{0}, g_lights_counted{0}, g_fades_smooth{0};
 std::atomic<u64> g_frames_between{0}, g_instances_held{0}, g_lights_held{0}, g_motions_held{0}, g_still_frames{0}, g_records_held{0};
 std::atomic<u64> g_ribbons_between{0}, g_ribbons_whole{0}, g_ribbons_unmarked{0};
-std::atomic<u64> g_wind_steps_smooth{0}, g_wind_steps_other{0}, g_records_whole{0};
+std::atomic<u64> g_wind_steps_smooth{0}, g_wind_steps_other{0}, g_records_whole{0}, g_motions_smooth{0};
 
 // The ribbons (their GX types) of the instances the smooth steps run this frame, marked as smooth_update takes an
 // instance, for the record update: it runs later from the render context's queue, and a pre-roll's (sub_2c500e0's
@@ -229,9 +229,12 @@ constexpr u64 kManagerOf = 0x70;  // SprjSfx +0x70: the effect manager (its time
 // whole step against the frame domain's frames) - and the FFX light, whose one
 // counted part sfx_light_update runs once a whole step
 // (tests/decomp/sfx_step_gate_test.cpp). Off the list, and so on the held
-// frames as with 30: the wobble motions 0x570e6d0, 0x570e690 and 0x570e8d0
-// (they count their updates), the module 0x5760f20 and the GPU particle type
-// 0x2712 (0x56eb030: whole grid passes of elapsed x 30). The ribbon, FFX-format
+// frames as with 30: the wobble motion 0x570e8d0 (it counts its updates over a
+// base motion, 0x570e7d0's, not read yet), the module 0x5760f20 and the GPU
+// particle type 0x2712 (0x56eb030: whole grid passes of elapsed x 30). The
+// wobbles 0x570e6d0 and 0x570e690 are on it: their counts and re-rolls held
+// between whole steps by sfx_wobble_a and sfx_wobble_follow, their base motion
+// (0x570e5d0's) and the follow by the frame's own time. The ribbon, FFX-format
 // GX type 0x28, and the GPU particle type 0x2713 (its parameters curves read at
 // the elapsed time) are on it for sfx_gx_record_update, which inserts the
 // ribbon's points once a whole step at the whole step's time and gives 0x2713's
@@ -240,6 +243,8 @@ constexpr u64 kConverted[] = {
     0x570e650,  // motion: velocity along itself by step x speed curve x +0x24, position by step x velocity, facing the move
     0x570e610,  // motion: the same with gravity (data_5ad1150 x a curve at the node's time, in the parent's frame) by step
     0x570e5d0,  // motion: the same with the effects' wind world's force by step, and its drift added to the move
+    0x570e6d0,  // motion: 0x570e5d0's, then a count and a re-roll every +0x68 calls - held between whole steps (sfx_wobble_a)
+    0x570e690,  // motion: a share of the parent's move, then 0x570e6d0's - its count held between whole steps (sfx_wobble_follow)
     0x570e790,  // motion: turned by step x its rates (or three curves)
     0x570e710,  // motion: a transform; never reads its step
     0x570e910,  // motion: its position a curve's value at the node's time; never reads its step
@@ -579,9 +584,27 @@ DECOMP_LEAF void sfx_wobble_b(u64 motion, u64 node, const float* step, u64 local
     game_function<MotionFn>(kWobbleBBase)(motion, node, step, local);
 }
 
+// With the smooth steps, a smooth instance's container call (sfx_node::smooth_call
+// names its node) between whole steps runs sub_2e896f0 itself: its follow takes
+// a share (a curve at the node's time, or +0xb0) of the parent's move since the
+// last call (the parent's rows it keeps at +0x70..+0x9f) - a share of each
+// frame's move adds up to that share of the whole step's - and its base motion
+// moves by the frame's step; its count and re-roll wait for the whole step, the
+// period +0x68 held at its largest for the call and the count +0x6c put back
+// (the wobble's own update, sub_2e89d10, is ours and holds them anyway).
 DECOMP_LEAF void sfx_wobble_follow(u64 motion, u64 node, const float* step, u64 local) {
+    const auto game = reinterpret_cast<MotionFn>(g_game_wobble_follow);
     if (!held() || MUTANT(11)) {
-        reinterpret_cast<MotionFn>(g_game_wobble_follow)(motion, node, step, local);
+        game(motion, node, step, local);
+        return;
+    }
+    if (sfx_node::smooth_call().node == node && !MUTANT(42)) {
+        g_motions_smooth.fetch_add(1, std::memory_order_relaxed);
+        const u32 count = load<u32>(motion + 0x6c), period = load<u32>(motion + 0x68);
+        store<u32>(motion + 0x68, 0xffffffffu);
+        game(motion, node, step, local);
+        store<u32>(motion + 0x68, period);
+        if (!MUTANT(43)) store<u32>(motion + 0x6c, count);
         return;
     }
     g_motions_held.fetch_add(1, std::memory_order_relaxed);
@@ -832,8 +855,9 @@ void report() {
              "%llu not a smooth instance's (a pre-roll's or a held one's: the game's)",
              static_cast<ull>(g_ribbons_between.load()), static_cast<ull>(g_ribbons_whole.load()), static_cast<ull>(g_ribbons_unmarked.load()));
     host_log("decomp:   wind source steps by the frame's time: %llu (%llu another caller's, the game's); GPU particle type 0x2713 records at "
-             "the whole step's elapsed time: %llu",
-             static_cast<ull>(g_wind_steps_smooth.load()), static_cast<ull>(g_wind_steps_other.load()), static_cast<ull>(g_records_whole.load()));
+             "the whole step's elapsed time: %llu; following wobble motions between whole steps by the frame's time: %llu",
+             static_cast<ull>(g_wind_steps_smooth.load()), static_cast<ull>(g_wind_steps_other.load()), static_cast<ull>(g_records_whole.load()),
+             static_cast<ull>(g_motions_smooth.load()));
     for (std::size_t i = 0; i < kKeptSlots; ++i) {
         const u64 vt = g_kept_class[i].load();
         if (!vt) break;
