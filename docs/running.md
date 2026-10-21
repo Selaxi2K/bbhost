@@ -208,6 +208,22 @@ memory (browsers, OBS, a second game) shrink the budget. On a GPU with under
 memory`). `BBHOST_VRAM_RESERVE_MB=0` goes back to placing everything until
 an allocation fails, `BBHOST_SMALL_VRAM=0` turns the small mode off.
 
+The same report says where the video memory goes: `gpu: video memory (MiB)`
+gives what the driver counts against its budget, what bbhost's own
+allocations hold and the driver's own share; `video memory held` lists what
+the game needs now (render targets, textures in use, buffers by owner) and
+`video memory caches` what bbhost keeps because the card has room (the
+vertex data's mirrors, textures not used for a while, free room in the image
+heap), which it gives back when memory runs short. At exit the log gives each
+owner's highest. Render targets and textures go in blocks of their own so
+that a block of textures can empty and be given back
+(`BBHOST_HEAP_CLASSES=0`, `BBHOST_HEAP_DRAIN=0` turn that off);
+`BBHOST_TESS_RING=whole` and `BBHOST_SCRATCH_RETURN=0` keep the tessellation
+ring and the texture upload scratch at their largest from the start. On a GPU
+without sparse binding (AMD, integrated GPUs) the vertex data's mirrors are
+made 64 MiB at a time as the game's meshes need them, rather than a whole
+gigabyte each (`BBHOST_SHADOW_WINDOWS=0` goes back to whole ones).
+
 **AMD on Linux, no picture.** AMD's kernel driver only imports anonymous
 memory, so bbhost passes the game's memory to the GPU through `/dev/udmabuf`.
 If that device is not accessible to your user, the log says so; this udev rule
