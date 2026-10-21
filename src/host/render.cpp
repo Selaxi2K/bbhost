@@ -10842,10 +10842,12 @@ void cross_vendor_report() {
                  static_cast<ull>(total[gcn::kOobWalkPastRecords]));
         host_log("render: out-of-range image accesses (BBHOST_OOB_COUNT): loads at integer coordinates outside the bound view's size at "
                  "their level %llu, at or past its level count %llu, at or past its layer count %llu; stores outside its size %llu, past "
-                 "its layers %llu, at a level other than 0 %llu (lanes EXEC holds)",
+                 "its layers %llu (%s), at a level other than 0 %llu (lanes EXEC holds)",
                  static_cast<ull>(total[gcn::kOobImageLoadSize]), static_cast<ull>(total[gcn::kOobImageLoadLevel]),
                  static_cast<ull>(total[gcn::kOobImageLoadLayer]), static_cast<ull>(total[gcn::kOobImageStoreSize]),
-                 static_cast<ull>(total[gcn::kOobImageStoreLayer]), static_cast<ull>(total[gcn::kOobImageStoreLevel]));
+                 static_cast<ull>(total[gcn::kOobImageStoreLayer]),
+                 gcn::image_store_bounds() ? "skipped, BBHOST_IMAGE_STORE_BOUNDS" : "written, BBHOST_IMAGE_STORE_BOUNDS=0",
+                 static_cast<ull>(total[gcn::kOobImageStoreLevel]));
         std::sort(slots.rbegin(), slots.rend());
         std::lock_guard<std::mutex> lk(g_oob_names_mu);
         for (std::size_t i = 0; i < slots.size() && i < 24; ++i) {
@@ -10872,9 +10874,9 @@ void cross_vendor_report() {
     }
     host_log("render: cross-vendor switches: PS input defaults %s (BBHOST_PS_INPUT_DEFAULTS), subgroup stages 0x%x (BBHOST_SUBGROUP_GATE), "
              "barrier masks %s (BBHOST_BARRIER_MASKS), layout fixes %s (BBHOST_LAYOUT_FIXES; copies into a target never made GENERAL %llu), "
-             "sampler fixes %s (BBHOST_SAMPLER_FIXES)",
+             "sampler fixes %s (BBHOST_SAMPLER_FIXES), image store bounds %s (BBHOST_IMAGE_STORE_BOUNDS)",
              g_ps_input_defaults ? "on" : "off", gcn::subgroup_stages(), barrier_masks_fixed() ? "on" : "off", render_layout_fixes() ? "on" : "off",
-             static_cast<ull>(g_layout_fixed[0].load()), sampler_fixes_on() ? "on" : "off");
+             static_cast<ull>(g_layout_fixed[0].load()), sampler_fixes_on() ? "on" : "off", gcn::image_store_bounds() ? "on" : "off");
 }
 
 void render_report() {

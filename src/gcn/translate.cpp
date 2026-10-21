@@ -52,11 +52,14 @@ bool tbuffer_dst_sel() {
 
 namespace {
 std::atomic<bool> g_index_bounds{false};  // set_index_bounds
+std::atomic<bool> g_image_store_bounds{true};  // set_image_store_bounds
 std::atomic<bool> g_oob_count{false};     // set_oob_count
 std::atomic<bool> g_oob_control{false};   // set_oob_control
 }  // namespace
 void set_index_bounds(bool on) { g_index_bounds.store(on, std::memory_order_relaxed); }
 bool index_bounds() { return g_index_bounds.load(std::memory_order_relaxed); }
+void set_image_store_bounds(bool on) { g_image_store_bounds.store(on, std::memory_order_relaxed); }
+bool image_store_bounds() { return g_image_store_bounds.load(std::memory_order_relaxed); }
 void set_oob_count(bool on) { g_oob_count.store(on, std::memory_order_relaxed); }
 bool oob_count() { return g_oob_count.load(std::memory_order_relaxed); }
 void set_oob_control(bool on) { g_oob_control.store(on, std::memory_order_relaxed); }
@@ -3469,9 +3472,24 @@ struct Translator {
             for (const Id raw : raws) vals.push_back(img.kind == 1 ? raw : img.kind == 2 ? i(raw) : f(raw));
             const Id texel = img.kind ? m.emit(spv::OpCompositeConstruct, texel_type(img), vals) : vec4f(vals[0], vals[1], vals[2], vals[3]);
             if (oob_base64) oob_image(img, arrayed, coords, op == 9 ? i(ld(vgpr_var(in.vaddr + ncoord))) : 0, true);
+            // gcn::set_image_store_bounds: GCN writes nothing outside the
+            // image, so the lanes outside the view's size and layers skip it.
+            Id inside = 0;
+            if (image_store_bounds()) {
+                m.capability(spv::CapImageQuery);
+                const Id size = m.emit(spv::OpImageQuerySize, ncoord == 1 ? t_i32 : ncoord == 2 ? t_v2i : ncoord == 3 ? t_v3i : t_v4i, {load_image(img)});
+                for (int k = 0; k < ncoord; ++k) {
+                    const Id ok = ult(ui(coords[static_cast<std::size_t>(k)]), ui(ncoord == 1 ? size : extract(t_i32, size, static_cast<std::uint32_t>(k))));
+                    inside = inside ? band(inside, ok) : ok;
+                }
+            }
             exec_guard([&] {
                 const Id image = load_image(img);
-                m.emit_void(spv::OpImageWrite, {image, coord, texel});
+                if (inside) {
+                    if_then(inside, [&] { m.emit_void(spv::OpImageWrite, {image, coord, texel}); });
+                } else {
+                    m.emit_void(spv::OpImageWrite, {image, coord, texel});
+                }
             });
             return;
         }

@@ -113,15 +113,20 @@ void hash_program(KeyHasher& h, const gcn::Program& p) {
     h.u32(static_cast<std::uint32_t>(p.insts.size()));
     h.u32(p.end);
     bool indexed = false;  // a typed load by index (gcn::indexed_typed_load)
+    bool stores = false;   // an image store (gcn::image_store_inst)
     for (const gcn::Inst& in : p.insts) {
         h.u32(in.size);
         for (std::uint32_t k = 0; k < in.size && k < 3; ++k) h.u32(in.words[k]);
         if (in.has_literal) h.u32(in.literal);
         indexed = indexed || gcn::indexed_typed_load(in);
+        stores = stores || gcn::image_store_inst(in);
     }
     // Its index checked against num_records (gcn::set_index_bounds): the
     // programs without such a load keep their keys.
     if (indexed && gcn::index_bounds()) h.u32(0x1d0bu);
+    // Its image stores' lanes outside the view skipped (gcn::set_image_store_bounds):
+    // the programs that store no image keep their keys.
+    if (stores && gcn::image_store_bounds()) h.u32(0x5b0du);
 }
 
 // Every TranslateOptions field, in declaration order (translate.h).

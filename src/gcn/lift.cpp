@@ -3107,7 +3107,27 @@ private:
         const Id texel = m.emit(spv::OpCompositeConstruct, b.kind == 1 ? t_v4u : b.kind == 2 ? m.type_vector(t_i32, 4) : t_v4f, vals);
         if (!res.rejections.empty()) return;
         if (oob_base64) oob_image(ii->second, b, coords, in.op == 9 ? to_i(as_u(value(256 + in.vaddr + ncoord))) : 0, true);  // gcn::set_oob_count
-        where_exec(exec_lane(), [&] { m.emit_void(spv::OpImageWrite, {image_only(ii->second), coord, texel}); });
+        // gcn::set_image_store_bounds, as the reference: the lanes outside the
+        // view's size and layers skip the store, as GCN writes nothing there.
+        Id inside = 0;
+        if (image_store_bounds()) {
+            m.capability(spv::CapImageQuery);
+            const Id size = m.emit(spv::OpImageQuerySize, ncoord == 1 ? t_i32 : ncoord == 2 ? t_v2i : ncoord == 3 ? t_v3i : m.type_vector(t_i32, 4),
+                                   {image_only(ii->second)});
+            for (int k = 0; k < ncoord; ++k) {
+                const Id dim_k = from_i(ncoord == 1 ? size : extract(t_i32, size, static_cast<std::uint32_t>(k)));
+                const Id ok = m.emit(spv::OpULessThan, t_bool, {from_i(coords[static_cast<std::size_t>(k)]), dim_k});
+                inside = inside ? m.emit(spv::OpLogicalAnd, t_bool, {inside, ok}) : ok;
+            }
+        }
+        where_exec(exec_lane(), [&] {
+            const auto write = [&] { m.emit_void(spv::OpImageWrite, {image_only(ii->second), coord, texel}); };
+            if (inside) {
+                where_true(inside, write);
+            } else {
+                write();
+            }
+        });
         ++image_stores;
         note += " stored";
     }
@@ -4680,6 +4700,16 @@ private:
             const Id layers = from_i(extract(t_i32, size, static_cast<std::uint32_t>(n - 1)));
             oob_note(past(from_i(coords[n - 1]), layers), store ? kOobImageStoreLayer : kOobImageLoadLayer);
         }
+    }
+    // `body` where `cond` holds (a selection, as where_exec's on a lane's EXEC bit).
+    void where_true(Id cond, const std::function<void()>& body) {
+        const Id l_then = m.fresh(), l_merge = m.fresh();
+        m.emit_void(spv::OpSelectionMerge, {l_merge, 0u});
+        m.emit_void(spv::OpBranchConditional, {cond, l_then, l_merge});
+        cur_label = m.label(l_then);
+        body();
+        m.emit_void(spv::OpBranch, {l_merge});
+        cur_label = m.label(l_merge);
     }
     void where_exec(const Val& e, const std::function<void()>& body) {
         if (e.constant) {

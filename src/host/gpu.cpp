@@ -3291,6 +3291,18 @@ bool init_locked() {
         f2.features.robustBufferAccess = VK_TRUE;  // core since 1.0, always supported
         host_log("gpu: robust buffer access on (BBHOST_ROBUST=1)");
     }
+    // BBHOST_IMAGE_STORE_BOUNDS (on by default): an image store's lanes outside
+    // the view bound for its T# skip it, as GCN writes nothing outside the
+    // image (gcn::set_image_store_bounds) - Vulkan leaves such a write
+    // undefined unless robust image access is on, and the game's compute
+    // passes make them where a target's height is not a multiple of their
+    // tiles. =0: every lane writes, as before.
+    {
+        const char* e = std::getenv("BBHOST_IMAGE_STORE_BOUNDS");
+        gcn::set_image_store_bounds(!(e && e[0] == '0'));
+        host_log("gpu: image stores outside the bound view %s (BBHOST_IMAGE_STORE_BOUNDS=%c)",
+                 gcn::image_store_bounds() ? "skip those lanes, as GCN drops them" : "write as before", gcn::image_store_bounds() ? '1' : '0');
+    }
     // BBHOST_INDEX_BOUNDS=1: the shaders' own check instead, where GCN makes
     // one - a typed load by index past the V#'s num_records reads 0
     // (gcn::set_index_bounds), on every driver, at a compare and a select a

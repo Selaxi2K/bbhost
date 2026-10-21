@@ -466,6 +466,19 @@ bool clip_demote();
 void set_index_bounds(bool on);
 bool index_bounds();
 inline bool indexed_typed_load(const Inst& in) { return in.enc == Enc::MTBUF && in.op < 4 && in.idxen; }
+// An image store (image_store, image_store_mip) whose coordinates fall outside
+// the image writes nothing on GCN; Vulkan leaves such a write undefined unless
+// robust image access is on. With set_image_store_bounds a store's lanes
+// outside the size and layers of the view the host binds for its T# skip it
+// (mimg, the lift's guest_image_store), as on the PS4 - the game's compute
+// passes write past the bottom of their targets where the height is not a
+// multiple of their tiles. On by default (the host's
+// BBHOST_IMAGE_STORE_BOUNDS=0 turns it off); set before the first
+// translation. Keyed for the programs that hold an image store
+// (image_store_inst), so it moves no other program's key.
+void set_image_store_bounds(bool on);
+bool image_store_bounds();
+inline bool image_store_inst(const Inst& in) { return in.enc == Enc::MIMG && (in.op == 8 || in.op == 9); }
 // A diagnostic (the host's BBHOST_OOB_COUNT=1): a vertex, pixel or compute
 // stage with no tessellation or GS role, translated or lifted, counts the
 // accesses that leave what GCN would read or what the bound view holds,
@@ -483,8 +496,9 @@ inline bool indexed_typed_load(const Inst& in) { return in.enc == Enc::MTBUF && 
 // image_load_mip at or past the view's level count, [kOobImageLoadLayer] an
 // arrayed load (a 2D array's, a cube's face) at or past its layer count,
 // [kOobImageStoreSize] and [kOobImageStoreLayer] the same of an
-// image_store(_mip), [kOobImageStoreLevel] an image_store_mip at a level other
-// than 0 (mimg writes level 0 of the view). Only lanes EXEC holds count. Set
+// image_store(_mip) (lanes set_image_store_bounds skips), [kOobImageStoreLevel]
+// an image_store_mip at a level other than 0 (mimg writes level 0 of the view).
+// Only lanes EXEC holds count. Set
 // once before the first translation; part of every key while on.
 void set_oob_count(bool on);
 bool oob_count();
