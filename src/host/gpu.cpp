@@ -6771,7 +6771,7 @@ std::string video_memory_report_locked(bool at_exit) {
             continue;
         }
         if (o.name == "image heap blocks") continue;
-        if (o.name == "mirrors" || o.name == "mirror blocks") {
+        if (o.name == "mirrors" || o.name == "mirror blocks" || o.name == "mirror windows") {
             mirror_bytes += o.bytes[0];
             continue;
         }
@@ -6841,7 +6841,7 @@ std::string video_memory_report_locked(bool at_exit) {
                   devbufs.c_str());
     out += buf;
     std::snprintf(buf, sizeof(buf),
-                  "\n[bbhost]   video memory caches %llu (given back when it runs short): mirrors %llu (%u whole of %llu, %u blocks of 64; %llu "
+                  "\n[bbhost]   video memory caches %llu (given back when it runs short): mirrors %llu (%u whole of %llu, %u blocks or windows; %llu "
                   "hold page copies, in %u windows of 64; %s), textures not bound for 20 s %llu (%llu) and made ahead, never bound %llu (%llu) - the cold eviction "
                   "takes them only down at the reserve; image heap room %llu in %zu blocks (in use %llu; spare %llu block(s) in play), untile "
                   "scratch kept %llu",
