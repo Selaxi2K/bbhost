@@ -154,8 +154,8 @@ void buffer_written(std::uint64_t holder, Retire why);
 void memory_written(std::uint64_t va, std::uint64_t bytes, Retire why);
 // A GPU copy's destination with the handles on (=1): a kept default buffer it
 // writes is retired - asked of the copy watch without a lock
-// (host/gxvk_watch.h), so a copy into memory no kept default buffer holds
-// (nearly all) reads a counter or two.
+// (host/gxvk_watch.h): a copy far from every kept default buffer reads a
+// counter or two, one next to them searches their ranges in halves.
 void copy_written(std::uint64_t va, std::uint64_t bytes);
 // BBHOST_GXVK_BUFFERS=2: the copy watch's granules checked against its slots
 // for a copy's destination (the exit report counts a miss, which may not be).

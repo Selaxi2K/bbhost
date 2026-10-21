@@ -679,7 +679,8 @@ UpdateSubresource or a GPU copy into the buffer retires the entry and its
 bindings take today's path again. Every GPU copy GX records asks a watch of
 the kept default buffers' ranges first, by the 64 KiB granules they cover
 (one-byte counters in a 16 KiB table), so a copy far from all of them reads
-a counter or two; a buffer that ended (its holder released,
+a counter or two, and one next to them searches the ranges, sorted, in
+halves; a buffer that ended (its holder released,
 its memory unmapped or given to a new resource) is still bound from its copy
 by the draws recorded before its end. Video memory is used down to the
 reserve kept for render targets and device buffers, then host-visible
