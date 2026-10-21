@@ -2633,7 +2633,11 @@ int choose_device(VkInstance instance, bool say, std::vector<Candidate>& usable)
             std::string lname(dp.deviceName), lwant(want);
             for (char& ch : lname) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
             for (char& ch : lwant) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-            if ((end && *end == 0 && n == static_cast<long>(index)) || lname.find(lwant) != std::string::npos) chosen = static_cast<int>(usable.size());
+            // A number names the device's index alone: as a part of the name
+            // "0" matched the "3070" of an RTX 3070 Ti and picked it over
+            // device 0.
+            const bool number = end && end != want && *end == 0;
+            if (number ? n == static_cast<long>(index) : lname.find(lwant) != std::string::npos) chosen = static_cast<int>(usable.size());
         }
         usable.push_back(c);
     }
