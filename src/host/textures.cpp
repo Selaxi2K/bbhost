@@ -4036,6 +4036,41 @@ void textures_return_from_host_locked() {
     if (any) bump_view_epoch();
 }
 
+// What the textures hold, for the video memory report (video_memory_report,
+// gpu.cpp), by the classes the cold eviction and the return use: a surface a
+// shader or a copy wrote (never evicted: its image holds what guest memory
+// does not), one made ahead at its resource's creation and never bound, one
+// no bind has looked up for 20 s (the cold eviction's default), and the rest;
+// the copies made of targets' regions and of single levels; what a shortage
+// put in host memory, apart.
+void textures_vram_census_locked(VramCensus& c) {
+    const std::uint64_t now = now_ms();
+    constexpr std::uint64_t kColdMs = 20000;
+    for (const auto& [base, sf] : g_surfaces) {
+        if (!sf.image || sf.failed) continue;
+        const std::uint64_t bytes = sf.memory.size;
+        if (surface_in_host(sf)) {
+            c.tex_host.add(bytes);
+            continue;
+        }
+        if (sf.gpu_written || sf.copied_mips) {
+            (sf.written_ms && now - sf.written_ms >= 10000 ? c.gpu_written_idle : c.gpu_written).add(bytes);
+        } else if (sf.ahead && !sf.ahead_used) {
+            c.tex_ahead.add(bytes);
+        } else if (sf.used_ms && now - sf.used_ms >= kColdMs) {
+            c.tex_cold.add(bytes);
+        } else {
+            c.tex_bound.add(bytes);
+        }
+    }
+    for (const auto& [key, reg] : g_rt_regions) {
+        if (reg.img.image) (image_memory_in_vram(reg.img.memory) ? c.regions : c.tex_host).add(reg.img.memory.size);
+    }
+    for (const auto& [key, al] : g_level_aliases) {
+        if (al.img.image) (image_memory_in_vram(al.img.memory) ? c.regions : c.tex_host).add(al.img.memory.size);
+    }
+}
+
 std::string textures_return_report() {
     char buf[224];
     std::snprintf(buf, sizeof(buf), ", textures in host memory %llu, back from it %llu (%llu MiB), evicted cold %llu (%llu MiB), not made ahead %llu",
@@ -4328,6 +4363,7 @@ bool texture_dump_locked(std::uint64_t base, const char* path, std::uint32_t lev
     VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     mai.allocationSize = req.size;
     mai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    MemOwner own_mem("diagnostic readbacks");
     if (vkAllocateMemory(g.device, &mai, nullptr, &tmp_mem) != VK_SUCCESS) {
         vkDestroyImage(g.device, tmp, nullptr);
         return false;

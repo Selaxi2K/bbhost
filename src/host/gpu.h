@@ -734,6 +734,11 @@ void host_gpu_compile_cancel();
 // The device in use: "vendor:device:driver:pipelineCacheUUID name".
 std::string host_gpu_device_identity();
 std::string host_gpu_memory_budget_report();
+// Where this process's video memory goes, by owner and kind, held against
+// cached (gpu.cpp video_memory_report_locked): every 300 flips, and at exit
+// with each owner's highest. Empty with BBHOST_VRAM_REPORT=0 or no GPU.
+std::string host_gpu_video_memory_report(bool at_exit);
+void host_gpu_log_video_memory(bool at_exit);  // the same, logged a line a call (indented but the exit's first)
 // Serialises queue use between the presenter and the executor.
 void host_gpu_lock();
 void host_gpu_unlock();

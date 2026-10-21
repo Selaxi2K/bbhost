@@ -3,6 +3,7 @@
 #include "core/paced_file.h"
 #include "core/portable.h"
 #include "engine/gx_resources.h"
+#include "engine/live_resolution.h"
 #include "host/foreign_hooks.h"
 #include "host/draw_capture.h"
 #include "host/gpu_internal.h"
@@ -503,6 +504,7 @@ VkResult host_span(Chunk& c, void* ptr, std::uint64_t size) {
     mai.pNext = &flags;
     mai.allocationSize = size;
     mai.memoryTypeIndex = type;
+    MemOwner own_mem("guest memory imports");
     if (const VkResult r = vkAllocateMemory(g.device, &mai, nullptr, &c.memory); r != VK_SUCCESS) return r;
     return vkBindBufferMemory(g.device, c.buffer, c.memory, 0);
 }
@@ -576,6 +578,7 @@ VkDeviceMemory dmabuf_memory(std::uint64_t offset, std::uint64_t size, std::uint
     mai.allocationSize = size;
     mai.memoryTypeIndex = type;
     VkDeviceMemory m = VK_NULL_HANDLE;
+    MemOwner own_mem("guest memory imports");
     if (const VkResult r = vkAllocateMemory(g.device, &mai, nullptr, &m); r != VK_SUCCESS) {
         host_log("gpu: importing a dma-buf of %llu MiB at +%llu MiB of direct memory failed: %d", static_cast<unsigned long long>(size >> 20),
                  static_cast<unsigned long long>(offset >> 20), r);
@@ -849,6 +852,7 @@ bool set_page_locked(std::uint64_t va, std::uint64_t dev) {
     auto it = g.l2.find(i1);
     if (it == g.l2.end()) {
         DevBuffer t;
+        MemOwner own_mem("page tables");
         if (!create_dev_buffer(t, gcn::kL2Entries * 8, true)) return false;
         fill_sink(t);
         it = g.l2.emplace(i1, t).first;
@@ -1320,6 +1324,7 @@ const Chunk* import_anon(std::uint64_t va, std::uint64_t len) {
     const bool say = len >= (256ull << 20) || said.fetch_add(1) < 4;  // as the dmem chunks: before, in case it never returns
     if (say) host_log("gpu: importing flexible mapping 0x%llx (%llu KiB)", static_cast<unsigned long long>(va), static_cast<unsigned long long>(len >> 10));
     const auto t0 = std::chrono::steady_clock::now();
+    MemOwner own_mem("guest memory imports");
     const VkResult r = vkAllocateMemory(g.device, &mai, nullptr, &c.memory);
     const double import_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     if (say || import_ms >= 50) host_log("gpu: flexible mapping 0x%llx: %s in %.0f ms", static_cast<unsigned long long>(va), r == VK_SUCCESS ? "imported" : "failed", import_ms);
@@ -1399,6 +1404,7 @@ void create_dim_dummies() {
             mai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
             if (mai.memoryTypeIndex == UINT32_MAX) mai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, 0);
             VkDeviceMemory mem = VK_NULL_HANDLE;
+            MemOwner own_mem("dummy images and buffers");
             if (mai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(g.device, &mai, nullptr, &mem) != VK_SUCCESS) {
                 vkDestroyImage(g.device, image, nullptr);
                 continue;
@@ -1497,6 +1503,7 @@ void create_depth_dummies() {
         mai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         if (mai.memoryTypeIndex == UINT32_MAX) mai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, 0);
         VkDeviceMemory mem = VK_NULL_HANDLE;
+        MemOwner own_mem("dummy images and buffers");
         if (mai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(g.device, &mai, nullptr, &mem) != VK_SUCCESS) {
             vkDestroyImage(g.device, image, nullptr);
             continue;
@@ -1648,6 +1655,7 @@ bool create_dummy_resources() {
     mai.allocationSize = req.size;
     mai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (mai.memoryTypeIndex == UINT32_MAX) mai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, 0);
+    MemOwner own_mem("dummy images and buffers");
     if (vkAllocateMemory(g.device, &mai, nullptr, &g.dummy_mem) != VK_SUCCESS) return false;
     vkBindImageMemory(g.device, g.dummy_image, g.dummy_mem, 0);
     VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -2886,11 +2894,14 @@ bool init_locked() {
         // budget is about 7171) - set before anything is allocated in them.
         const std::uint32_t t = find_memory_type(~0u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         g.local_heap = t == UINT32_MAX ? 0 : g.mem_props.memoryTypes[t].heapIndex;
-        std::uint32_t types = 0;
+        std::uint32_t types = 0, other_device = 0;
         for (std::uint32_t i = 0; i < g.mem_props.memoryTypeCount; ++i) {
-            if (g.mem_props.memoryTypes[i].heapIndex == g.local_heap) types |= 1u << i;
+            const std::uint32_t h = g.mem_props.memoryTypes[i].heapIndex;
+            if (h == g.local_heap) types |= 1u << i;
+            else if (g.mem_props.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) other_device |= 1u << i;
         }
         if (t != UINT32_MAX) bb_memory_set_local_types(types);
+        bb_memory_set_heap_classes(other_device);
         if (const char* e = std::getenv("BBHOST_TEST_VRAM_MB"); e && std::strtoull(e, nullptr, 10)) {
             bb_memory_test_limit(types, std::strtoull(e, nullptr, 10) << 20);
         }
@@ -3659,6 +3670,7 @@ bool init_locked() {
         if (vram != UINT32_MAX && ring_fits_budget(vram, req.size, "the params ring", &note)) {
             const std::uint32_t host_type = mai.memoryTypeIndex;
             mai.memoryTypeIndex = vram;
+            MemOwner own_mem("params ring");
             params_allocated = vkAllocateMemory(g.device, &mai, nullptr, &g.ubo_mem) == VK_SUCCESS;
             if (!params_allocated) mai.memoryTypeIndex = host_type;
             note_ring_placed(params_allocated, req.size);
@@ -3667,7 +3679,11 @@ bool init_locked() {
     }
     host_log("gpu: params ring in memory type %u (flags 0x%x)", mai.memoryTypeIndex,
              mai.memoryTypeIndex < g.mem_props.memoryTypeCount ? g.mem_props.memoryTypes[mai.memoryTypeIndex].propertyFlags : 0u);
-    if (!params_allocated && vkAllocateMemory(g.device, &mai, nullptr, &g.ubo_mem) != VK_SUCCESS) {
+    if (!params_allocated) {
+        MemOwner own_mem("params ring");
+        params_allocated = vkAllocateMemory(g.device, &mai, nullptr, &g.ubo_mem) == VK_SUCCESS;
+    }
+    if (!params_allocated) {
         host_log("gpu: params buffer allocation failed");
         return false;
     }
@@ -3679,8 +3695,13 @@ bool init_locked() {
         return false;
     }
     bindless_dummies_locked(g.dummy_view, g.dummy_view, g.dummy_sampler);  // slot 0 of the global arrays
-    if (!create_dev_buffer(g.l1, gcn::kL1Entries * 8, true) || !create_dev_buffer(g.sink, 1ull << gcn::kPageShift, false) ||
-        !create_dev_buffer(g.sink_l2, gcn::kL2Entries * 8, true)) {
+    bool tables_made = false;
+    {
+        MemOwner own_mem("page tables");
+        tables_made = create_dev_buffer(g.l1, gcn::kL1Entries * 8, true) && create_dev_buffer(g.sink, 1ull << gcn::kPageShift, false) &&
+                      create_dev_buffer(g.sink_l2, gcn::kL2Entries * 8, true);
+    }
+    if (!tables_made) {
         host_log("gpu: page table buffers failed");
         return false;
     }
@@ -6144,6 +6165,7 @@ bool acquire_staging_locked(DevBuffer& b, std::uint64_t size, VkDeviceSize& offs
             g.staging_free_bytes -= it->size;
             g.staging_free.erase(it);
         } else {
+            MemOwner own_mem("upload staging");
             if (!create_dev_buffer(chunk, want, true)) return false;
             g_staging_created.fetch_add(1, std::memory_order_relaxed);
         }
@@ -6205,6 +6227,7 @@ bool acquire_scratch_locked(DevBuffer& b, std::uint64_t size, VkDeviceSize& offs
                 g_scratch_refusals.fetch_add(1, std::memory_order_relaxed);
                 return false;
             }
+            MemOwner own_mem("untile scratch");
             if (!create_dev_buffer(chunk, want, false)) return false;
             g_scratch_created.fetch_add(1, std::memory_order_relaxed);
         }
@@ -6360,6 +6383,7 @@ bool heap_place_locked(const VkMemoryRequirements& req, std::uint32_t type, bool
             mai.allocationSize = kHeapBlock;
             mai.memoryTypeIndex = type;
             VkDeviceMemory mem = VK_NULL_HANDLE;
+            MemOwner own_mem("image heap blocks");
             if (vkAllocateMemory(g.device, &mai, nullptr, &mem) != VK_SUCCESS) break;
             heap_add_block_locked(mem, type);
             ++g_heap_cp_blocks;
@@ -6372,6 +6396,7 @@ bool heap_place_locked(const VkMemoryRequirements& req, std::uint32_t type, bool
     VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     mai.allocationSize = req.size;
     mai.memoryTypeIndex = type;
+    MemOwner own_mem("images of their own");
     if (vkAllocateMemory(g.device, &mai, nullptr, &out.memory) != VK_SUCCESS) return false;
     out.size = req.size;
     out.type = type;
@@ -6603,6 +6628,196 @@ std::string image_heap_report() {
     return buf;
 }
 
+// The video memory report: where the device-local memory this process holds
+// goes, by owner and kind, and how much of it is what the run must hold
+// against what caches took because the card had room - the mirrors, textures
+// no bind has looked up for a while, free room in the image heap's blocks -
+// which give it back when video memory runs short. Every 300 flips and at
+// exit, beside the "memory by heap" line. BBHOST_VRAM_REPORT=0: not made.
+namespace {
+std::atomic<std::uint64_t> g_spare_play_blocks{1};  // the memory keeper's spare in play (start_memory_reserve)
+std::uint64_t g_vram_peak_usage = 0;                // the most the driver counted in the video memory heap at a report
+}  // namespace
+
+bool vram_report_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_VRAM_REPORT");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+
+std::string video_memory_report_locked(bool at_exit) {
+    using ull = unsigned long long;
+    const auto mib = [](std::uint64_t b) { return static_cast<ull>((b + (1ull << 19)) >> 20); };
+    const auto smib = [](std::int64_t b) { return static_cast<long long>(b / (1ll << 20)); };
+    const auto t0 = std::chrono::steady_clock::now();
+    std::string out;
+    char buf[640];
+    // The driver's count (VK_EXT_memory_budget) for every device-local heap.
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT mb{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 mp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+    const bool have = g.has_memory_budget && g.phys;
+    if (have) {
+        mp.pNext = &mb;
+        vkGetPhysicalDeviceMemoryProperties2(g.phys, &mp);
+    }
+    const std::vector<MemOwnerTotal> owners = bb_memory_owner_totals();
+    std::uint64_t ours[3] = {};
+    for (const MemOwnerTotal& o : owners) {
+        for (int c = 0; c < 3; ++c) ours[c] += o.bytes[c];
+    }
+    std::uint64_t local_peak = 0, device_peak = 0;
+    bb_memory_peaks(&local_peak, &device_peak);
+    const std::uint64_t usage = have ? mb.heapUsage[g.local_heap] : ours[0];
+    const std::int64_t driver_own = static_cast<std::int64_t>(usage) - static_cast<std::int64_t>(ours[0]);
+    g_vram_peak_usage = std::max(g_vram_peak_usage, usage);
+
+    // The images by kind (render.cpp, textures.cpp) and the image heap's
+    // blocks in video memory.
+    VramCensus c;
+    unsigned dw = 0, dh = 0;
+    if (!live_resolution_display_size(&dw, &dh)) dw = dh = 0;
+    {
+        // At the display buffers' own size the scene's targets have it too:
+        // no line between them then.
+        unsigned rw = 0, rh = 0;
+        live_resolution_current(&rw, &rh);
+        if (rw == dw && rh == dh) dw = dh = 0;
+    }
+    render_vram_census_locked(c, dw, dh);
+    textures_vram_census_locked(c);
+    VkDeviceSize used_vram = 0, free_vram = 0;
+    std::size_t blocks_vram = 0;
+    for (const HeapBlock& b : g_heap) {
+        if (b.memory == VK_NULL_HANDLE || g.mem_props.memoryTypes[b.type].heapIndex != g.local_heap) continue;
+        used_vram += b.used;
+        free_vram += kHeapBlock - b.used;
+        ++blocks_vram;
+    }
+    ShadowCensus sc;
+    shadow_vram_census_locked(sc);
+    // Device buffers and anything else with memory of its own, by owner; the
+    // image heap's blocks and images of their own are broken down by kind
+    // above, the mirrors are a cache.
+    std::uint64_t own_images = 0, devbuf_bytes = 0, mirror_bytes = 0;
+    std::string devbufs;
+    for (const MemOwnerTotal& o : owners) {
+        if (!o.bytes[0]) continue;
+        if (o.name == "images of their own") {
+            own_images += o.bytes[0];
+            continue;
+        }
+        if (o.name == "image heap blocks") continue;
+        if (o.name == "mirrors" || o.name == "mirror blocks") {
+            mirror_bytes += o.bytes[0];
+            continue;
+        }
+        devbuf_bytes += o.bytes[0];
+        if (o.bytes[0] < (1ull << 20)) continue;
+        std::snprintf(buf, sizeof(buf), "%s%s %llu", devbufs.empty() ? "" : ", ", o.name.c_str(), mib(o.bytes[0]));
+        devbufs += buf;
+    }
+    const std::uint64_t scratch_kept = std::min<std::uint64_t>(g.scratch_free_bytes, devbuf_bytes);
+    const std::uint64_t targets = c.rt_colour.bytes + c.rt_depth.bytes + c.rt_display.bytes;
+    const std::uint64_t gpu_written = c.gpu_written.bytes + c.gpu_written_idle.bytes;
+    const std::uint64_t images = targets + c.snapshots.bytes + gpu_written + c.regions.bytes + c.tex_bound.bytes + c.tex_cold.bytes +
+                                 c.tex_ahead.bytes;
+    // Image heap bytes in use that no container holds: ranges of images
+    // destroyed in submissions still in flight, which go when they retire.
+    const std::int64_t unattributed = static_cast<std::int64_t>(used_vram + own_images) - static_cast<std::int64_t>(images);
+    const std::uint64_t held = targets + c.snapshots.bytes + gpu_written + c.regions.bytes + c.tex_bound.bytes + (devbuf_bytes - scratch_kept);
+    const std::uint64_t cached = mirror_bytes + c.tex_cold.bytes + c.tex_ahead.bytes + free_vram + scratch_kept;
+
+    std::snprintf(buf, sizeof(buf),
+                  "gpu: video memory (MiB): heap %u %s %llu of %llu = ours %llu (held %llu, caches %llu, in flight %lld) + the driver's own %lld; "
+                  "ours at most %llu, the driver's count at most %llu at a report",
+                  g.local_heap, have ? "the driver counts" : "ours", mib(usage), mib(have ? mb.heapBudget[g.local_heap] : g.local_budget),
+                  mib(ours[0]), mib(held), mib(cached), smib(unattributed), smib(driver_own), mib(local_peak), mib(g_vram_peak_usage));
+    out += buf;
+    if (have) {
+        for (std::uint32_t h = 0; h < g.mem_props.memoryHeapCount; ++h) {
+            if (h == g.local_heap || !(g.mem_props.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) continue;
+            std::snprintf(buf, sizeof(buf), "; device-local heap %u (%llu) %llu of %llu", h, mib(g.mem_props.memoryHeaps[h].size),
+                          mib(mb.heapUsage[h]), mib(mb.heapBudget[h]));
+            out += buf;
+        }
+    }
+    if (ours[1]) {
+        std::string bar;
+        for (const MemOwnerTotal& o : owners) {
+            if (o.bytes[1] < (1ull << 20)) continue;
+            std::snprintf(buf, sizeof(buf), "%s%s %llu", bar.empty() ? "" : ", ", o.name.c_str(), mib(o.bytes[1]));
+            bar += buf;
+        }
+        std::snprintf(buf, sizeof(buf), ", ours there %llu (%s)", mib(ours[1]), bar.c_str());
+        out += buf;
+    }
+    {
+        std::string host;
+        for (const MemOwnerTotal& o : owners) {
+            if (o.bytes[2] < (16ull << 20)) continue;
+            std::snprintf(buf, sizeof(buf), "%s%s %llu", host.empty() ? "" : ", ", o.name.c_str(), mib(o.bytes[2]));
+            host += buf;
+        }
+        std::snprintf(buf, sizeof(buf), "; host memory the GPU reads, which Windows counts as shared GPU memory: ours %llu (%s)", mib(ours[2]),
+                      host.c_str());
+        out += buf;
+    }
+    std::snprintf(buf, sizeof(buf),
+                  "\n[bbhost]   video memory held %llu: targets %llu (colour %llu in %llu, depth %llu in %llu, the display buffers' %ux%u %llu in "
+                  "%llu; %llu MiB of them not written for 10 s), snapshots %llu (%llu), surfaces a shader or a copy wrote %llu (%llu; %llu "
+                  "MiB of them not written for 10 s), copies of targets' regions and levels %llu (%llu), textures bound in the last 20 s %llu "
+                  "(%llu)",
+                  mib(held), mib(targets), mib(c.rt_colour.bytes), static_cast<ull>(c.rt_colour.n), mib(c.rt_depth.bytes),
+                  static_cast<ull>(c.rt_depth.n), dw, dh, mib(c.rt_display.bytes), static_cast<ull>(c.rt_display.n), mib(c.rt_idle.bytes),
+                  mib(c.snapshots.bytes), static_cast<ull>(c.snapshots.n), mib(gpu_written), static_cast<ull>(c.gpu_written.n + c.gpu_written_idle.n),
+                  mib(c.gpu_written_idle.bytes), mib(c.regions.bytes), static_cast<ull>(c.regions.n), mib(c.tex_bound.bytes),
+                  static_cast<ull>(c.tex_bound.n));
+    out += buf;
+    std::snprintf(buf, sizeof(buf), "; device buffers %llu without the untile scratch kept (%s)", mib(devbuf_bytes - scratch_kept),
+                  devbufs.c_str());
+    out += buf;
+    std::snprintf(buf, sizeof(buf),
+                  "\n[bbhost]   video memory caches %llu (given back when it runs short): mirrors %llu (%u whole of %llu, %u blocks of 64; %llu "
+                  "hold page copies, in %u windows of 64; %s), textures not bound for 20 s %llu (%llu) and made ahead, never bound %llu (%llu) - the cold eviction "
+                  "takes them only down at the reserve; image heap room %llu in %zu blocks (in use %llu; spare %llu block(s) in play), untile "
+                  "scratch kept %llu",
+                  mib(cached), mib(mirror_bytes), sc.whole, mib(kChunkBytes), sc.blocks, mib(sc.data_bytes), sc.windows,
+                  !buffer_shadow_on() ? "the buffer shadow is off"
+                  : sc.given_back     ? "given back"
+                  : sc.live           ? "the share follows the budget"
+                                      : "a fixed share",
+                  mib(c.tex_cold.bytes), static_cast<ull>(c.tex_cold.n), mib(c.tex_ahead.bytes), static_cast<ull>(c.tex_ahead.n), mib(free_vram),
+                  blocks_vram, mib(used_vram), static_cast<ull>(g_spare_play_blocks.load(std::memory_order_relaxed)), mib(scratch_kept));
+    out += buf;
+    if (c.rt_host.n || c.tex_host.n) {
+        std::snprintf(buf, sizeof(buf), "; in host memory for want of video memory: targets and snapshots %llu (%llu), textures %llu (%llu)",
+                      mib(c.rt_host.bytes), static_cast<ull>(c.rt_host.n), mib(c.tex_host.bytes), static_cast<ull>(c.tex_host.n));
+        out += buf;
+    }
+    if (at_exit) {
+        // The owners that held the most at once over the run (video memory).
+        std::vector<const MemOwnerTotal*> by_peak;
+        for (const MemOwnerTotal& o : owners) {
+            if (o.peak >= (1ull << 20)) by_peak.push_back(&o);
+        }
+        std::sort(by_peak.begin(), by_peak.end(), [](const MemOwnerTotal* x, const MemOwnerTotal* y) { return x->peak > y->peak; });
+        std::string peaks;
+        for (std::size_t i = 0; i < by_peak.size() && i < 16; ++i) {
+            std::snprintf(buf, sizeof(buf), "%s%s %llu", peaks.empty() ? "" : ", ", by_peak[i]->name.c_str(), mib(by_peak[i]->peak));
+            peaks += buf;
+        }
+        std::snprintf(buf, sizeof(buf), "\n[bbhost]   video memory at most, by owner (MiB, each at its own highest): %s; every device-local heap "
+                      "together at most %llu", peaks.c_str(), mib(device_peak));
+        out += buf;
+    }
+    const auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+    std::snprintf(buf, sizeof(buf), " (the census took %lld us)", static_cast<long long>(us));
+    out += buf;
+    return out;
+}
+
 // Memory made ahead, off the command processor, and given back when idle.
 // Upload staging is pinned host memory, which the driver pins page by page
 // (~30 ms a 64 MiB chunk), and an image-heap block is 5-10 ms of VRAM; the
@@ -6651,6 +6866,7 @@ void start_memory_reserve() {
     const bool few = g.tight || g.small_vram;
     const std::uint64_t spare_play = env("BBHOST_IMAGE_HEAP_SPARE", few ? 0 : 1);
     const std::uint64_t spare_load = std::max(env("BBHOST_IMAGE_HEAP_SPARE_LOADING", few ? 1 : 4), spare_play);
+    g_spare_play_blocks.store(spare_play, std::memory_order_relaxed);
     const bool keeper = env("BBHOST_MEMORY_KEEPER", 1) != 0;
     const bool staging_return = env("BBHOST_STAGING_RETURN", 0) != 0;
     std::thread([=] {
@@ -6665,6 +6881,7 @@ void start_memory_reserve() {
                     if (g.staging_free_bytes + kStagingChunkBytes > std::min(upto, kStagingKeepBytes)) break;
                 }
                 DevBuffer chunk;
+                MemOwner own_mem("upload staging");
                 if (!create_dev_buffer(chunk, kStagingChunkBytes, true)) break;
                 std::lock_guard<GpuMutex> lk(g.mu);
                 g.staging_free.push_back(chunk);
@@ -6689,6 +6906,7 @@ void start_memory_reserve() {
                 mai.allocationSize = kHeapBlock;
                 mai.memoryTypeIndex = type;
                 VkDeviceMemory mem = VK_NULL_HANDLE;
+                MemOwner own_mem("image heap blocks");
                 if (vkAllocateMemory(g.device, &mai, nullptr, &mem) != VK_SUCCESS) {
                     g_vram_refused_ms.store(steady_ms(), std::memory_order_relaxed);
                     break;
@@ -8857,6 +9075,7 @@ void twin_slice_free_locked(int block, VkDeviceSize offset, VkDeviceSize size) {
 bool twin_place_locked(VkDeviceSize bytes, Twin& t) {
     const VkDeviceSize need = (bytes + kTwinAlign - 1) & ~(kTwinAlign - 1);
     if (need > kTwinOwnBytes) {
+        MemOwner own_mem("particle twins");
         if (!create_dev_buffer(t.own, need, false)) return false;
         t.buffer = t.own.buffer, t.offset = 0, t.size = t.own.size, t.address = t.own.address, t.block = -1;
         return true;
@@ -8881,6 +9100,7 @@ bool twin_place_locked(VkDeviceSize bytes, Twin& t) {
         }
         if (round) break;
         TwinBlock nb;
+        MemOwner own_mem("particle twins");
         if (!create_dev_buffer(nb.buf, kTwinBlockBytes, false)) return false;
         nb.free.emplace(0, nb.buf.size);
         g_twin_blocks.push_back(std::move(nb));
@@ -9785,6 +10005,27 @@ void host_gpu_resources_report() {
 std::string host_gpu_image_heap_report() {
     std::lock_guard<GpuMutex> lock(gpu::g.mu);
     return gpu::image_heap_report();
+}
+
+std::string host_gpu_video_memory_report(bool at_exit) {
+    if (!gpu::g.ok || !gpu::vram_report_on()) return {};
+    std::lock_guard<GpuMutex> lock(gpu::g.mu);
+    return gpu::video_memory_report_locked(at_exit);
+}
+
+void host_gpu_log_video_memory(bool at_exit) {
+    const std::string r = host_gpu_video_memory_report(at_exit);
+    if (r.empty()) return;
+    // A line a call: host_log keeps 1 KiB of one, and the lines together pass it.
+    static const std::string sep = "\n[bbhost]   ";
+    std::size_t at = 0;
+    for (int k = 0;; ++k) {
+        const std::size_t nl = r.find(sep, at);
+        const std::string line = r.substr(at, nl == std::string::npos ? std::string::npos : nl - at);
+        host_log(at_exit && k == 0 ? "%s" : "  %s", line.c_str());
+        if (nl == std::string::npos) break;
+        at = nl + sep.size();
+    }
 }
 
 // Per heap: usage and budget as the driver reports them (VK_EXT_memory_budget),
@@ -10769,5 +11010,6 @@ void host_gpu_report() {
     }
     if (glitch_on()) host_log("%s", glitch_report().c_str());
     if (occlusion_on()) host_log("%s", occlusion_report(true).c_str());
+    host_gpu_log_video_memory(true);
     render_report();
 }

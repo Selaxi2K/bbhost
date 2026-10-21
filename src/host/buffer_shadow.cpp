@@ -428,6 +428,7 @@ Mirror* mirror_for(std::uint32_t chunk) {
         vkGetBufferMemoryRequirements(g.device, m.buffer, &req);
         mai.allocationSize = req.size;
         mai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        MemOwner own_mem("mirrors");
         if (mai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(g.device, &mai, nullptr, &m.memory) != VK_SUCCESS) {
             vkDestroyBuffer(g.device, m.buffer, nullptr);
             m.buffer = VK_NULL_HANDLE;
@@ -539,6 +540,7 @@ bool new_stage_chunk(StageChunk& c) {
     VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     mai.allocationSize = req.size;
     mai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    MemOwner own_mem("vertex stage chunks");
     if (mai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(g.device, &mai, nullptr, &c.memory) != VK_SUCCESS) {
         vkDestroyBuffer(g.device, c.buffer, nullptr);
         c = StageChunk{};
@@ -1445,6 +1447,7 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
                     bump(g_imports);
                     return;
                 }
+                MemOwner own_mem("mirror blocks");
                 if (!room || vkAllocateMemory(g.device, &bai, nullptr, &mem) != VK_SUCCESS) {
                     go_dynamic(*m, p, page_va, !room ? "has no room in the mirrors' share of video memory"
                                                      : "has no device memory for its mirror page");
@@ -1649,11 +1652,13 @@ bool snap_ring_make() {
     if (type != UINT32_MAX && !ring_fits_budget(type, req.size, "the rewritten vertex data's ring", &note)) type = UINT32_MAX;
     if (type != UINT32_MAX) {
         mai.memoryTypeIndex = type;
+        MemOwner own_mem("vertex copies ring");
         if (vkAllocateMemory(g.device, &mai, nullptr, &g_snap.memory) == VK_SUCCESS) g_snap.device_local = true;
         note_ring_placed(g_snap.device_local, req.size);
     }
     if (!g_snap.memory) {
         mai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, visible);
+        MemOwner own_mem("vertex copies ring");
         if (mai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(g.device, &mai, nullptr, &g_snap.memory) != VK_SUCCESS) {
             vkDestroyBuffer(g.device, g_snap.buffer, nullptr);
             g_snap.buffer = VK_NULL_HANDLE;
@@ -2261,6 +2266,39 @@ void shadow_flush_at_load_locked(Gpu::Slot& slot) {
         mid_flushed = true;
         g_flush_refusals = g_room_refusals;
         flush_mirrors_locked(slot, "pages refused for want of room in play");
+    }
+}
+
+void shadow_vram_census_locked(ShadowCensus& c) {
+    c = ShadowCensus{};
+    c.live = g_live;
+    c.sparse = g.has_sparse;
+    c.cap = g_live ? 0 : g_mirror_cap;
+    c.given_back = g_given_back;
+    for (const Mirror& m : g_mirrors) {
+        if (!m.buffer) continue;
+        std::uint64_t valid = 0;
+        // The 64 MiB windows of the chunk that hold a copied page: what a
+        // mirror made window by window (no sparse binding) would hold.
+        std::uint32_t windows = 0;
+        for (std::uint32_t w = 0; w * kBlockPages < m.pages.size(); ++w) {
+            bool any = false;
+            for (std::uint32_t p = w * kBlockPages; p < (w + 1) * kBlockPages && p < m.pages.size(); ++p) {
+                const bool held = m.pages[p].valid || (m.sparse && (m.resident[p >> 6] >> (p & 63)) & 1);
+                any |= held;
+                valid += m.pages[p].valid && !m.pages[p].dynamic;
+            }
+            windows += any;
+        }
+        c.windows += windows;
+        if (m.sparse) {
+            c.block_bytes += static_cast<std::uint64_t>(m.blocks.size()) * kBlockPages * kPageBytes;
+            c.blocks += static_cast<std::uint32_t>(m.blocks.size());
+        } else if (m.memory) {
+            c.whole_bytes += kChunkBytes;
+            ++c.whole;
+        }
+        c.data_bytes += valid * kPageBytes;
     }
 }
 

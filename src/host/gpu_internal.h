@@ -15,9 +15,12 @@
 
 // Every vkAllocateMemory/vkFreeMemory in the files that include this header
 // is tagged with its site (gpu_memtrack.cpp), so a VRAM report can say which
-// allocation holds what - the question when several instances share a GPU.
+// allocation holds what - the question when several instances share a GPU -
+// and with its owner where a MemOwner names one (host/gpu_memtrack.h).
 #include <chrono>
 #include <string>
+
+#include "host/gpu_memtrack.h"
 VkResult bb_alloc_memory(VkDevice device, const VkMemoryAllocateInfo* info, const VkAllocationCallbacks* cb,
                          VkDeviceMemory* out, const char* file, int line);
 void bb_free_memory(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks* cb);
@@ -28,7 +31,8 @@ std::string bb_memory_sites_report();
 void bb_memory_test_limit(std::uint32_t types, std::uint64_t bytes);
 // The memory types of the device-local heap: what our allocations hold in
 // them is counted (bb_memory_local_bytes), and the report's sites outside it
-// are marked "@host".
+// are marked "@bar" (another device-local heap: bb_memory_set_heap_classes)
+// or "@host".
 void bb_memory_set_local_types(std::uint32_t types);
 std::uint64_t bb_memory_local_bytes();
 // Whether BBHOST_TEST_VRAM_MB acts out a smaller card: its limit, and what
@@ -733,6 +737,37 @@ void evict_cold_surfaces_locked();
 // Free room in the image heap's blocks of video memory (gpu.cpp).
 std::uint64_t image_heap_vram_free_locked();
 std::string vram_return_report();  // the 5-second report's counts
+// What the image heap's images hold by kind, for the video memory report
+// (video_memory_report, gpu.cpp). Under g.mu. Bytes in video memory, and
+// what a shortage put in host memory apart (rt_host, tex_host).
+struct VramKind {
+    std::uint64_t bytes = 0, n = 0;
+    void add(std::uint64_t b) {
+        bytes += b;
+        ++n;
+    }
+};
+struct VramCensus {
+    // render.cpp: colour and depth targets (g_rts), the display buffers' size
+    // apart; of all three, those no draw, fill or copy has written for 10 s
+    // (rt_idle); copy snapshots (g_snapshots), likewise.
+    VramKind rt_colour, rt_depth, rt_display, rt_idle, snapshots, snap_idle, rt_host;
+    // textures.cpp: surfaces a shader or a copy wrote (and those not written
+    // for 10 s), textures made ahead and never bound, textures no bind looked
+    // up for 20 s (what the cold eviction takes when video memory is down to
+    // the reserve), the rest; copies of targets' regions and level aliases.
+    VramKind gpu_written, gpu_written_idle, tex_ahead, tex_cold, tex_bound, regions, tex_host;
+    // depth_copy.cpp and other images with memory of their own in video
+    // memory: counted by gpu_memtrack's owners instead.
+};
+// display_w x display_h: the display buffers' size (0 x 0: not known).
+void render_vram_census_locked(VramCensus& c, std::uint32_t display_w, std::uint32_t display_h);  // render.cpp
+void textures_vram_census_locked(VramCensus& c);  // textures.cpp
+// The video memory report's lines (gpu.cpp): the driver's count and ours, what
+// is held by kind and owner, what caches hold; at exit also each owner's
+// highest. BBHOST_VRAM_REPORT=0: vram_report_on() is false and nothing is made.
+bool vram_report_on();
+std::string video_memory_report_locked(bool at_exit);
 // Frees `m` with `image` once the recording in progress has retired.
 void defer_destroy_image(VkImage image, const ImageMemory& m);
 std::string image_heap_report();
@@ -1032,6 +1067,18 @@ void shadow_flush_at_load_locked(Gpu::Slot& slot);
 // Whether a loading screen is up (host_gpu_set_loading).
 bool loading_screen_now();
 std::string shadow_report();
+// What the mirrors hold, for the video memory report: whole mirrors (a guest
+// chunk each, where there is no sparse binding) and sparse 64 MiB blocks, and
+// how much of either holds a page copy; the share (cap, 0 with the live
+// share, which follows the budget), and whether they were given back.
+struct ShadowCensus {
+    bool live = false, sparse = false, given_back = false;
+    std::uint64_t cap = 0;
+    std::uint64_t whole_bytes = 0, block_bytes = 0, data_bytes = 0;
+    std::uint32_t whole = 0, blocks = 0;
+    std::uint32_t windows = 0;  // 64 MiB windows of the chunks that hold a page copy or a bound page
+};
+void shadow_vram_census_locked(ShadowCensus& c);
 std::uint64_t fnv1a(const void* data, std::size_t n, std::uint64_t h = 1469598103934665603ull);
 void bind_dummy_images(VkDescriptorSet set, const gcn::TranslateResult& meta, std::vector<VkWriteDescriptorSet>& writes,
                        std::vector<VkDescriptorImageInfo>& infos, VkDescriptorImageInfo& smp_info);

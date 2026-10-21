@@ -645,6 +645,12 @@ if(UNIX)
     target_include_directories(vertex_plan_test PRIVATE src)
     target_link_libraries(vertex_plan_test PRIVATE Vulkan::Headers)
     add_test(NAME vertex_plan_test COMMAND vertex_plan_test)
+    # The device memory tracker's owners and heap classes, with the driver's
+    # allocation calls faked (host/gpu_memtrack.h; tests/gpu_memtrack_test.cpp).
+    add_executable(gpu_memtrack_test tests/gpu_memtrack_test.cpp src/host/gpu_memtrack.cpp)
+    target_include_directories(gpu_memtrack_test PRIVATE src)
+    target_link_libraries(gpu_memtrack_test PRIVATE Vulkan::Headers)
+    add_test(NAME gpu_memtrack_test COMMAND gpu_memtrack_test)
   endif()
   # The engine's classes by the names they register (tools/class_catalog.cpp).
   add_executable(class_catalog tools/class_catalog.cpp src/decomp/insn.cpp)

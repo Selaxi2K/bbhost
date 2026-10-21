@@ -10326,6 +10326,34 @@ void render_return_targets_locked() {
     }
 }
 
+void render_vram_census_locked(VramCensus& c, std::uint32_t display_w, std::uint32_t display_h) {
+    const std::uint64_t now = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    constexpr std::uint64_t kIdleMs = 10000;  // the reuse retire's idle time (BBHOST_IMG_REUSE_IDLE's default)
+    for (const auto& [base, r] : g_rts) {
+        if (!r.image) continue;
+        const std::uint64_t bytes = r.memory.size;
+        if (!image_memory_in_vram(r.memory)) {
+            c.rt_host.add(bytes);
+            continue;
+        }
+        if (r.written_ms && now - r.written_ms >= kIdleMs) c.rt_idle.add(bytes);
+        if (r.depth) c.rt_depth.add(bytes);
+        else if (display_w && r.width == display_w && r.height == display_h) c.rt_display.add(bytes);
+        else c.rt_colour.add(bytes);
+    }
+    for (const auto& [base, r] : g_snapshots) {
+        if (!r.image) continue;
+        const std::uint64_t bytes = r.memory.size;
+        if (!image_memory_in_vram(r.memory)) {
+            c.rt_host.add(bytes);
+            continue;
+        }
+        c.snapshots.add(bytes);
+        if (r.written_ms && now - r.written_ms >= kIdleMs) c.snap_idle.add(bytes);
+    }
+}
+
 std::string render_return_report() {
     if (!g_rt_returned) return {};
     char buf[96];
@@ -11395,6 +11423,7 @@ bool record_target_copy_locked(RtImage& src, RtImage& dst, std::uint32_t width, 
             scratch = DevBuffer{};
             std::uint64_t want = 1ull << 20;
             while (want < need) want <<= 1;
+            MemOwner own_mem("depth copy buffer");
             if (!create_dev_buffer(scratch, want, false)) {
                 scratch = DevBuffer{};
                 return false;
@@ -12574,7 +12603,10 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
             static std::uint64_t scratch_lap = 1;
             // (A snapshot's range was located in imported memory: mapped.)
             if (realign && bytes && bytes <= (1u << 20) && (snapshot || hle_kernel_va_mapped(base, bytes))) {
-                if (!scratch.buffer) create_upload_buffer(scratch, kScratch, "the constant-buffer copies' ring");
+                if (!scratch.buffer) {
+                    MemOwner own_mem("constant-buffer copies ring");
+                    create_upload_buffer(scratch, kScratch, "the constant-buffer copies' ring");
+                }
                 // The same buffer snapshotted again within one recording - a
                 // command buffer, the walk of one submission of the game's -
                 // binds the copy its first snapshot made: the game wrote the
@@ -16406,6 +16438,7 @@ bool tess_ls_pass_locked(const GpuDraw& d, TessDraw& t) {
     // BBHOST_DUMP_ON_BRIGHT, which read it back.
     static const bool ring_read_back = std::getenv("BBHOST_TESS_DEBUG") || std::getenv("BBHOST_DUMP_ON_BRIGHT");
     if (!grows && !ring.buffer) {
+        MemOwner own_mem("tessellation ring");
         if (!create_dev_buffer(ring, kRingBytes, ring_read_back, ring_read_back)) return false;
         std::lock_guard<std::mutex> lk(g_tess_lds_mu);
         g_tess_ring_address = ring.address;
@@ -16441,6 +16474,7 @@ bool tess_ls_pass_locked(const GpuDraw& d, TessDraw& t) {
                 if (!oldest || r.submission < oldest->submission) oldest = &r;
             }
             region = idle;
+            MemOwner own_mem("tessellation ring");
             if (!region && unmade && create_dev_buffer(unmade->buf, kRegionBytes, ring_read_back, ring_read_back)) {
                 region = unmade;
                 std::lock_guard<std::mutex> lk(g_tess_lds_mu);
@@ -16458,6 +16492,7 @@ bool tess_ls_pass_locked(const GpuDraw& d, TessDraw& t) {
             // once there is room (it is free: nothing in flight reads it).
             if (region->buf.in_host && vram_return_on() && vram_room_for(kRegionBytes)) {
                 DevBuffer nb;
+                MemOwner own_mem("tessellation ring");
                 if (create_dev_buffer(nb, kRegionBytes, ring_read_back, ring_read_back) && !nb.in_host) {
                     defer_destroy(region->buf);
                     region->buf = nb;
@@ -18335,6 +18370,7 @@ static bool draw_impl(const GpuDraw& d) {
                         vkFreeMemory(g.device, k.buf.memory, nullptr);
                         k.buf = DevBuffer{};
                     }
+                    MemOwner own_mem("diagnostic readbacks");
                     if (create_dev_buffer(k.buf, bytes, true, true)) {
                         k.width = src->width;
                         k.height = src->height;
@@ -20746,6 +20782,7 @@ void host_gpu_watch_display(std::uint64_t display_va) {
     static bool have_last = false;
     if (!smalls[0].buf.buffer) {
         for (Small& sm : smalls) {
+            MemOwner own_mem("diagnostic readbacks");
             if (!create_dev_buffer(sm.buf, kSide * kSide * 4, true, true)) return;
         }
         VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -20766,6 +20803,7 @@ void host_gpu_watch_display(std::uint64_t display_va) {
         mai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         if (mai.memoryTypeIndex == UINT32_MAX) mai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, 0);
         if (mai.memoryTypeIndex == UINT32_MAX) return;
+        MemOwner own_mem("diagnostic readbacks");
         if (vkAllocateMemory(g.device, &mai, nullptr, &small_mem) != VK_SUCCESS) return;
         vkBindImageMemory(g.device, small, small_mem, 0);
     }
@@ -21014,6 +21052,7 @@ void host_gpu_watch_display(std::uint64_t display_va) {
                     vkFreeMemory(g.device, one.buf.memory, nullptr);
                     one.buf = DevBuffer{};
                 }
+                MemOwner own_mem("diagnostic readbacks");
                 if (create_dev_buffer(one.buf, bytes, true, true)) {
                     one.width = src->width;
                     one.height = src->height;
@@ -21408,6 +21447,7 @@ bool gpu::rt_float_max_locked(RtImage& r, float* out3) {
     if (r.depth || (!half4 && r.format != VK_FORMAT_B10G11R11_UFLOAT_PACK32)) return false;
     const std::size_t bpp = rt_bytes_per_pixel(r);
     DevBuffer staging;
+    MemOwner own_mem("diagnostic readbacks");
     if (!create_dev_buffer(staging, static_cast<std::uint64_t>(r.width) * r.height * bpp, true)) return false;
     begin_recording_locked();
     render_end_pass_locked();
@@ -21453,6 +21493,7 @@ bool record_target_readback(RtImage& r, DevBuffer& staging, TargetPixels& out) {
     out.format = r.format;
     out.depth = depth;
     out.bpp = depth ? 4 : rt_bytes_per_pixel(r);
+    MemOwner own_mem("diagnostic readbacks");
     if (!create_dev_buffer(staging, static_cast<std::uint64_t>(r.width) * r.height * out.bpp, true, true)) return false;
     begin_recording_locked();
     render_end_pass_locked();
@@ -21473,6 +21514,7 @@ bool record_stencil_readback(RtImage& r, DevBuffer& staging, TargetPixels& out) 
     out.depth = false;
     out.stencil = true;
     out.bpp = 1;
+    MemOwner own_mem("diagnostic readbacks");
     if (!create_dev_buffer(staging, (static_cast<std::uint64_t>(r.width) * r.height + 3) & ~3ull, true, true)) return false;
     begin_recording_locked();
     render_end_pass_locked();

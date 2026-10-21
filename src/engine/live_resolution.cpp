@@ -1309,6 +1309,13 @@ void live_resolution_go_back() {
     }
 }
 
+bool live_resolution_display_size(unsigned* w, unsigned* h) {
+    if (!g_display[0] || !g_display[1]) return false;
+    if (w) *w = g_display[0];
+    if (h) *h = g_display[1];
+    return true;
+}
+
 std::uint64_t live_resolution_current(unsigned* w, unsigned* h) {
     const std::uint64_t c = g_current.load();
     if (w) *w = static_cast<unsigned>(c >> 32);
