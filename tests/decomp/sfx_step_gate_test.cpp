@@ -54,6 +54,11 @@
 //     between whole steps none of that moves and no point is smoothed; on
 //     every frame the last drawn point the emitter at the frame's own time, the
 //     record's times as the game's one call leaves them, the definition back;
+//   - the same record update with type 0x2713 under the smooth steps: a smooth
+//     instance's (marked for the frame) the game's call with the whole step's
+//     elapsed time for the type's curves, the record's times then the frame's
+//     and its elapsed one the type's again for the draw; an unmarked one or
+//     the game's own still frame the game's call;
 //   - the wind sources' registry step, 0x1314660, with the game's own wind
 //     sources (0x56ec140, stepped by 0x2d552d0) and default objects: the
 //     smooth steps off, the game's own still frame or a step not the effect
@@ -1228,6 +1233,74 @@ int check_records(int cases, u64 sfx) {
     return bad;
 }
 
+// --- GPU particle type 0x2713 under the smooth steps -------------------------------------
+
+// A smooth instance's 0x2713 record (marked for the frame): its type reads its curves at the whole step's elapsed time
+// (1/30 on the manager's and the instance's scales) - the game's call with that step - and the record's times end as the
+// frame's step leaves them, the previous one where the draw reads the same elapsed time; an unmarked one (a held
+// instance's, a pre-roll's) or the game's own still frame, the game's call as it is.
+struct Seen2713 {
+    long cases = 0, whole = 0, game = 0, prev_nudged = 0;
+} g_seen_2713;
+int check_records_smooth(int cases, u64 sfx, u64 manager) {
+    const auto game = eboot_kit::fn<GxRecordFn>(kGxRecordUpdate);
+    int bad = 0;
+    decomp_sfx_smooth(true);
+    for (int c = 0; c < cases; ++c) {
+        g_blocks.clear();
+        const Record r = make_record(true);
+        const u64 node = load<u64>(r.record + 0x10), inst = block(0x98);
+        store<u64>(node + 0x58, inst);
+        const float scale = g_rng.chance(0.6) ? 1.0f : value(0.5f, 2.0f), time_scale = g_rng.chance(0.7) ? 1.0f : value(0.5f, 1.5f);
+        store<float>(inst + 8, scale);
+        store<float>(manager + 0x5d8, time_scale);
+        const bool still = g_rng.chance(0.1), marked = g_rng.chance(0.8), between = g_rng.chance(0.6);
+        store<u32>(sfx + 0x8c, still ? 1u : 0u);
+        const float frame = value(1.0f / 240, 1.0f / 31);
+        decomp_sfx_step_frame(between);
+        decomp_sfx_frame_time(frame, 0.0f, 0.0f);
+        if (marked) ribbon_mark(r.type);
+        const float step = frame * time_scale * scale;
+        store<float>(r.item + 0x60, step);
+        const std::vector<u8> before = record_bytes(r);
+        const bool takes = marked && !still;
+        const float whole = 1.0f / 30.0f * time_scale * scale;
+        // the reference: the game's call with the whole step (when it takes), else with the item as it is
+        if (takes) store<float>(r.item + 0x60, whole);
+        game(r.record, r.item);
+        store<float>(r.item + 0x60, step);
+        const std::vector<u8> theirs = record_bytes(r);
+        put_record(r, before);
+        sfx_gx_record_update(r.record, r.item);
+        const std::vector<u8> ours = record_bytes(r);
+        ++g_seen_2713.cases;
+        const char* why = nullptr;
+        if (!takes) {
+            ++g_seen_2713.game;
+            if (ours != theirs) why = "not marked, or the still frame: the game's call";
+        } else {
+            ++g_seen_2713.whole;
+            // the type and every record byte but the two times as the game's call with the whole step
+            std::vector<u8> want = theirs;
+            std::memcpy(want.data() + 0x24, ours.data() + 0x24, 8);
+            const float c0 = load<float>(reinterpret_cast<u64>(before.data()) + 0x28);
+            const float cur = load<float>(reinterpret_cast<u64>(ours.data()) + 0x28), prev = load<float>(reinterpret_cast<u64>(ours.data()) + 0x24);
+            const float elapsed = sub_ss(load<float>(reinterpret_cast<u64>(theirs.data()) + 0x28), c0);
+            if (ours != want) why = "the type's values (the curves at the whole step's elapsed time)";
+            else if (bits(cur) != bits(add_ss(c0, step))) why = "the record's time (the frame's step on it)";
+            else if (bits(sub_ss(cur, prev)) != bits(elapsed)) why = "the elapsed time the draw reads";
+            g_seen_2713.prev_nudged += bits(prev) != bits(sub_ss(cur, elapsed));
+        }
+        put_record(r, before);
+        if (why && ++bad <= 6 && !g_quiet)
+            std::printf("smooth 0x2713 record case %d (marked %d, still %d, scale %g x %g): %s differs\n", c, marked, still, scale, time_scale, why);
+    }
+    decomp_sfx_smooth(false);
+    decomp_sfx_step_frame(false);
+    store<u32>(sfx + 0x8c, 0u);
+    return bad;
+}
+
 // --- the wind sources' registry step ---------------------------------------------------
 
 // A registry (*0x58b0bb0): +0x28 a list's sentinel, each node's +0 the next and +0x10 its entry, an entry's +0x48 its
@@ -1939,6 +2012,23 @@ int main() {
         }
     }
     g_sfx_gate_mutant = 0;
+    // GPU particle type 0x2713 under the smooth steps.
+    g_quiet = false;
+    g_rng.specials = false;
+    const int s2bad = check_records_smooth(kCases, sfx, manager);
+    std::printf("decomp_sfx_step_gate: %d smooth GPU particle type 0x2713 record cases (%ld at the whole step's elapsed time, %ld the game's; %ld "
+                "previous times moved by an ulp or more to keep the draw's elapsed time), %d differ\n",
+                kCases, g_seen_2713.whole, g_seen_2713.game, g_seen_2713.prev_nudged, s2bad);
+    if (s2bad) return 1;
+    g_quiet = true;
+    for (const int m : {40, 41}) {
+        g_sfx_gate_mutant = m;
+        if (!check_records_smooth(2000, sfx, manager)) {
+            std::printf("decomp_sfx_step_gate: mutant %d not caught by the smooth 0x2713 records\n", m);
+            ++missed;
+        }
+    }
+    g_sfx_gate_mutant = 0;
     // The wind sources' registry step.
     g_game_wind_step = eboot_kit::at(kWindSourcesStep);
     g_quiet = false;
@@ -2004,6 +2094,6 @@ int main() {
         }
     }
     g_sfx_gate_mutant = 0;
-    std::printf("decomp_sfx_step_gate: %d of 37 mutants caught\n", 37 - missed);
+    std::printf("decomp_sfx_step_gate: %d of 39 mutants caught\n", 39 - missed);
     return missed ? 1 : 0;
 }

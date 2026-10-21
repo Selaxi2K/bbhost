@@ -38,7 +38,9 @@
 #include <atomic>
 #include <bit>
 #include <cstdint>
+#include <cmath>
 #include <cstring>
+#include <limits>
 
 #include "log.h"
 
@@ -105,7 +107,7 @@ std::atomic<u64> g_smooth_updates{0}, g_smooth_kept{0};
 std::atomic<u64> g_lights_smooth{0}, g_lights_counted{0}, g_fades_smooth{0};
 std::atomic<u64> g_frames_between{0}, g_instances_held{0}, g_lights_held{0}, g_motions_held{0}, g_still_frames{0}, g_records_held{0};
 std::atomic<u64> g_ribbons_between{0}, g_ribbons_whole{0}, g_ribbons_unmarked{0};
-std::atomic<u64> g_wind_steps_smooth{0}, g_wind_steps_other{0};
+std::atomic<u64> g_wind_steps_smooth{0}, g_wind_steps_other{0}, g_records_whole{0};
 
 // The ribbons (their GX types) of the instances the smooth steps run this frame, marked as smooth_update takes an
 // instance, for the record update: it runs later from the render context's queue, and a pre-roll's (sub_2c500e0's
@@ -139,9 +141,14 @@ bool ribbon_marked(u64 type) {
     return false;
 }
 
-// The game's vaddss x, x, y: the record's time plus an item's step, as sub_2cbcf50 adds them.
+// The game's vaddss x, x, y: the record's time plus an item's step, as sub_2cbcf50 adds them; and vsubss, its
+// elapsed time.
 inline float add_ss(float x, float y) {
     __asm__("addss %1, %0" : "+x"(x) : "x"(y));
+    return x;
+}
+inline float sub_ss(float x, float y) {
+    __asm__("subss %1, %0" : "+x"(x) : "x"(y));
     return x;
 }
 
@@ -217,11 +224,12 @@ constexpr u64 kManagerOf = 0x70;  // SprjSfx +0x70: the effect manager (its time
 // counted part sfx_light_update runs once a whole step
 // (tests/decomp/sfx_step_gate_test.cpp). Off the list, and so on the held
 // frames as with 30: the wobble motions 0x570e6d0, 0x570e690 and 0x570e8d0
-// (they count their updates), the module 0x5760f20, the GPU particle types 0x2712
-// (0x56eb030: whole grid passes of elapsed x 30) and 0x2713 (0x56eb0d0: its
-// parameters are curves read at the elapsed time). The ribbon, FFX-format GX
-// type 0x28, is on it for sfx_gx_record_update, which inserts its points once a
-// whole step at the whole step's time (tests/decomp/sfx_step_gate_test.cpp).
+// (they count their updates), the module 0x5760f20 and the GPU particle type
+// 0x2712 (0x56eb030: whole grid passes of elapsed x 30). The ribbon, FFX-format
+// GX type 0x28, and the GPU particle type 0x2713 (its parameters curves read at
+// the elapsed time) are on it for sfx_gx_record_update, which inserts the
+// ribbon's points once a whole step at the whole step's time and gives 0x2713's
+// curves the whole step's elapsed time (tests/decomp/sfx_step_gate_test.cpp).
 constexpr u64 kConverted[] = {
     0x570e650,  // motion: velocity along itself by step x speed curve x +0x24, position by step x velocity, facing the move
     0x570e610,  // motion: the same with gravity (data_5ad1150 x a curve at the node's time, in the parent's frame) by step
@@ -247,6 +255,7 @@ constexpr u64 kConverted[] = {
     0x56eadf0,  // GX type 0x283c: a wind source; its fade += the elapsed time, its velocity the move over it (0 for none)
     0x56eac40,  // GX type 0x283d: a wind source without the velocity; its fade += the elapsed time
     0x56e3620,  // GX type 0x28 (FFX format): a ribbon; its inserts once a whole step at its time (sfx_gx_record_update)
+    0x56eb0d0,  // GPU particle type 0x2713: its curves read at the whole step's elapsed time (sfx_gx_record_update)
 };
 const u64* g_converted = kConverted;
 std::size_t g_converted_count = sizeof kConverted / sizeof kConverted[0];
@@ -317,7 +326,7 @@ u64 first_unconverted(u64 instance) {
     return 0;
 }
 
-// The instance's ribbons marked for this frame (ribbon_mark); false when one finds no slot.
+// The instance's ribbons and GPU particle types 0x2713 marked for this frame (ribbon_mark); false when one finds no slot.
 bool mark_ribbons(u64 instance) {
     const auto next_of = game_function<NextFn>(kNodeNext);
     for (u64 node = load<u64>(instance + 0x78); node; node = next_of(node))
@@ -326,7 +335,8 @@ bool mark_ribbons(u64 instance) {
             if (!target || load<u64>(target) != game_address(0x56e3100)) continue;
             const u64 holder = load<u64>(target + 0x10);
             const u64 type = holder ? load<u64>(holder + 8) : 0;
-            if (type && load<u64>(type) == game_address(kGxTypeRibbon) && !ribbon_mark(type)) return false;
+            if (type && (load<u64>(type) == game_address(kGxTypeRibbon) || load<u64>(type) == game_address(kGxType2713)) && !ribbon_mark(type))
+                return false;
         }
     return true;
 }
@@ -385,7 +395,7 @@ DECOMP_LEAF u8 sfx_instance_update(u64 instance, u64 context, float step) {
                 count_kept(kept);
             } else if (!mark_ribbons(instance)) {
                 g_smooth_kept.fetch_add(1, std::memory_order_relaxed);
-                count_kept(game_address(kGxTypeRibbon));  // no room to mark a ribbon this frame: held, as at 30
+                count_kept(game_address(kGxTypeRibbon));  // no room to mark a ribbon (or a 0x2713) this frame: held, as at 30
             } else {
                 return smooth_update(instance, context, step);
             }
@@ -715,6 +725,33 @@ DECOMP_LEAF void sfx_gx_record_update(u64 record, u64 item) {
             return;
         }
     }
+    if (type && load<u64>(type) == game_address(kGxType2713) && g_smooth.load(std::memory_order_relaxed) && ribbon_marked(type)) {
+        // A smooth instance's GPU particle type 0x2713 (marked by its instance's update this frame): its update reads its
+        // five curves at the record's elapsed time, as does its draw - the whole step's at 30. The game's call with the
+        // whole step (1/30 on the manager's and the instance's scales) for the type's update, then the record's times as
+        // the frame's step leaves them, the previous one where the draw reads the same elapsed time again.
+        const u64 sfx = load<u64>(game_address(kSprjSfx));
+        const u64 manager = sfx ? load<u64>(sfx + kManagerOf) : 0;
+        const u64 node = load<u64>(record + 0x10);
+        const u64 instance = node ? load<u64>(node + 0x58) : 0;
+        const float step = load<float>(item + 0x60);
+        if (manager && instance && !load<u32>(sfx + 0x8c) && step > 0.0f) {
+            g_records_whole.fetch_add(1, std::memory_order_relaxed);
+            const float whole = 1.0f / 30.0f * load<float>(manager + 0x5d8) * load<float>(instance + 8);
+            const float before = load<float>(record + 0x28);
+            if (!MUTANT(40)) store<float>(item + 0x60, whole);
+            game(record, item);
+            store<float>(item + 0x60, step);
+            if (MUTANT(40)) return;
+            const float elapsed = sub_ss(load<float>(record + 0x28), before), cur = add_ss(before, step);
+            float prev = sub_ss(cur, elapsed);
+            for (int k = 0; k < 8 && sub_ss(cur, prev) != elapsed; ++k)
+                prev = std::nextafter(prev, sub_ss(cur, prev) > elapsed ? std::numeric_limits<float>::infinity() : -std::numeric_limits<float>::infinity());
+            store<float>(record + 0x24, MUTANT(41) ? before : prev);
+            store<float>(record + 0x28, cur);
+            return;
+        }
+    }
     const bool is_2713 = type && (load<u64>(type) == game_address(kGxType2713) || MUTANT(15));
     if (!is_2713 || (load<float>(item + 0x60) != 0.0f && !MUTANT(16)) || (load<u32>(record + 0x24) == load<u32>(record + 0x28) && !MUTANT(17)) ||
         !between_steps()) {
@@ -789,8 +826,9 @@ void report() {
     host_log("decomp:   ribbon updates: %llu between whole steps (the head by the frame's time, nothing inserted), %llu on frames with one, "
              "%llu not a smooth instance's (a pre-roll's or a held one's: the game's)",
              static_cast<ull>(g_ribbons_between.load()), static_cast<ull>(g_ribbons_whole.load()), static_cast<ull>(g_ribbons_unmarked.load()));
-    host_log("decomp:   wind source steps by the frame's time: %llu (%llu another caller's, the game's)", static_cast<ull>(g_wind_steps_smooth.load()),
-             static_cast<ull>(g_wind_steps_other.load()));
+    host_log("decomp:   wind source steps by the frame's time: %llu (%llu another caller's, the game's); GPU particle type 0x2713 records at "
+             "the whole step's elapsed time: %llu",
+             static_cast<ull>(g_wind_steps_smooth.load()), static_cast<ull>(g_wind_steps_other.load()), static_cast<ull>(g_records_whole.load()));
     for (std::size_t i = 0; i < kKeptSlots; ++i) {
         const u64 vt = g_kept_class[i].load();
         if (!vt) break;
