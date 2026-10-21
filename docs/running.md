@@ -272,10 +272,14 @@ the same speed at every rate (`engine/frame_rate.cpp`, from Kyo's FPS++ lists
 and yogesh1239's high-FPS fixes). The play time adds each frame's milliseconds
 with the fractions kept (the game drops them: its clock ran 4% slow at 60 and
 120). The effects - fire, lamps', candles' and braziers' flicker, blood,
-magic, every effect the game's effect manager runs - and the wind that sways
-grass and trees step in whole 1/30 s above 30, as many times a second as at
-30 (every other frame at 60, every fourth at 120), the flicker and the sway
-keeping the cadence the game has at 30. The frames between whole steps still
+magic, every effect the game's effect manager runs - step in whole 1/30 s
+above 30, as many times a second as at 30 (every other frame at 60, every
+fourth at 120), the flicker keeping the cadence the game has at 30. The wind
+that sways grass and trees moves every frame at 30's pace: the game steps it a
+fixed 1/60 s each 1/30 s frame, so above 30 it takes half each frame's step,
+and its bend keeps the game's weight of 1/60 (`engine/wind_pace.h`;
+`BBHOST_WIND_PACE=0` steps it by the frame's time with a weight of 1/30, twice
+30's pace and bend). The frames between whole steps still
 run the effects' update, so effects follow what they ride on and are drawn
 every frame, but with what the game counts in updates held for the next
 whole step - a node's state, its emissions and the definitions its
@@ -284,8 +288,8 @@ motion's turns and its lag toward what it follows
 (`decomp/sfx/step_gate.cpp`; `BBHOST_SFX_GATE=0` lets them count, as when
 Ebrietas's attacks left sparks that never ended at 60, and `=1` holds them
 with 60 too). `[video] effect_steps = 60` steps the effects in whole 1/60 s
-instead (60 updates a second above 60) and the wind by the frame's time;
-`frame` steps both by the frame's time. `smooth` keeps 30's whole steps
+instead (60 updates a second above 60); `frame` steps them by the frame's
+time. `smooth` keeps 30's whole steps
 for what the effects count and moves what they move by time - a particle's
 path, a motion's turn, the GPU particles' clock - by each frame's own time,
 in the effects whose every part has been converted for it; the rest run as
