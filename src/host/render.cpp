@@ -16408,13 +16408,15 @@ bool tess_ls_pass_locked(const GpuDraw& d, TessDraw& t) {
     // twice as many as submissions in flight, until 16 submissions in flight
     // would have made them 8 MiB.)
     //
-    // With small video memory (gpu.cpp, small_vram) the ring grows as it is
-    // needed instead of being made whole at the first tessellated draw: each
-    // region is a buffer of its own, and a recording takes the region that
-    // has been free longest (its submission and the two after it have run),
-    // a new one while fewer than 16 are made, and only then waits for the
-    // oldest - so the ring holds as many regions as recordings in flight
-    // really use. BBHOST_TESS_RING=grow / =whole says instead.
+    // The ring grows as it is needed instead of being made whole at the
+    // first tessellated draw: each region is a buffer of its own, and a
+    // recording takes the region that has been free longest (its submission
+    // and the two after it have run), a new one while fewer than 16 are
+    // made, and only then waits for the oldest - so the ring holds as many
+    // regions as recordings in flight really use: 4-5 of the 16 (64-80 MiB
+    // of 256) over the tour's places on 4 and 6 GB budgets, where it grew
+    // first (small_vram). BBHOST_TESS_RING=whole makes it whole at the first
+    // tessellated draw, as before.
     static DevBuffer ring;
     constexpr std::uint64_t kRingBytes = kTessRingBytes;
     constexpr std::uint64_t kRegions = kTessRegions;
@@ -16429,7 +16431,7 @@ bool tess_ls_pass_locked(const GpuDraw& d, TessDraw& t) {
     static Region* current = nullptr;
     static const bool grows = [] {
         const char* e = std::getenv("BBHOST_TESS_RING");
-        return e && *e ? std::strcmp(e, "grow") == 0 : g.small_vram;
+        return !(e && std::strcmp(e, "whole") == 0);
     }();
     // Device-local: the stages behind it read and write it all draw long - the
     // game's own hull shaders and their domain shaders, at up to 16 cells a

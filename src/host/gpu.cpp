@@ -2666,11 +2666,11 @@ std::atomic<int> g_tight{-1};  // memory_tight of the device run on, -1 until kn
 // Whether the device is a discrete GPU with little video memory free for us:
 // under 7.5 GiB at the start (BBHOST_TEST_VRAM_MB's limit when a smaller card
 // is acted out). Then the settings that hold memory ahead are cut - spare
-// image heap blocks, kept untile scratch, a tessellation ring made whole,
-// display buffers for sizes the run may never use - on top of the reserve
-// and the live mirror share. Not on an integrated GPU or with tight memory,
-// which have settings of their own (a Steam Deck). BBHOST_SMALL_VRAM=0/1
-// says instead.
+// image heap blocks, kept untile scratch, display buffers for sizes the run
+// may never use - on top of the reserve and the live mirror share (the
+// tessellation ring grows as it is needed on every card). Not on an
+// integrated GPU or with tight memory, which have settings of their own (a
+// Steam Deck). BBHOST_SMALL_VRAM=0/1 says instead.
 std::uint64_t start_vram_free(const Candidate& c) {
     std::uint64_t free = c.local_free;
     if (const char* t = std::getenv("BBHOST_TEST_VRAM_MB"); t && std::strtoull(t, nullptr, 10))
@@ -2827,7 +2827,7 @@ bool init_locked() {
             g.small_vram = g_small.load() == 1;
             if (g.small_vram)
                 host_log("gpu: %llu MiB of video memory free at the start: small video memory (BBHOST_SMALL_VRAM=0 says otherwise) - no "
-                         "spare image heap blocks in play, less untile scratch kept, a tessellation ring that grows as it is needed",
+                         "spare image heap blocks in play, less untile scratch kept",
                          static_cast<unsigned long long>(start_vram_free(c) >> 20));
         }
         if (g_tight.exchange(g.tight ? 1 : 0) == (g.tight ? 0 : 1))
