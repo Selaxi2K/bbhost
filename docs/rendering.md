@@ -196,9 +196,12 @@ detiling, the buffer shadow's mirrors). `BBHOST_IMPORT_WINDOWS=1` imports
 only what is used, a 16 MB window at a time when something first needs it or
 when the engine makes a resource there (on a thread of its own); an import
 over several windows replaces the ones it covers, so no page is imported
-twice, and a dispatch imports what its shader reads and stores. It is off by
-default (`gpu.import_windows` in the config turns it on too): the work under
-way moves each of those uses off guest memory, and windows are then only the
+twice, and a dispatch imports what its shader reads and stores (an import a
+draw waits for is counted in the log's `frames:` and `stall:` lines, `imports
+waited for N in M ms`, and the exit report gives the driver's time by the
+thread that waited). It is off by default (`gpu.import_windows` in the config
+turns it on too): the work under way moves each of those uses off guest
+memory, and windows are then only the
 fallback for what is not moved yet. The Steam Deck kit turns it on: there the
 memory shared with the GPU stays under the driver's budget and the start is
 about 3 s sooner, at the same frame rate (its device-local twins, below, stay

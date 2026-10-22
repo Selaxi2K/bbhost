@@ -423,6 +423,10 @@ bool host_gpu_counter_fill(std::uint64_t dst, std::uint32_t value, std::size_t b
 // it in place, its windows are imported ahead of their first use on a thread
 // of their own; nothing otherwise. Any thread, any lock.
 void host_gpu_import_prefetch(std::uint64_t va, std::uint64_t bytes, std::uint8_t usage, std::uint8_t bind);
+// The guest memory imports the command processor waited for so far - made at
+// a binding, a device address or a walk, not by the import thread - and the
+// driver's time they took (the frames and stall lines' "imports waited for").
+void host_gpu_import_waits(std::uint64_t* n, std::uint64_t* us);
 // A GX buffer was made over [memory, memory + bytes) with this usage, these
 // bind flags and the registry's generation: with BBHOST_GX_TWINS=1 one the
 // GPU writes (usage default, unordered-access bind) gets a device-local twin

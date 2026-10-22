@@ -750,6 +750,12 @@ void note_copied_locked(std::uint64_t dst) {
     ++c.copies;
 }
 std::atomic<std::uint64_t> g_import_who_n[kImportWhos], g_import_who_bytes[kImportWhos];
+// The driver's time of each import by the path that made it: the import
+// thread's (bb-import) keeps nobody waiting; any other import's time is the
+// time of the thread that asked for it - the command processor's, at a
+// binding, a device address or a walk (under the renderer's lock, so whatever
+// else wants it waits too), the mapping thread's for a whole span.
+std::atomic<std::uint64_t> g_import_who_us[kImportWhos], g_import_wait_max_us{0};
 std::atomic<std::uint64_t> g_imports_retired{0}, g_import_retired_bytes{0};
 std::atomic<std::uint64_t> g_dispatch_read_imports{0}, g_dispatch_untraced{0};  // window imports of what dispatches read
 
@@ -793,6 +799,13 @@ std::unique_ptr<Chunk> make_import(std::uint32_t index, std::uint64_t lo, std::u
     const int who = t_import_who >= 0 && t_import_who < kImportWhos ? t_import_who : kIwBinding;
     g_import_who_n[who].fetch_add(1, std::memory_order_relaxed);
     g_import_who_bytes[who].fetch_add(size, std::memory_order_relaxed);
+    g_import_who_us[who].fetch_add(static_cast<std::uint64_t>(us), std::memory_order_relaxed);
+    if (who != kIwPrefetch && who != kIwSpan) {
+        std::uint64_t was = g_import_wait_max_us.load(std::memory_order_relaxed);
+        while (static_cast<std::uint64_t>(us) > was &&
+               !g_import_wait_max_us.compare_exchange_weak(was, static_cast<std::uint64_t>(us), std::memory_order_relaxed)) {
+        }
+    }
     if (g_imports_made.fetch_add(1, std::memory_order_relaxed) < 8 || size > (256ull << 20)) {
         host_log("gpu: dmem chunk %u: +%llu MiB, %llu MiB imported at device address 0x%llx in %lld us", index,
                  static_cast<unsigned long long>(lo >> 20), static_cast<unsigned long long>(size >> 20),
@@ -7901,6 +7914,16 @@ void host_gpu_import_prefetch(std::uint64_t va, std::uint64_t bytes, std::uint8_
     g_pf_cv.notify_one();
 }
 
+void host_gpu_import_waits(std::uint64_t* n, std::uint64_t* us) {
+    std::uint64_t cn = 0, cus = 0;
+    for (const int who : {kIwBinding, kIwAddress, kIwWalk}) {
+        cn += g_import_who_n[who].load(std::memory_order_relaxed);
+        cus += g_import_who_us[who].load(std::memory_order_relaxed);
+    }
+    if (n) *n = cn;
+    if (us) *us = cus;
+}
+
 bool host_gpu_init(const char* const* instance_exts, std::uint32_t n_exts, bool want_present) {
     if (g_imports_whole.load(std::memory_order_relaxed) < 0) imports_whole_decide();  // the config is read by now
     std::lock_guard<GpuMutex> lock(g.mu);
@@ -11292,6 +11315,17 @@ void host_gpu_report() {
                  static_cast<ull>(g_import_who_n[kIwSpan].load()), mib(g_import_who_bytes[kIwSpan]), static_cast<ull>(g_imports_merged.load()),
                  static_cast<ull>(g_imports_retired.load()), mib(g_import_retired_bytes), static_cast<ull>(live >> 20), nlive,
                  static_cast<ull>(flex >> 20));
+        // Who waited for the driver: the import thread's imports keep nobody waiting.
+        const auto ms = [](const std::atomic<std::uint64_t>& us) { return static_cast<double>(us.load()) / 1e3; };
+        host_log("gpu: guest memory imports waited for (the driver's time of the thread that asked): by the paths that needed them %llu in %.0f ms "
+                 "(bindings %llu in %.0f, device addresses %llu in %.0f, walks %llu in %.0f; the longest %.1f ms), whole spans %llu in %.0f ms; "
+                 "the import thread's %llu in %.0f ms",
+                 static_cast<ull>(g_import_who_n[kIwBinding].load() + g_import_who_n[kIwAddress].load() + g_import_who_n[kIwWalk].load()),
+                 ms(g_import_who_us[kIwBinding]) + ms(g_import_who_us[kIwAddress]) + ms(g_import_who_us[kIwWalk]),
+                 static_cast<ull>(g_import_who_n[kIwBinding].load()), ms(g_import_who_us[kIwBinding]), static_cast<ull>(g_import_who_n[kIwAddress].load()),
+                 ms(g_import_who_us[kIwAddress]), static_cast<ull>(g_import_who_n[kIwWalk].load()), ms(g_import_who_us[kIwWalk]),
+                 ms(g_import_wait_max_us), static_cast<ull>(g_import_who_n[kIwSpan].load()), ms(g_import_who_us[kIwSpan]),
+                 static_cast<ull>(g_import_who_n[kIwPrefetch].load()), ms(g_import_who_us[kIwPrefetch]));
         if (!imports_whole()) {
             host_log("gpu: import prefetch: %llu asked, %llu already imported, %llu looked at, %llu imports made (%llu MiB), %llu dropped as a "
                      "binding imported first, %llu not queued; dispatches: %llu reads imported, %llu with a base that does not trace "
