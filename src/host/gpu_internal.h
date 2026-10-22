@@ -433,6 +433,7 @@ struct Gpu {
     // gpu.cpp arena_place_locked): its map function and the alignment a
     // placed mapping takes.
     bool has_placed_map = false;
+    const char* placed_missing = "not asked for";  // why has_placed_map is false, for the arena's log
     void* map_memory2 = nullptr;  // PFN_vkMapMemory2KHR
     VkDeviceSize placed_align = 0;
     // Vulkan 1.3's pipelineCreationCacheControl: a pipeline can be asked for

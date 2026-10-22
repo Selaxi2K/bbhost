@@ -515,8 +515,10 @@ void arena_report() {
         std::snprintf(b, sizeof b, "%s%s %llu", w ? ", " : "", kWhyName[w], v(g_fell[w]));
         fell += b;
     }
-    host_log("gxvk arena: %s; the heap's bindings %s: %s; today's path because %s", g_mode == Arena::kInPlace ? "bound in place" : "compared",
-             g_mode == Arena::kInPlace ? "in place" : "that would be in place", bound.c_str(), fell.c_str());
+    const bool placing = g_mode == Arena::kInPlace || g_mode == Arena::kMoved;
+    host_log("gxvk arena: %s; the heap's bindings %s: %s; today's path because %s",
+             g_mode == Arena::kCompare ? "compared" : g_moved.load() == 1 ? "bound in place, the heap moved" : "bound in place",
+             placing ? "in place" : "that would be in place", bound.c_str(), fell.c_str());
     host_log("gxvk arena: the release proof: %llu hand-outs recorded (%llu outside the heap), %llu alive at most; %llu handed out again before "
              "their binding's submission completed; bytes checked %llu (%llu skipped: handed out again first, or the ring full), %llu changed "
              "under a queued draw%s",

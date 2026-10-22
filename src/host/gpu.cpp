@@ -1300,7 +1300,11 @@ void arena_place_locked() {
     std::uint64_t va = 0, bytes = 0;
     if (!gxvk::arena_move_pending(&va, &bytes)) return;
 #if defined(VK_EXT_map_memory_placed) && defined(VK_KHR_map_memory2) && !defined(_WIN32)
-    if (!g.has_placed_map) return gxvk::arena_moved(false, "the device cannot place a mapping (VK_EXT_map_memory_placed)");
+    if (!g.has_placed_map) {
+        char why[160];
+        std::snprintf(why, sizeof why, "the device cannot place a mapping (%s)", g.placed_missing);
+        return gxvk::arena_moved(false, why);
+    }
     if (g.placed_align && (va % g.placed_align || bytes % g.placed_align))
         return gxvk::arena_moved(false, "the mapping is not at the alignment placing takes");
     Chunk c;
@@ -2936,6 +2940,10 @@ bool init_locked() {
         // build's headers know the extension.
 #if defined(VK_EXT_map_memory_placed) && defined(VK_KHR_map_memory2)
         g.has_placed_map = c.placed_map && c.map_memory2 && gxvk::arena_mode() == gxvk::Arena::kMoved;
+        if (gxvk::arena_mode() == gxvk::Arena::kMoved)
+            g.placed_missing = !c.placed_map ? "the device has no VK_EXT_map_memory_placed" : !c.map_memory2 ? "the device has no VK_KHR_map_memory2" : "";
+#else
+        g.placed_missing = "this build's Vulkan headers have no VK_EXT_map_memory_placed";
 #endif
         g.has_push_descriptor = c.push;
         g.has_device_fault = c.fault;
@@ -3261,6 +3269,7 @@ bool init_locked() {
             dext.push_back("VK_EXT_map_memory_placed");
         } else {
             g.has_placed_map = false;
+            g.placed_missing = "the device's memoryMapPlaced feature is off";
         }
     }
 #endif
@@ -3574,7 +3583,10 @@ bool init_locked() {
         p2.pNext = &pp;
         vkGetPhysicalDeviceProperties2(g.phys, &p2);
         g.placed_align = pp.minPlacedMemoryMapAlignment;
-        if (!g.map_memory2) g.has_placed_map = false;
+        if (!g.map_memory2) {
+            g.has_placed_map = false;
+            g.placed_missing = "the device gave no vkMapMemory2KHR";
+        }
     }
 #endif
     if (g.device) {
