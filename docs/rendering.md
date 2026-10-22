@@ -741,7 +741,13 @@ the params ring; the constant-buffer copies' ring then goes in host memory.
 A step that fails is undone - the heap host memory again, with every write
 GX made - and the log says which and why; `=2` then binds in place as `=1`
 does - with the heap in bbhost's pieces when the driver has no placed
-mappings (lavapipe), in the game's region on Windows.
+mappings (lavapipe), in the game's region on Windows. Measured on an RTX
+4070, `=2` loses about two thirds of the frame rate although every move
+worked - uncapped, Old Yharnam from 90.8 to 31.7 fps, the Nightmare of
+Mensis from 90.9 to 34.4 and Central Yharnam from 105.2 to 31.6, and 31-34
+fps at 60 - because the CPU reads the heap too: bbhost's copies of GX's
+renamed buffers and the game's main thread, and the CPU reads video memory
+at about 30 MB/s. So it stays off, and the heap stays in host memory.
 
 ## Tools
 
