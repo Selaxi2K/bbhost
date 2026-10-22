@@ -10355,7 +10355,11 @@ namespace {
 // records, one target at most and once a second.
 std::uint64_t g_rt_returned = 0, g_rt_returned_bytes = 0;  // under g.mu
 
-bool rt_return_one_locked(RtImage& r) {
+// The image made again in other memory: `existing_room` - from room the
+// image heap's video memory blocks already have (the targets' blocks drain,
+// below), never a new block or host memory - or wherever rt_image_memory
+// places a target.
+bool rt_remake_locked(RtImage& r, bool existing_room) {
     RtImage n = r;
     n.image = VK_NULL_HANDLE;
     n.view = VK_NULL_HANDLE;
@@ -10381,7 +10385,16 @@ bool rt_return_one_locked(RtImage& r) {
     ici.usage = r.usage;
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (vkCreateImage(g.device, &ici, nullptr, &n.image) != VK_SUCCESS) return false;
-    if (!rt_image_memory(n.image, n.memory) || !image_memory_in_vram(n.memory)) {
+    bool placed = false;
+    if (existing_room) {
+        VkMemoryRequirements req{};
+        vkGetImageMemoryRequirements(g.device, n.image, &req);
+        placed = image_memory_place_existing_locked(req, n.memory, kHeapTargets) &&
+                 vkBindImageMemory(g.device, n.image, n.memory.memory, n.memory.offset) == VK_SUCCESS;
+    } else {
+        placed = rt_image_memory(n.image, n.memory) && image_memory_in_vram(n.memory);
+    }
+    if (!placed) {
         vkDestroyImage(g.device, n.image, nullptr);
         if (n.memory.memory) defer_destroy_image(VK_NULL_HANDLE, n.memory);
         return false;
@@ -10403,8 +10416,107 @@ bool rt_return_one_locked(RtImage& r) {
     bump_view_epoch();
     return true;
 }
+bool rt_return_one_locked(RtImage& r) { return rt_remake_locked(r, false); }
 
+// The targets' blocks drain (BBHOST_HEAP_TARGET_DRAIN, on unless 0): a
+// targets' block that holds little - an area's few long-lived targets with
+// the rest of it holes - is emptied into room the other targets' blocks
+// already have, so the memory keeper can give it back. Its targets and
+// snapshots are made again there and copied (as one back from host memory
+// is), its textures and copies of targets' regions let go (made again at
+// their next bind); no image goes in it meanwhile. Not a block holding a
+// surface a shader or a copy wrote (its contents are not the guest's), and
+// never into a new block: a target with no room elsewhere ends the try. On
+// the Radeon 680M at the first Central Yharnam lamp one of five targets'
+// blocks held 25 MiB of colour and 11 of depth targets in 256 MiB. Only where
+// the keeper keeps no spare block in play (small video memory): with one, as
+// on an integrated GPU, the emptied block becomes that spare - there the
+// 680M ended with as many blocks either way - and the targets' moves buy
+// nothing. Once a second while no load is on, 32 MiB of targets a turn; a
+// block not empty 30 s after its drain began is left as it is, and no other
+// drain begins for 30 s after one ends (a target the game makes again and
+// again would move each time).
+std::uint64_t g_td_blocks = 0, g_td_emptied = 0, g_td_targets = 0, g_td_bytes = 0, g_td_dropped = 0, g_td_refused = 0,
+              g_td_pinned = 0, g_td_gave_up = 0;
 }  // namespace
+
+void drain_target_blocks_locked() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_HEAP_TARGET_DRAIN");
+        return !(e && e[0] == '0');
+    }();
+    if (!on || !image_heap_classes_on() || loading_screen_now()) return;
+    if (image_heap_spare_in_play() && image_heap_avoided_block_locked() < 0) return;
+    static std::uint64_t last_ms = 0, began_ms = 0, quiet_until_ms = 0;
+    const std::uint64_t now = steady_ms();
+    if (now - last_ms < 1000) return;
+    last_ms = now;
+    int block = image_heap_avoided_block_locked();
+    if (block >= 0 && image_heap_block_used_locked(block) == 0) {  // emptied: the keeper gives it back
+        image_heap_avoid_block_locked(-1);
+        ++g_td_emptied;
+        quiet_until_ms = now + 30000;
+        return;
+    }
+    if (block >= 0 && now - began_ms >= 30000) {  // something in it stays: let it be
+        image_heap_avoid_block_locked(-1);
+        ++g_td_gave_up;
+        quiet_until_ms = now + 30000;
+        return;
+    }
+    if (block < 0) {
+        if (now < quiet_until_ms) return;
+        std::uint64_t used = 0, room = 0;
+        const int c = image_heap_target_drain_candidate_locked(&used, &room);
+        constexpr std::uint64_t kMostUsed = 64ull << 20, kSpare = 32ull << 20;
+        if (c < 0 || used > kMostUsed || room < used + kSpare) return;
+        if (textures_block_pinned_locked(c)) {
+            ++g_td_pinned;
+            quiet_until_ms = now + 30000;
+            return;
+        }
+        block = c;
+        image_heap_avoid_block_locked(block);
+        began_ms = now;
+        ++g_td_blocks;
+        static int logs = 0;
+        if (logs++ < 8)
+            host_log("render: the targets' image heap block %d holds %llu MiB, the other targets' blocks %llu MiB of free room: its images "
+                     "move there (BBHOST_HEAP_TARGET_DRAIN=0 keeps them)",
+                     block, static_cast<unsigned long long>(used >> 20), static_cast<unsigned long long>(room >> 20));
+    }
+    g_td_dropped += textures_drop_block_locked(block);
+    std::uint64_t moved = 0;
+    for (std::map<std::uint64_t, RtImage>* m : {&g_rts, &g_snapshots}) {
+        for (auto& [base, r] : *m) {
+            if (!r.image || r.memory.block != block || !image_memory_in_vram(r.memory)) continue;
+            if (moved >= (32ull << 20)) return;
+            const std::uint64_t bytes = r.memory.size;
+            if (!rt_remake_locked(r, true)) {
+                image_heap_avoid_block_locked(-1);
+                ++g_td_refused;
+                quiet_until_ms = now + 30000;
+                return;
+            }
+            moved += bytes;
+            g_td_bytes += bytes;
+            ++g_td_targets;
+        }
+    }
+}
+
+std::string target_drain_report() {
+    if (!g_td_blocks && !g_td_pinned) return {};
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "; targets' blocks drained %llu (emptied %llu, given up %llu, no room for a target %llu, a GPU-written surface in it %llu): "
+                  "targets moved %llu (%llu MiB), textures and copies let go %llu MiB",
+                  static_cast<unsigned long long>(g_td_blocks), static_cast<unsigned long long>(g_td_emptied),
+                  static_cast<unsigned long long>(g_td_gave_up), static_cast<unsigned long long>(g_td_refused),
+                  static_cast<unsigned long long>(g_td_pinned), static_cast<unsigned long long>(g_td_targets),
+                  static_cast<unsigned long long>(g_td_bytes >> 20), static_cast<unsigned long long>(g_td_dropped >> 20));
+    return buf;
+}
 
 void render_return_targets_locked() {
     if (!vram_return_on()) return;

@@ -6427,6 +6427,11 @@ const bool g_heap_fullest = [] {
     return !(e && e[0] == '0');
 }();
 
+// A targets' block being emptied (drain_target_blocks_locked, render.cpp): no
+// image goes in it while it is, so what moves out of it and whatever comes
+// next fill room elsewhere, and it can empty for the keeper to give back.
+int g_heap_avoid = -1;
+
 bool heap_place_locked(const VkMemoryRequirements& req, std::uint32_t type, bool grow, ImageMemory& out, int cls) {
     const VkDeviceSize align = std::max<VkDeviceSize>(req.alignment, 256);
     if (!g_heap_classes) cls = kHeapTargets;
@@ -6436,7 +6441,8 @@ bool heap_place_locked(const VkMemoryRequirements& req, std::uint32_t type, bool
             order.clear();
             for (std::size_t k = 0; k < g_heap.size(); ++k) {
                 const HeapBlock& b = g_heap[k];
-                if (b.memory != VK_NULL_HANDLE && b.type == type && kHeapBlock - b.used >= req.size && heap_class_fits(b.cls, cls))
+                if (b.memory != VK_NULL_HANDLE && b.type == type && kHeapBlock - b.used >= req.size && heap_class_fits(b.cls, cls) &&
+                    static_cast<int>(k) != g_heap_avoid)
                     order.push_back(k);
             }
             if (g_heap_fullest) {
@@ -6531,6 +6537,39 @@ int image_heap_drain_candidate_locked(std::uint64_t* class_free, std::uint64_t* 
     if (class_free) *class_free = free;
     if (used) *used = best >= 0 ? g_heap[static_cast<std::size_t>(best)].used : 0;
     return blocks >= 2 ? best : -1;  // the last texture block is never drained into nothing
+}
+
+int image_heap_target_drain_candidate_locked(std::uint64_t* used, std::uint64_t* room_elsewhere) {
+    int best = -1;
+    std::size_t blocks = 0;
+    std::uint64_t room = 0;
+    for (std::size_t k = 0; k < g_heap.size(); ++k) {
+        const HeapBlock& b = g_heap[k];
+        if (b.memory == VK_NULL_HANDLE || b.cls != kHeapTargets || g.mem_props.memoryTypes[b.type].heapIndex != g.local_heap) continue;
+        ++blocks;
+        room += kHeapBlock - b.used;
+        if (best < 0 || b.used < g_heap[static_cast<std::size_t>(best)].used) best = static_cast<int>(k);
+    }
+    if (best < 0 || blocks < 2) return -1;
+    const HeapBlock& b = g_heap[static_cast<std::size_t>(best)];
+    if (used) *used = b.used;
+    if (room_elsewhere) *room_elsewhere = room - (kHeapBlock - b.used);
+    return best;
+}
+
+void image_heap_avoid_block_locked(int block) { g_heap_avoid = block; }
+int image_heap_avoided_block_locked() { return g_heap_avoid; }
+
+std::uint64_t image_heap_block_used_locked(int block) {
+    if (block < 0 || static_cast<std::size_t>(block) >= g_heap.size() || g_heap[static_cast<std::size_t>(block)].memory == VK_NULL_HANDLE) return 0;
+    return g_heap[static_cast<std::size_t>(block)].used;
+}
+
+bool image_memory_place_existing_locked(const VkMemoryRequirements& req, ImageMemory& out, int cls) {
+    out = ImageMemory{};
+    const std::uint32_t local = find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (local == UINT32_MAX || req.size > kHeapLargest) return false;
+    return heap_place_locked(req, local, false, out, cls);
 }
 
 int image_memory_class_locked(const ImageMemory& m) {
@@ -6760,6 +6799,8 @@ std::atomic<std::uint64_t> g_spare_play_blocks{1};  // the memory keeper's spare
 std::uint64_t g_vram_peak_usage = 0;                // the most the driver counted in the video memory heap at a report
 }  // namespace
 
+std::uint64_t image_heap_spare_in_play() { return g_spare_play_blocks.load(std::memory_order_relaxed); }
+
 bool vram_report_on() {
     static const bool on = [] {
         const char* e = std::getenv("BBHOST_VRAM_REPORT");
@@ -6930,6 +6971,7 @@ std::string video_memory_report_locked(bool at_exit) {
                       static_cast<ull>(c.tex_in_targets.n), static_cast<ull>(drained[0]), static_cast<ull>(drained[1]), mib(drained[2]),
                       static_cast<ull>(drained[3]));
         out += buf;
+        out += target_drain_report();
         // The targets' blocks one by one: what each holds (MiB of colour,
         // depth, snapshots, GPU-written surfaces, textures, region copies)
         // and its free room - all of it, the largest hole, the holes.
@@ -7490,6 +7532,7 @@ void submit_locked() {
     // this recording wrote it with (vram_return_on; one at most, once a
     // second).
     render_return_targets_locked();
+    drain_target_blocks_locked();  // a targets' block holding little, emptied into room elsewhere (one turn a second)
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;

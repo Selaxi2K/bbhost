@@ -718,6 +718,26 @@ bool image_heap_classes_on();  // BBHOST_HEAP_CLASSES
 int image_heap_drain_candidate_locked(std::uint64_t* class_free, std::uint64_t* used, const std::vector<int>& skip);
 // The textures' blocks drain (textures.cpp, BBHOST_HEAP_DRAIN): see there.
 void drain_texture_blocks_locked();
+// The targets' blocks drain (render.cpp drain_target_blocks_locked): the
+// targets' block that holds least when the class has two or more - its index,
+// the bytes it holds and the free room of the others' (-1: none); a block no
+// image goes in while it is emptied (-1: none); a block's bytes in use; and an
+// image's memory from room the heap's video memory blocks already have -
+// never a new block, never host memory (false when there is none).
+int image_heap_target_drain_candidate_locked(std::uint64_t* used, std::uint64_t* room_elsewhere);
+void image_heap_avoid_block_locked(int block);
+int image_heap_avoided_block_locked();
+std::uint64_t image_heap_block_used_locked(int block);
+bool image_memory_place_existing_locked(const VkMemoryRequirements& req, ImageMemory& out, int cls);
+// textures.cpp: whether the block holds a surface that cannot be made again
+// (a shader or a copy wrote it), and letting go of what it holds that can -
+// textures, copies of targets' regions, level aliases (made again at their
+// next bind); returns the bytes let go.
+bool textures_block_pinned_locked(int block);
+std::uint64_t textures_drop_block_locked(int block);
+void drain_target_blocks_locked();  // render.cpp, once a second from the submission
+std::uint64_t image_heap_spare_in_play();  // the memory keeper's spare blocks in play (gpu.cpp)
+std::string target_drain_report();  // render.cpp: what the targets' blocks drain did
 // The drain so far: blocks emptied, textures and MiB taken out, blocks left
 // because a surface the GPU wrote sits in them.
 void textures_drain_counts(std::uint64_t out[4]);
