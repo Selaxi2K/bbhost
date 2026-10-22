@@ -358,7 +358,8 @@ smooth. `BBHOST_SFX_STEP=30|smooth|60|frame` overrides the setting, and
 `BBHOST_SFX_SMOOTH=0|1` turns the smooth steps off or on for a test run. The wakes
 characters leave in water (GX's water interaction, one wave step a frame) step
 at 30 a second of game time above 30 too, on the effects' whole steps, so they
-spread as fast as at 30, and the water shows the last step between steps
+spread as fast as at 30; each step takes the latest frame's wakes, as at 30,
+and the water shows the last step between steps
 (`decomp/gx/water_gate.cpp`; `BBHOST_WATER_GATE=0` steps them every frame,
 twice as fast at 60). The flicker of the torches, braziers and candles (each
 GX light's blink) begins its cycles on the effects' whole steps, holding the
