@@ -547,6 +547,10 @@ if(UNIX)
   add_executable(arena_memory_test tests/arena_memory_test.cpp)
   target_include_directories(arena_memory_test PRIVATE src)
   add_test(NAME arena_memory_test COMMAND arena_memory_test)
+  # The flip keeper replayed against recorded flip timelines (hle/flip_pacing.h).
+  add_executable(flip_pacing_test tests/flip_pacing_test.cpp)
+  target_include_directories(flip_pacing_test PRIVATE src)
+  add_test(NAME flip_pacing_test COMMAND flip_pacing_test)
   # The copy watch: its granules, then its ranges searched in halves (host/gxvk_watch.h).
   add_executable(gxvk_watch_test tests/gxvk_watch_test.cpp)
   target_include_directories(gxvk_watch_test PRIVATE src)
