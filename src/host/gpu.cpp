@@ -7006,6 +7006,8 @@ bool vram_report_on() {
     return on;
 }
 
+std::atomic<std::uint64_t> g_glance_cache{0};  // video memory the last census found to be cache
+std::atomic<bool> g_glance_census{false};
 std::string video_memory_report_locked(bool at_exit) {
     using ull = unsigned long long;
     const auto mib = [](std::uint64_t b) { return static_cast<ull>((b + (1ull << 19)) >> 20); };
@@ -7093,6 +7095,8 @@ std::string video_memory_report_locked(bool at_exit) {
     const std::int64_t unattributed = static_cast<std::int64_t>(used_vram + own_images) - static_cast<std::int64_t>(images);
     const std::uint64_t held = targets + c.snapshots.bytes + gpu_written + c.regions.bytes + c.tex_bound.bytes + (devbuf_bytes - scratch_kept);
     const std::uint64_t cached = mirror_bytes + c.tex_cold.bytes + c.tex_ahead.bytes + free_vram + scratch_kept;
+    g_glance_cache.store(cached, std::memory_order_relaxed);  // the memory counter's (host_gpu_memory_glance)
+    g_glance_census.store(true, std::memory_order_relaxed);
 
     std::snprintf(buf, sizeof(buf),
                   "gpu: video memory (MiB): heap %u %s %llu of %llu = ours %llu (held %llu, caches %llu, in flight %lld) + the driver's own %lld; "
@@ -10489,6 +10493,30 @@ std::string host_gpu_video_memory_report(bool at_exit) {
     if (!gpu::g.ok || !gpu::vram_report_on()) return {};
     std::lock_guard<GpuMutex> lock(gpu::g.mu);
     return gpu::video_memory_report_locked(at_exit);
+}
+
+void host_gpu_memory_census_refresh() { (void)host_gpu_video_memory_report(false); }
+
+bool host_gpu_memory_glance(GpuMemoryGlance& out) {
+    using namespace gpu;
+    if (!g.ok || !g.phys) return false;
+    std::uint64_t ours[3] = {};
+    for (const MemOwnerTotal& o : bb_memory_owner_totals()) {
+        for (int c = 0; c < 3; ++c) ours[c] += o.bytes[c];
+    }
+    out.vram = ours[0];
+    if (g.has_memory_budget) {
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT mb{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+        VkPhysicalDeviceMemoryProperties2 mp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+        mp.pNext = &mb;
+        vkGetPhysicalDeviceMemoryProperties2(g.phys, &mp);
+        if (g.local_heap < mp.memoryProperties.memoryHeapCount && mb.heapUsage[g.local_heap]) out.vram = mb.heapUsage[g.local_heap];
+    }
+    out.shared = ours[2];
+    out.cache = g_glance_cache.load(std::memory_order_relaxed);
+    out.cache_known = g_glance_census.load(std::memory_order_relaxed);
+    out.integrated = g.integrated;
+    return true;
 }
 
 void host_gpu_log_video_memory(bool at_exit) {

@@ -260,6 +260,29 @@ look each draw's bytes up; one that finds no room keeps the mirrors
 the copies on an integrated GPU, with tight memory or small video memory
 too).
 
+**Task Manager shows more GPU memory than shadPS4.** Task Manager's GPU
+columns for a process count two things: *dedicated GPU memory* is the card's
+video memory, *shared GPU memory* is system memory the GPU can reach. bbhost
+lets the GPU read the game's own memory where it lies, as the PS4's single
+memory does: the game's GPU-visible memory (about 4 GB in the world) is
+imported into Vulkan, and Windows counts every imported page as shared GPU
+memory, although it is the game's memory, which the process holds either way,
+not a second copy. Upload staging (memory the CPU fills for the GPU to copy
+from, up to about 0.8 GB) counts there too. shadPS4 copies what the GPU uses
+into buffers and images of its own instead, so its shared column stays small.
+Measured at the same place (Central Yharnam, 1080p) on one laptop: with its
+RTX 3070 Ti Laptop GPU, shadPS4 0.19 showed 2.7 GB dedicated and 0.1 GB
+shared, bbhost 3.0 GB dedicated and 4.8 GB shared. On an integrated GPU
+Windows counts all of it as shared: on the same laptop's Radeon 680M shadPS4
+showed 2.9 GB and bbhost 7.8 GB. To compare the two, read the dedicated
+column on a card of its own, or turn on the Memory counter (F10), which shows
+bbhost's own count under the FPS counter: the video memory in use, how much of
+it is cache that bbhost gives back when memory runs short, and the shared
+memory. With window imports (`import_windows = true` under `[gpu]`) only the
+memory the GPU uses is imported: on that laptop the shared column fell by
+about 2.7 GB on the RTX and 2.1 GB on the 680M, at the cost of waits when a
+place is first drawn (the log's `imports waited for`).
+
 **AMD on Linux, no picture.** AMD's kernel driver only imports anonymous
 memory, so bbhost passes the game's memory to the GPU through `/dev/udmabuf`.
 If that device is not accessible to your user, the log says so; this udev rule
