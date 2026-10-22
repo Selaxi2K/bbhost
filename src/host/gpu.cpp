@@ -11,6 +11,7 @@
 #include "host/arena_memory.h"
 #include "host/arena_move.h"
 #include "host/arena_move_vk.h"
+#include "host/import_prefetch.h"
 #include "host/label_landing.h"
 #include "host/ring_budget.h"
 #include "host/shader_patch.h"
@@ -1155,13 +1156,23 @@ bool imports_whole_decide() {
 // processor. A run of windows some binding imported meanwhile is dropped (an
 // import is never put over part of another: no page imported twice).
 // BBHOST_IMPORT_PREFETCH=0: imports at the first use only.
+// The meshes too (host/import_prefetch.h): a vertex or index buffer the
+// buffer shadow reads in place when GX tells its writes (BBHOST_SHADOW_IN_PLACE,
+// on an integrated GPU), once the device says the shadow does.
+// BBHOST_IMPORT_PREFETCH_MESHES=0: their windows at their first draw's
+// binding, on the command processor.
 namespace {
 const bool g_prefetch_on = [] {
     const char* e = std::getenv("BBHOST_IMPORT_PREFETCH");
     return !(e && e[0] == '0');
 }();
+const bool g_prefetch_meshes = [] {
+    const char* e = std::getenv("BBHOST_IMPORT_PREFETCH_MESHES");
+    return !(e && e[0] == '0');
+}();
 struct PrefetchJob {
     std::uint64_t va = 0, bytes = 0;
+    bool meshes = false;  // import_prefetch::Ask::kMeshes: only if the shadow reads told meshes in place
 };
 std::mutex g_pf_mu;
 std::condition_variable g_pf_cv;
@@ -1169,6 +1180,7 @@ std::deque<PrefetchJob> g_pf_jobs;  // under g_pf_mu
 bool g_pf_started = false;          // under g_pf_mu
 std::atomic<std::uint64_t> g_pf_asked{0}, g_pf_known{0}, g_pf_checked{0}, g_pf_imports{0}, g_pf_bytes{0}, g_pf_raced{0},
     g_pf_dropped{0};
+std::atomic<std::uint64_t> g_pf_mesh_asked{0}, g_pf_mesh_skipped{0}, g_pf_mesh_imports{0}, g_pf_mesh_bytes{0};
 
 void prefetch_thread() {
     host_thread_set_name("bb-import");
@@ -1226,6 +1238,10 @@ void prefetch_thread() {
         {
             std::lock_guard<GpuMutex> lock(g.mu);
             if (!g.ok || !rebuild_page_tables()) continue;
+            if (job.meshes && !shadow_in_place_on()) {  // (asked again: the mirrors copy them through staging, no import)
+                g_pf_mesh_skipped.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
             for (const GuestMapInfo& mi : g.maps) {
                 if (!mi.dmem || mi.phys < 0) continue;
                 const std::uint64_t lo = std::max(job.va, mi.va), hi = std::min(end, mi.va + mi.len);
@@ -1270,6 +1286,10 @@ void prefetch_thread() {
             }
             g_pf_imports.fetch_add(1, std::memory_order_relaxed);
             g_pf_bytes.fetch_add(c->size, std::memory_order_relaxed);
+            if (job.meshes) {
+                g_pf_mesh_imports.fetch_add(1, std::memory_order_relaxed);
+                g_pf_mesh_bytes.fetch_add(c->size, std::memory_order_relaxed);
+            }
             d.imports.push_back(std::move(c));
             install_import_locked(r.chunk, d.imports.back().get());
             t_import_va = job.va;  // the census: by the buffer the job is for
@@ -7884,29 +7904,32 @@ void host_gpu_gx_buffer_mapped_own(std::uint64_t memory, std::uint64_t, std::uin
 void host_gpu_gx_buffer_gone(std::uint64_t memory, std::uint64_t gen) { twins_buffer_gone(memory, gen); }
 
 void host_gpu_import_prefetch(std::uint64_t va, std::uint64_t bytes, std::uint8_t usage, std::uint8_t bind) {
-    if (imports_whole() || !g_prefetch_on || !bytes || usage == 3 /* STAGING */) return;
-    // What the GPU reads in place: an unordered-access buffer (bind 0x80: what
-    // compute writes, particles), a dynamic one (usage 2: rings the game
-    // rewrites, bound from host memory). A vertex or index buffer (bind 0x1,
-    // 0x2) only without the buffer shadow - with it the mirror serves meshes,
-    // their pages copied through staging. Textures never: their uploads go
-    // through staging too.
-    const bool in_place = (bind & 0x80) || usage == 2 || ((bind & 0x3) && !buffer_shadow_on());
-    if (!in_place) return;
-    // One the GPU writes, kept as a device-local twin (BBHOST_GX_TWINS=1), needs
-    // no import: its twin is filled through staging at its first use. With
-    // level 2 neither does a dynamic one: the draws read its renamed copies
-    // (CPU-written rings), and its own memory once GX's copy-backs have
-    // written it - which makes it a twin.
-    if ((twins_level() == 1 || twins_level() == 2) && usage == 0 && (bind & 0x80)) return;
-    if (twins_level() == 2 && usage == 2) return;
+    if (imports_whole() || !g_prefetch_on || !bytes) return;
+    // What the GPU reads in place (host/import_prefetch.h): an unordered-access
+    // buffer, a dynamic one, a vertex or index buffer without the buffer
+    // shadow - not one kept as a device-local twin (BBHOST_GX_TWINS), whose
+    // twin is filled through staging - and, with the shadow, the meshes it
+    // reads in place. Textures never: their uploads go through staging.
+    // (Not the meshes while GX on Vulkan binds GX's buffers by handle,
+    // BBHOST_GXVK_BUFFERS: its own copies serve them, and nothing reads them in place.)
+    const import_prefetch::Ask ask = import_prefetch::ask(usage, bind, buffer_shadow_on(), twins_level(), g_prefetch_meshes && !gxvk::buffers_on());
+    if (ask == import_prefetch::Ask::kNone) return;
+    const bool meshes = ask == import_prefetch::Ask::kMeshes;
+    // The meshes only while the shadow reads told ones in place, which is
+    // known once the device is made (the thread drops every job before then):
+    // on a discrete GPU with window imports nothing more is queued.
+    if (meshes && !(g.ok && shadow_in_place_on())) {
+        g_pf_mesh_skipped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     std::lock_guard<std::mutex> lk(g_pf_mu);
     g_pf_asked.fetch_add(1, std::memory_order_relaxed);
+    if (meshes) g_pf_mesh_asked.fetch_add(1, std::memory_order_relaxed);
     if (g_pf_jobs.size() >= 8192) {
         g_pf_dropped.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    g_pf_jobs.push_back({va, bytes});
+    g_pf_jobs.push_back({va, bytes, meshes});
     if (!g_pf_started) {
         g_pf_started = true;
         std::thread(prefetch_thread).detach();
@@ -11329,10 +11352,13 @@ void host_gpu_report() {
         if (!imports_whole()) {
             host_log("gpu: import prefetch: %llu asked, %llu already imported, %llu looked at, %llu imports made (%llu MiB), %llu dropped as a "
                      "binding imported first, %llu not queued; dispatches: %llu reads imported, %llu with a base that does not trace "
-                     "(their walks reach what nothing imports for them)",
+                     "(their walks reach what nothing imports for them); meshes the buffer shadow reads in place "
+                     "(BBHOST_IMPORT_PREFETCH_MESHES): %llu asked, %llu dropped while it does not, %llu imports made (%llu MiB)",
                      static_cast<ull>(g_pf_asked.load()), static_cast<ull>(g_pf_known.load()), static_cast<ull>(g_pf_checked.load()),
                      static_cast<ull>(g_pf_imports.load()), mib(g_pf_bytes), static_cast<ull>(g_pf_raced.load()), static_cast<ull>(g_pf_dropped.load()),
-                     static_cast<ull>(g_dispatch_read_imports.load()), static_cast<ull>(g_dispatch_untraced.load()));
+                     static_cast<ull>(g_dispatch_read_imports.load()), static_cast<ull>(g_dispatch_untraced.load()),
+                     static_cast<ull>(g_pf_mesh_asked.load()), static_cast<ull>(g_pf_mesh_skipped.load()), static_cast<ull>(g_pf_mesh_imports.load()),
+                     mib(g_pf_mesh_bytes));
         }
         // (A copy taken under the lock: the command processor may still be
         // making imports while the exit report runs.)

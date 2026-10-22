@@ -1078,6 +1078,10 @@ std::string untile_gpu_report();
 // recording); `loc` keeps the import otherwise. A write over a range makes the
 // next read copy it again, or - written by the GPU - bind it from the import.
 bool buffer_shadow_on();  // BBHOST_BUFFER_SHADOW, else on except on an integrated GPU or with tight memory
+// Whether the shadow reads told pages in place (BBHOST_SHADOW_IN_PLACE and,
+// with window imports, BBHOST_SHADOW_IN_PLACE_WINDOWS): only once the device
+// is made, which it is decided by.
+bool shadow_in_place_on();
 void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc);
 // The same without a host location first: true, `out` the mirror, when the
 // mirrors serve [va, va+bytes) whole (copying what they must); false when it

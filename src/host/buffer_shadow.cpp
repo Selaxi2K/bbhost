@@ -230,7 +230,8 @@ std::uint64_t g_windows_made = 0;
 // again: on the Radeon 680M at a lamp 1,264 MiB of 16 MiB windows held 531
 // MiB of page copies, ~84% of them told pages. With window imports
 // (BBHOST_IMPORT_WINDOWS=1) the import is the range's window, which the
-// binding's locate() makes if no import covers it yet;
+// binding's locate() makes when the import thread has not (GX's meshes are
+// imported as GX makes them, host_gpu_import_prefetch);
 // BBHOST_SHADOW_IN_PLACE_WINDOWS=0 keeps in place to whole imports, the
 // mirrors serving every mesh with window imports, as before.
 const int g_in_place_env = [] {
@@ -241,8 +242,8 @@ const bool g_in_place_windows = [] {
     const char* e = std::getenv("BBHOST_SHADOW_IN_PLACE_WINDOWS");
     return !(e && e[0] == '0');
 }();
-// (Decided at the first use, a draw's, by when the device - and whether it
-// is integrated - is known.)
+// (Decided at the first use, a draw's or the import thread's, by when the
+// device - and whether it is integrated - is known.)
 bool in_place_on() {
     static const bool on = shadow_place::in_place_wanted(imports_whole(), g_in_place_env, g_in_place_windows, g.integrated);
     return on;
@@ -1277,6 +1278,7 @@ bool integrated_with_room() {
 bool buffer_shadow_on() {
     return g_shadow_env >= 0 ? g_shadow_env == 1 : !g.tight && (!g.integrated || integrated_with_room());
 }
+bool shadow_in_place_on() { return buffer_shadow_on() && in_place_on(); }
 
 namespace {
 // In place (in_place_on): true when [p0, p1] binds the import - each page

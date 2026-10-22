@@ -248,8 +248,10 @@ them in place on any GPU), and vertex data left in host memory is not copied
 for each draw either (`BBHOST_VERTEX_STAGE=1` copies it as on a discrete GPU).
 With window imports (`BBHOST_IMPORT_WINDOWS=1`, or `import_windows = true`
 under `[gpu]`; see [rendering.md](rendering.md)) the meshes are read in place
-too, from their windows (`BBHOST_SHADOW_IN_PLACE_WINDOWS=0` copies them into
-the mirrors instead, as window imports did before).
+too, from their windows, which a thread of their own imports as the game makes
+its buffers (`BBHOST_SHADOW_IN_PLACE_WINDOWS=0` copies them into the mirrors
+instead, as window imports did before; `BBHOST_IMPORT_PREFETCH_MESHES=0`
+imports their windows at their first draw).
 On other GPUs, unless memory is tight or video memory small, the game's own
 immutable vertex and index buffers are bound from copies of their own, made
 in video memory as they are first drawn, so the command processor does not
