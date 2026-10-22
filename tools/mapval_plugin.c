@@ -24,6 +24,8 @@
  *     travel <return point> <block hex> <name> [<event flag>...]
  *                                             lamp travel (a full map load,
  *                                             api->lamp_warp); done once the
+ *                                             host has placed the player in a
+ *                                             map since the request and the
  *                                             player stands still in that block
  *                                             with the loading screen gone. Up
  *                                             to four event flags are turned on
@@ -182,6 +184,12 @@ static int warp_retries;
 static float travel_last[3];
 static double travel_still_t;  /* when the player came to rest for the travel's stillness */
 static double travel_loading;  /* loading-screen seconds within the current travel step */
+/* When the host last placed the player in a map (its on_world_load), on now_s()'s clock. A travel is done only after
+ * a placement that came after its request: a player already standing still in the travel's block - a save made
+ * there, or the tour's last place in the same block - would otherwise end it before the warp's own load wherever
+ * the warp starts late (lavapipe: over a minute after the request; a GPU at 60 fps: under a second). */
+static volatile double placed_t = -1;
+static int travel_wait_logged;
 static int dump_chrs = 0, want_team = -1;
 static int warp_tries = 10; /* BBHOST_MAPVAL_WARP_TRIES */
 static double travel_limit = 150; /* BBHOST_MAPVAL_TRAVEL_S: the seconds a travel may take */
@@ -653,6 +661,7 @@ static void begin(int i, double t) {
         int r = api->size >= sizeof(BbHostApi) ? api->lamp_warp(s->team) : 1;
         travel_still = 0;
         travel_loading = 0;
+        travel_wait_logged = 0;
         tour_rp = s->team;
         tour_block = s->block;
         api->log("mapval step %d travel %s %.3f return point %d block %08x -> %s", i, s->name, t, s->team, s->block, r ? "REFUSED" : "queued");
@@ -930,7 +939,8 @@ static void tick(double t) {
          * frames come slower than ~7 a second (lavapipe: a chalice dungeon
          * draws one frame in ~2 s), still for 12 s over at least 8 frames. */
         int still = (travel_still > 90 && t - travel_still_t >= 2.0) || (travel_still > 8 && t - travel_still_t >= 12.0);
-        if (still && (fabsf(p[0]) > 0.01f || fabsf(p[2]) > 0.01f)) { /* not the (0, y, 0) a load starts at */
+        int placed_since = placed_t >= step_t0; /* the warp's own placement, not one before the request */
+        if (still && placed_since && (fabsf(p[0]) > 0.01f || fabsf(p[2]) > 0.01f)) { /* not the (0, y, 0) a load starts at */
             api->log("mapval travel-done %s %.3f %08x %.3f %.3f %.3f after %.1f s, %.1f s of it loading", s->name, t, b, p[0], p[1], p[2],
                      el, travel_loading);
             memcpy(good_pos, p, sizeof good_pos);
@@ -950,6 +960,10 @@ static void tick(double t) {
             }
             next = 1;
             cur = nsteps - 1;
+        } else if (still && !placed_since && !travel_wait_logged) {
+            travel_wait_logged = 1;
+            api->log("mapval travel-wait %s %.3f: still in %08x for %.1f s, not placed since the request", s->name, t, b,
+                     t - travel_still_t);
         }
     } else if (s->kind == S_WALK) {
         heal();
@@ -1062,7 +1076,9 @@ static void watch_death(double t, const float p[3], int have) {
  * respawn, a lamp, a warp into another block). */
 static void placed(uint32_t block, void* u) {
     (void)u;
-    api->log("mapval placed %.3f %08x", now_s(), block);
+    double t = now_s();
+    placed_t = t;
+    api->log("mapval placed %.3f %08x", t, block);
 }
 
 static void on_frame(void* u) {
