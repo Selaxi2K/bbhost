@@ -32,7 +32,7 @@ const Flags g_flags = [] {
     Flags f;
     if (const char* e = std::getenv("BBHOST_GXVK_BUFFERS"); e && *e) {
         f.given = true;
-        f.mode = buffers_mode_for(e, false);
+        f.mode = buffers_mode_for(e, BuffersDevice::kRoomy);
         if (std::strcmp(e, "census") == 0) f.census = true;
     }
     if (const char* e = std::getenv("BBHOST_GXVK_CENSUS"); e && e[0] == '1') f.census = true;
@@ -224,11 +224,17 @@ Buffers buffers_mode() {
     // before the game runs - and said once.
     static const Buffers mode = [] {
         if (g_flags.given) return g_flags.mode;
-        const bool integrated = host_gpu_integrated(), tight = !integrated && host_gpu_memory_tight();
-        const Buffers m = buffers_mode_for(nullptr, integrated || tight);
-        if (m == Buffers::kOff)
+        const BuffersDevice d = host_gpu_integrated()     ? BuffersDevice::kIntegrated
+                                : host_gpu_memory_tight() ? BuffersDevice::kTight
+                                : host_gpu_small_vram()   ? BuffersDevice::kSmallVram
+                                                          : BuffersDevice::kRoomy;
+        const Buffers m = buffers_mode_for(nullptr, d);
+        if (d == BuffersDevice::kSmallVram)
+            host_log("gxvk: GX's buffers on today's path: small video memory, where their copies compete with the targets and textures "
+                     "(BBHOST_GXVK_BUFFERS=1 binds them by handle)");
+        else if (m == Buffers::kOff)
             host_log("gxvk: GX's buffers on today's path: %s, whose draws read them where they are (BBHOST_GXVK_BUFFERS=1 binds them by handle)",
-                     integrated ? "an integrated GPU" : "tight memory");
+                     d == BuffersDevice::kIntegrated ? "an integrated GPU" : "tight memory");
         else
             host_log("gxvk: GX's buffers bound by handle (BBHOST_GXVK_BUFFERS=0: today's path)");
         return m;

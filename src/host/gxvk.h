@@ -39,21 +39,26 @@
 
 namespace gxvk {
 
-// BBHOST_GXVK_BUFFERS: unset, GX buffers bound by their handles (1), except on
-// an integrated GPU or with tight memory, where the draws read GX's buffers
+// BBHOST_GXVK_BUFFERS: unset, GX buffers bound by their handles (1) on a
+// discrete GPU with room in its video memory; today's path (0) on an
+// integrated GPU or with tight memory, where the draws read GX's buffers
 // where they are (the buffer shadow in place there, or no shadow) and a
-// buffer's copy would hold memory and buy nothing: today's path (0) there.
-// 0 today's path; 1 by handle on any GPU; 2 both, compared; "census" the
-// census alone (as BBHOST_GXVK_CENSUS=1, which can join the others). Read
-// once, as the GX hooks are installed: the device's kind is asked before the
-// device is made (host_gpu_integrated, host_gpu_memory_tight).
+// buffer's copy would hold memory and buy nothing, and with small video
+// memory, where the copies compete with the targets and textures for it and
+// one dip to the reserve costs far more GPU time than the command processor
+// saves. 0 today's path; 1 by handle on any GPU; 2 both, compared; "census"
+// the census alone (as BBHOST_GXVK_CENSUS=1, which can join the others).
+// Read once, as the GX hooks are installed: the device's kind is asked before
+// the device is made (host_gpu_integrated, host_gpu_memory_tight,
+// host_gpu_small_vram).
 enum class Buffers : int { kOff = 0, kOn = 1, kCompare = 2 };
 Buffers buffers_mode();
 bool census();
-// The mode for the switch's value (null or empty: unset) on a device whose
-// draws read GX's buffers in place (an integrated GPU, tight memory) or not.
-inline Buffers buffers_mode_for(const char* env, bool reads_in_place) {
-    if (!env || !*env) return reads_in_place ? Buffers::kOff : Buffers::kOn;
+// The device as the default sees it.
+enum class BuffersDevice : int { kRoomy, kIntegrated, kTight, kSmallVram };
+// The mode for the switch's value (null or empty: unset) on that device.
+inline Buffers buffers_mode_for(const char* env, BuffersDevice device) {
+    if (!env || !*env) return device == BuffersDevice::kRoomy ? Buffers::kOn : Buffers::kOff;
     return env[0] == '1' ? Buffers::kOn : env[0] == '2' ? Buffers::kCompare : Buffers::kOff;
 }
 

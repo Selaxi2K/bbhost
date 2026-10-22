@@ -683,21 +683,29 @@ a counter or two, and one next to them searches the ranges, sorted, in
 halves; a buffer that ended (its holder released,
 its memory unmapped or given to a new resource) is still bound from its copy
 by the draws recorded before its end. Video memory is used down to the
-reserve kept for render targets and device buffers, then host-visible
-memory. `BBHOST_GXVK_BUFFERS=2` keeps today's path and checks the handles
+reserve kept for render targets and device buffers; short of room a buffer
+keeps today's path - never a copy in host memory on a discrete GPU, where
+one placed during a dip stayed for the session and every draw of it read
+across the bus (on an integrated GPU, whose host memory is the same RAM,
+host-visible memory is taken). `BBHOST_GXVK_BUFFERS=2` keeps today's path
+and checks the handles
 beside it - the vertex input, the bytes as today's path finds them, the
 buffer's bytes against their hash when copied, the device copy read back -
 and the exit report counts the bindings by handle, the fallbacks by reason
 and any disagreement.
 
 GX's buffers are bound by handle by default (`BBHOST_GXVK_BUFFERS=0` keeps
-today's path), except on an integrated GPU or with tight memory: there the
+today's path), except on an integrated GPU or with tight memory, where the
 draws read GX's buffers where they are - the buffer shadow in place, or no
-shadow - so a copy would hold memory and buy nothing, and today's path stays
-unless `BBHOST_GXVK_BUFFERS=1`. On an RTX 4070 at Old Yharnam, uncapped, the
-command processor takes 1.31 ms a flip less by handle and the frame rate goes
-from 81.9 to 92.0; at 60 it takes 0.26-1.15 ms a flip less at four places,
-with the GPU's time and the frame pacing unchanged.
+shadow - so a copy would hold memory and buy nothing, and with small video
+memory (under 7.5 GiB free at the start), where the copies compete with the
+targets and textures for it and one dip to the reserve costs far more GPU
+time than the command processor saves; there today's path stays unless
+`BBHOST_GXVK_BUFFERS=1`. On an RTX 4070, uncapped, the frame rate goes from
+83.6 to 94.6 at Old Yharnam and from 82.2 to 95.0 at the Nightmare of Mensis
+by handle, the command processor taking 1.4-1.6 ms a flip less; at 60 it
+takes up to 1 ms a flip less, with the GPU's time and the frame pacing
+unchanged.
 
 **The upload heap (the stage's second part, off by default while it is
 measured).** GX's device gives its block pool one region - GX's upload heap,
