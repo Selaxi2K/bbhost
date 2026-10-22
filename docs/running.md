@@ -327,7 +327,11 @@ characters leave in water (GX's water interaction, one wave step a frame) step
 at 30 a second of game time above 30 too, so they spread as fast as at 30, and
 the water shows the last step between steps
 (`decomp/gx/water_gate.cpp`; `BBHOST_WATER_GATE=0` steps them every frame,
-twice as fast at 60). Above 60 and
+twice as fast at 60). The flicker of the torches, braziers and candles (each
+GX light's blink) begins its cycles on the effects' whole steps, holding the
+light's high on the frames between, so the lights blink as fast as at 30
+(`decomp/gx/blink.cpp`; `BBHOST_BLINK_HOLD=0` begins them on any frame, 5-7%
+faster above 30). Above 60 and
 Uncapped the game paces itself and its frames are shown as they come, so 90
 on a 60 Hz display shows 60 of them a second; a rate the machine cannot hold
 runs slower than real time in the few places that count frames.
