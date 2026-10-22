@@ -287,12 +287,9 @@ conditions pick, the controllers, a light's flicker phase, a wobbling
 motion's turns and its lag toward what it follows
 (`decomp/sfx/step_gate.cpp`; `BBHOST_SFX_GATE=0` lets them count, as when
 Ebrietas's attacks left sparks that never ended at 60, and `=1` holds them
-with 60 too). The grid particles of GPU type 0x2712 (Cainhurst's snow among
-them) also wait for the whole step on the frames between, gate on or off, so
-their emissions reach the grid as at 30 (`BBHOST_SFX_2712_HOLD=0` runs them
-on every frame as before, when at 60 and above none did), and the wind's
-warm-up after a load (the grass and trees settling) counts whole steps
-(`BBHOST_SFX_WIND_WARMUP_HOLD=0` counts frames as before). `[video] effect_steps = 60` steps the effects in whole 1/60 s
+with 60 too). The wind's warm-up after a load (the grass and trees settling)
+counts whole steps too (`BBHOST_SFX_WIND_WARMUP_HOLD=0` counts frames as
+before). `[video] effect_steps = 60` steps the effects in whole 1/60 s
 instead (60 updates a second above 60); `frame` steps them by the frame's
 time. `smooth` keeps 30's whole steps
 for what the effects count and moves what they move by time - a particle's

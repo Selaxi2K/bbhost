@@ -65,7 +65,6 @@ constexpr u64 kControllerUpdate = 0x2c820f0;   // (controller, instance, step)
 constexpr u64 kPrerollContext = 0x56dbd80;     // sub_2c500e0's stand-in render context's vtable
 constexpr u64 kGxRecordUpdate = 0x2cbcf50;     // a GPU particle system's record taking an item: (record, item)
 constexpr u64 kGxType2713 = 0x56eb0d0;         // GPU particle type 0x2713's vtable: its parameters are curves read at the elapsed time
-constexpr u64 kGxType2712 = 0x56eb030;         // GPU particle type 0x2712's vtable: the grid simulation (update sub_12e6080)
 constexpr u64 kGxTypeRibbon = 0x56e3620;       // FFX-format GX type 0x28's vtable: a ribbon (update sub_2ec1e00)
 constexpr std::size_t kRibbonDefinition = 0x12c;  // what sub_2ec1e00 reads of its definition (type +8): up to +0x128's dword
 constexpr u64 kWobbleA = 0x2e89d10;            // motion 0x570e6d0's update (and the end of 0x570e690's): count +0x6c, period +0x68
@@ -111,9 +110,8 @@ std::atomic<u64> g_lights_smooth{0}, g_lights_counted{0}, g_fades_smooth{0};
 std::atomic<u64> g_frames_between{0}, g_instances_held{0}, g_lights_held{0}, g_motions_held{0}, g_still_frames{0}, g_records_held{0};
 std::atomic<u64> g_ribbons_between{0}, g_ribbons_whole{0}, g_ribbons_unmarked{0};
 std::atomic<u64> g_wind_steps_smooth{0}, g_wind_steps_other{0}, g_records_whole{0}, g_motions_smooth{0};
-std::atomic<u64> g_records_2712_held{0}, g_warmups_held{0};
+std::atomic<u64> g_warmups_held{0};
 std::atomic<u32> g_hold_warmup{1};  // BBHOST_SFX_WIND_WARMUP_HOLD=0: the wind system's warm-up counts every frame, as before
-std::atomic<u32> g_hold_2712{1};  // BBHOST_SFX_2712_HOLD=0: type 0x2712's update runs on the frames between whole steps, as before
 
 // The ribbons (their GX types) of the instances the smooth steps run this frame, marked as smooth_update takes an
 // instance, for the record update: it runs later from the render context's queue, and a pre-roll's (sub_2c500e0's
@@ -237,8 +235,9 @@ constexpr u64 kManagerOf = 0x70;  // SprjSfx +0x70: the effect manager (its time
 // whole step against the frame domain's frames) - and the FFX light, whose one
 // counted part sfx_light_update runs once a whole step
 // (tests/decomp/sfx_step_gate_test.cpp). Off the list, and so on the held
-// frames as with 30: the module 0x5760f20 and the GPU particle type 0x2712
-// (0x56eb030: whole grid passes of elapsed x 30). The wobbles are on it: their
+// frames as with 30: the module 0x5760f20. The game never makes GPU particle type
+// 0x2712 (0x56eb030): its registered create (0x12e7da0) returns null, so a
+// record of it never gets a type and never updates. The wobbles are on it: their
 // counts and re-rolls held between whole steps by sfx_wobble_a, sfx_wobble_b and
 // sfx_wobble_follow, their base motions (0x570e5d0's, 0x570e7d0's) and the
 // follows by the frame's own time - 0x570e890's follow is the game's own, its
@@ -752,44 +751,11 @@ inline int ribbon_mode(u64 record, u64 item, u64 type, float& into) {
     return 2;
 }
 
-// GPU particle type 0x2712's update (sub_12e6080, read in Binary Ninja) counts in its updates: at the start of
-// each it checks its emission timer +0x528 (run out: an interval drawn from the FX RNG at data_5940de8 +0x30, the
-// emission flag +0x2f4 set, else cleared), it draws six more FX RNG values for its emitter's jitter (+0x2e4..+0x2ec,
-// +0x308..+0x310 and its grid's +0x138 object's +0x24c / +0x270), moves its grid to the emitter (+0x20: sub_132e6f0,
-// sub_132e620) and at the end takes the record's elapsed time off the timer. Its grid pass (vtable +0x18, sub_12e6e10
-// -> sub_132e860 -> sub_1330e40, which reads the flag) runs only when that elapsed time is above 0. On a frame between
-// whole steps the item's step is 0: the timer that ran out on the whole step fired there, the pass did not run, and
-// the next whole step cleared the flag - at 60 fps and above none of its emissions reached the grid, at 45 about half,
-// and the FX RNG was drawn on every frame. So on such a frame the record takes its item - its rows, its times (the
-// elapsed time 0, so no pass) and its bounds - with a stand-in for the type whose update is only that update's
-// result: the bounds sub_12e6080 always gives, data_4b38150's w lane choosing data_4b38020's 1 over data_4b38140's
-// -FLT_MAX and data_4b38130's FLT_MAX. The type itself waits for the whole step, as at 30.
-DECOMP_LEAF void sfx_2712_bounds(u64 out, u64, u64, u64) {
-    for (u64 lane = 0; lane < 4; ++lane) {
-        const u32 w = load<u32>(game_address(0x4b38150) + 4 * lane), one = load<u32>(game_address(0x4b38020) + 4 * lane);
-        const u32 lo = load<u32>(game_address(0x4b38140) + 4 * lane), hi = load<u32>(game_address(0x4b38130) + 4 * lane);
-        store<u32>(out + 4 * lane, (w & one) | (~w & lo));
-        store<u32>(out + 0x10 + 4 * lane, MUTANT(48) ? 0u : (w & one) | (~w & hi));
-    }
-}
-alignas(16) u64 g_type_2712_vtable[8];
-alignas(16) u64 g_type_2712_stand_in[2];
-
 }  // namespace
 
 DECOMP_LEAF void sfx_gx_record_update(u64 record, u64 item) {
     const auto game = reinterpret_cast<GxRecordFn>(g_game_gx_record);
     const u64 type = load<u64>(record + 8);
-    if (type && load<u64>(type) == game_address(kGxType2712) && g_hold_2712.load(std::memory_order_relaxed) && !MUTANT(46) &&
-        load<float>(item + 0x60) == 0.0f && between_steps()) {
-        g_records_2712_held.fetch_add(1, std::memory_order_relaxed);
-        g_type_2712_vtable[2] = reinterpret_cast<u64>(&sfx_2712_bounds);  // vtable +0x10, the update
-        g_type_2712_stand_in[0] = reinterpret_cast<u64>(g_type_2712_vtable);
-        store<u64>(record + 8, reinterpret_cast<u64>(g_type_2712_stand_in));
-        game(record, item);
-        if (!MUTANT(47)) store<u64>(record + 8, type);
-        return;
-    }
     if (type && load<u64>(type) == game_address(kGxTypeRibbon)) {
         float into = 0.0f;
         const int mode = ribbon_mode(record, item, type, into);
@@ -922,11 +888,9 @@ constexpr std::uint8_t kWindReceiversEntry[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x
 void report() {
     if (!decomp_sfx_gate_placed()) return;
     host_log("decomp: the effects' frames between whole steps: %llu frames; %llu instance updates, %llu light updates and %llu wobble "
-             "motion updates held, %llu GPU type 0x2713 items kept at their whole step's time, %llu GPU type 0x2712 updates held for the "
-             "whole step (BBHOST_SFX_2712_HOLD=%u); %llu calls on the game's own still frame left to it",
+             "motion updates held, %llu GPU type 0x2713 items kept at their whole step's time; %llu calls on the game's own still frame left to it",
              static_cast<ull>(g_frames_between.load()), static_cast<ull>(g_instances_held.load()), static_cast<ull>(g_lights_held.load()),
-             static_cast<ull>(g_motions_held.load()), static_cast<ull>(g_records_held.load()), static_cast<ull>(g_records_2712_held.load()),
-             g_hold_2712.load(), static_cast<ull>(g_still_frames.load()));
+             static_cast<ull>(g_motions_held.load()), static_cast<ull>(g_records_held.load()), static_cast<ull>(g_still_frames.load()));
     host_log("decomp:   the wind system's warm-up count held for the whole step on %llu frames (BBHOST_SFX_WIND_WARMUP_HOLD=%u)",
              static_cast<ull>(g_warmups_held.load()), g_hold_warmup.load());
     if (!g_smooth.load()) return;
@@ -955,11 +919,7 @@ void report() {
 
 void decomp_sfx_step_gate_add() {
     const char* area = "sfx";
-    if (const char* e = std::getenv("BBHOST_SFX_2712_HOLD"); e && (e[0] == '0' || e[0] == '1')) g_hold_2712.store(e[0] == '1' ? 1u : 0u);
     if (const char* e = std::getenv("BBHOST_SFX_WIND_WARMUP_HOLD"); e && (e[0] == '0' || e[0] == '1')) g_hold_warmup.store(e[0] == '1' ? 1u : 0u);
-    if (!g_hold_2712.load())
-        host_log("decomp: GPU type 0x2712's update runs on the frames between whole effect steps, as before (BBHOST_SFX_2712_HOLD=0): "
-                 "its emissions there never reach its grid");
     DecompFunction instance{"sub_2c4ff30", area, 0x2c4ff30, kInstanceEntry, sizeof(kInstanceEntry),
                             reinterpret_cast<void*>(&sfx_instance_update), DecompKind::Leaf, &g_game_instance};
     instance.report = &report;
