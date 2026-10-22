@@ -84,6 +84,23 @@ std::vector<Record> g_records;            // under g_mu
 std::vector<std::uint32_t> g_free;        // under g_mu: records not live
 std::vector<std::vector<std::uint32_t>> g_pages;  // under g_mu: by page, the live records over it
 std::uint64_t g_live = 0, g_live_max = 0;         // under g_mu
+// The last records handed out over (BBHOST_GXVK_ARENA_TRACE=1): where a binding
+// no hand-out holds was, for the log.
+struct Dropped {
+    std::uint64_t start = 0, end = 0, stamp = 0, by_start = 0, by_end = 0, seq = 0;
+};
+constexpr std::size_t kDropped = 4096;
+Dropped g_dropped[kDropped];  // under g_mu: a ring
+std::uint64_t g_dropped_n = 0, g_handout_seq = 0;  // under g_mu
+const bool g_trace = [] {
+    const char* e = std::getenv("BBHOST_GXVK_ARENA_TRACE");
+    return e && e[0] == '1';
+}();
+int g_traced = 0;  // under g_mu
+// BBHOST_GXVK_ARENA_TRACE=1: bindings no hand-out holds, by MiB of the heap; hand-outs of other pools.
+std::atomic<std::uint64_t> g_norecord_mib[256] = {};
+std::atomic<std::uint64_t> g_other_pool{0}, g_other_pool_in_heap{0};
+std::atomic<int> g_handout_said{0};
 
 // A sampled binding, waiting for its submission.
 struct Sample {
@@ -234,12 +251,20 @@ bool arena_heap(std::uint64_t* lo, std::uint64_t* hi) {
 }
 
 void arena_handout(std::uint64_t pool, std::uint64_t node) {
-    if (g_mode == Arena::kOff || !node || pool != g_pool.load(std::memory_order_relaxed)) return;
+    if (g_mode == Arena::kOff || !node) return;
     const std::uint64_t lo = g_lo.load(std::memory_order_acquire), hi = g_hi.load(std::memory_order_relaxed);
     std::uint64_t start = 0, next = 0, end = 0;
     std::memcpy(&start, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(node + 8)), 8);
     std::memcpy(&next, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(node + 0x18)), 8);
     if (next) std::memcpy(&end, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(next + 8)), 8);
+    if (g_trace && (hi && start >= hi - (1u << 20) && start < hi) && g_handout_said.fetch_add(1) < 16)
+        host_log("gxvk arena: a hand-out at the heap's top: [0x%llx, 0x%llx) by pool 0x%llx (the heap's 0x%llx)", static_cast<ull>(start),
+                 static_cast<ull>(end), static_cast<ull>(pool), static_cast<ull>(g_pool.load()));
+    if (pool != g_pool.load(std::memory_order_relaxed)) {
+        g_other_pool.fetch_add(1, std::memory_order_relaxed);
+        if (lo && start >= lo && start < hi) g_other_pool_in_heap.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     if (!lo || start < lo || end > hi || end <= start) {
         g_outside.fetch_add(1, std::memory_order_relaxed);
         return;
@@ -261,6 +286,7 @@ void arena_handout(std::uint64_t pool, std::uint64_t node) {
                 violation("a range handed out again before the submission that bound it completed", rec.start, rec.end - rec.start, rec.stamp - 1,
                           done);
             }
+            if (g_trace) g_dropped[g_dropped_n++ % kDropped] = {rec.start, rec.end, rec.stamp, start, end, g_handout_seq};
             drop_locked(r);
         }
     }
@@ -277,14 +303,19 @@ void arena_handout(std::uint64_t pool, std::uint64_t node) {
     rec.end = end;
     rec.stamp = 0;
     rec.live = true;
+    ++g_handout_seq;
     for (std::uint64_t p = p0; p <= p1; ++p) g_pages[p].push_back(r);
     if (++g_live > g_live_max) g_live_max = g_live;
 }
 
 bool arena_bind(std::uint64_t va, std::uint64_t bytes, std::uint64_t serial, Use use, bool stored) {
     if (g_mode == Arena::kOff) return false;
-    const std::uint64_t lo = g_lo.load(std::memory_order_acquire);
-    if (!lo || va < lo || bytes > g_hi.load(std::memory_order_relaxed) - va) return false;
+    const std::uint64_t lo = g_lo.load(std::memory_order_acquire), hi = g_hi.load(std::memory_order_relaxed);
+    if (!lo || va < lo || (va >= hi && !MUTANT(5))) return false;  // not the heap's: nothing to count
+    if (bytes > hi - va) {
+        g_fell[kWhyStraddle].fetch_add(1, std::memory_order_relaxed);  // runs past the heap's end
+        return false;
+    }
     if (stored) {
         g_fell[kWhyStored].fetch_add(1, std::memory_order_relaxed);
         return false;
@@ -323,6 +354,38 @@ bool arena_bind(std::uint64_t va, std::uint64_t bytes, std::uint64_t serial, Use
     }
     if (!found) {
         g_fell[straddle ? kWhyStraddle : kWhyNoRecord].fetch_add(1, std::memory_order_relaxed);
+        if (g_trace && !straddle) g_norecord_mib[std::min<std::uint64_t>((va - lo) >> 20, 255)].fetch_add(1, std::memory_order_relaxed);
+        if (g_trace && !straddle) {
+            std::lock_guard<std::mutex> lk(g_mu);
+            if (g_traced < 24) {
+                ++g_traced;
+                const std::uint64_t p = (va - lo) >> kPageShift;
+                std::uint64_t near_lo = 0, near_hi = 0;
+                std::size_t n = p < g_pages.size() ? g_pages[p].size() : 0;
+                for (std::size_t k = 0; k < n; ++k) {
+                    const Record& rec = g_records[g_pages[p][k]];
+                    if (rec.end <= va && rec.end > near_lo) near_lo = rec.end;
+                    if (rec.start > va && (!near_hi || rec.start < near_hi)) near_hi = rec.start;
+                }
+                const Dropped* was = nullptr;
+                for (std::uint64_t k = 0; k < std::min<std::uint64_t>(g_dropped_n, kDropped); ++k) {
+                    const Dropped& d = g_dropped[(g_dropped_n - 1 - k) % kDropped];
+                    if (va >= d.start && va < d.end) {
+                        was = &d;
+                        break;
+                    }
+                }
+                char drop[200] = "";
+                if (was)
+                    std::snprintf(drop, sizeof drop, "; it was in [0x%llx, 0x%llx), stamp %llu, handed out over by [0x%llx, 0x%llx) %llu hand-outs ago",
+                                  static_cast<ull>(was->start), static_cast<ull>(was->end), static_cast<ull>(was->stamp), static_cast<ull>(was->by_start),
+                                  static_cast<ull>(was->by_end), static_cast<ull>(g_handout_seq - was->seq));
+                host_log("gxvk arena: a binding no hand-out holds: 0x%llx, %llu bytes, submission %llu (%llu completed); its page has %zu records, the "
+                         "nearest ending 0x%llx before it, the nearest starting 0x%llx after it%s",
+                         static_cast<ull>(va), static_cast<ull>(bytes), static_cast<ull>(serial), static_cast<ull>(done_submissions()), n,
+                         static_cast<ull>(near_lo), static_cast<ull>(near_hi), drop);
+            }
+        }
         return false;
     }
     if (!g_in_place.load(std::memory_order_relaxed)) {
@@ -426,6 +489,18 @@ void arena_report() {
         std::lock_guard<std::mutex> lk(g_mu);
         check_samples_locked(done_submissions());
         live_max = g_live_max;
+    }
+    if (g_trace) {
+        std::string mib;
+        for (int m = 0; m < 256; ++m) {
+            const std::uint64_t n = g_norecord_mib[m].load();
+            if (!n) continue;
+            char b[48];
+            std::snprintf(b, sizeof b, " %d:%llu", m, static_cast<ull>(n));
+            mib += b;
+        }
+        host_log("gxvk arena: bindings no hand-out holds, by MiB from the heap's start:%s; hand-outs of other pools %llu (%llu in the heap)",
+                 mib.c_str(), v(g_other_pool), v(g_other_pool_in_heap));
     }
     static const char* const kUseLabel[kUses] = {"vertex records", "index buffers", "constant buffers", "unordered-access buffers"};
     std::string bound;

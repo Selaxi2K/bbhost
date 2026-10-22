@@ -239,6 +239,21 @@ int check_all(bool say) {
     }
     if (say) std::printf("  bytes: %ld rewrites under queued draws made, %ld found; none found where ranges were only handed out again\n", rewrites,
                          changed);
+    // Bindings outside the heap are not the arena's: nothing bound, nothing counted (an address above the heap once
+    // wrapped the bounds test round and counted as a fallback); one running past the heap's end is refused.
+    {
+        run(Arena::kInPlace, 2000, 0.0, 0.0, 41);
+        const u64 base = (reinterpret_cast<u64>(g_heap) + 15) & ~u64{15};
+        const auto c0 = gxvk::arena_test_counts();
+        const bool above = gxvk::arena_bind(base + kHeapBytes + 4096, 64, 1, gxvk::kUseConstant, false);
+        const bool below = gxvk::arena_bind(base - 4096, 64, 1, gxvk::kUseConstant, false);
+        const auto c1 = gxvk::arena_test_counts();
+        if (above || below || c1.fell != c0.fell) fail("a binding outside the heap bound or counted", 0);
+        const bool past = gxvk::arena_bind(base + kHeapBytes - 32, 64, 1, gxvk::kUseConstant, false);
+        const auto c2 = gxvk::arena_test_counts();
+        if (past || c2.fell != c1.fell + 1) fail("a binding over the heap's end not refused and counted", 0);
+        if (say) std::printf("  bindings outside the heap: not the arena's; one over its end refused\n");
+    }
     return g_failed - before;
 }
 
@@ -251,9 +266,10 @@ int main() {
         return 1;
     }
     static const char* const kMistake[] = {"", "a binding's stamp one submission short", "a hand-out over part of a record not checked",
-                                           "a binding past its hand-out bound in place", "a sample checked after its range was handed out again"};
+                                           "a binding past its hand-out bound in place", "a sample checked after its range was handed out again",
+                                           "the heap's bounds test wrapping round above it"};
     int missed = 0;
-    for (int m = 1; m <= 4; ++m) {
+    for (int m = 1; m <= 5; ++m) {
         g_arena_mutant = m;
         g_quiet = true;
         const int bad = check_all(false);
