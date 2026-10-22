@@ -1723,7 +1723,8 @@ int check_wind_warmup(int cases) {
         int at = -1;
         ++g_seen_warmup.cases;
         auto bytes = [](u64 w) {
-            std::vector<u8> v(reinterpret_cast<u8*>(w), reinterpret_cast<u8*>(w) + 0x80);
+            std::vector<u8> v(0x80);
+            std::memcpy(v.data(), reinterpret_cast<const void*>(w), v.size());
             std::memset(v.data() + 0x18, 0, 8);  // the list heads are each one's own
             return v;
         };
