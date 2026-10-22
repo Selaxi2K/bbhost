@@ -314,6 +314,12 @@ if(Vulkan_FOUND)
   add_executable(hlsl_equiv tools/hlsl_equiv.cpp src/host/dxc.cpp)
   target_include_directories(hlsl_equiv PRIVATE src)
   target_link_libraries(hlsl_equiv PRIVATE gcn Vulkan::Vulkan ${CMAKE_DL_LIBS})
+  # GX's upload heap's move (BBHOST_GXVK_ARENA=2) on a GPU, outside the game: the steps bbhost runs, checked (Linux).
+  if(NOT WIN32)
+    add_executable(arena_move_check tools/arena_move_check.cpp)
+    target_include_directories(arena_move_check PRIVATE src)
+    target_link_libraries(arena_move_check PRIVATE Vulkan::Vulkan Threads::Threads)
+  endif()
   # Offline replay of BBHOST_CAPTURE_DRAW captures.
   add_executable(drawreplay tools/drawreplay.cpp src/core/sha256.cpp)
   target_include_directories(drawreplay PRIVATE src)
@@ -571,6 +577,10 @@ if(UNIX)
   add_executable(gxvk_buffers_mode_test tests/gxvk_buffers_mode_test.cpp)
   target_include_directories(gxvk_buffers_mode_test PRIVATE src)
   add_test(NAME gxvk_buffers_mode_test COMMAND gxvk_buffers_mode_test)
+  # GX's upload heap moved in pieces (BBHOST_GXVK_ARENA=2): the layout, the room rule and the steps with their undo.
+  add_executable(arena_move_test tests/arena_move_test.cpp)
+  target_include_directories(arena_move_test PRIVATE src)
+  add_test(NAME arena_move_test COMMAND arena_move_test)
   # The buffer shadow's page copies grow a run only where both ends meet.
   add_executable(copy_runs_test tests/copy_runs_test.cpp)
   target_include_directories(copy_runs_test PRIVATE src)

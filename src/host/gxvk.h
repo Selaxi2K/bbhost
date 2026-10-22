@@ -208,6 +208,12 @@ bool arena_move_pending(std::uint64_t* va, std::uint64_t* bytes);
 // then whether the move held, with what the memory is.
 void arena_moving(bool on);
 void arena_moved(bool ok, const char* what);
+// Whether the move held: the heap is video memory the CPU writes.
+bool arena_moved_ok();
+// BBHOST_GXVK_ARENA=2: the host mapping the heap was given, recorded as pieces
+// of `piece` bytes side by side (each its own mapping, import and move:
+// host/arena_move.h); false in every other mode.
+bool arena_pieces(std::uint64_t* va, std::uint64_t* bytes, std::uint64_t* piece);
 // The fault handler's (async-signal-safe, no stack protector): a write fault
 // on the heap while it moves waits for the move and returns true (retry).
 bool arena_move_fault(std::uint64_t addr);
@@ -222,6 +228,8 @@ void arena_handout(std::uint64_t pool, std::uint64_t node);
 bool arena_bind(std::uint64_t va, std::uint64_t bytes, std::uint64_t serial, Use use, bool stored);
 // The binding found no one buffer over the heap to bind it in.
 void arena_no_backing();
+// The binding's range crosses two of the heap's pieces (=2), so no one buffer holds it.
+void arena_crossing();
 // Today's path over the heap, counted where it runs: the work stage 1c takes
 // away, and the command processor's reads of descriptor tables in the heap -
 // slow once the heap is in write-combined video memory (BBHOST_GXVK_ARENA=2).

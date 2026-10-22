@@ -718,11 +718,22 @@ sends every binding of the heap back to today's path for the rest of the run,
 and the exit report says so. `BBHOST_GXVK_ARENA=compare` keeps today's path
 and checks every binding of the heap as in place would bind it.
 `BBHOST_GXVK_ARENA=2` also moves the heap into video memory the CPU writes,
-where the driver can place a mapping at an address of ours
-(`VK_EXT_map_memory_placed`) and the memory budget has room: GX's device is
-made before bbhost's, so its pool is given a host mapping of bbhost's, whose
-bytes are copied at the GPU's start - writes to it wait meanwhile - and the
-video memory is mapped over it.
+on Linux, where the driver can place a mapping at an address of ours
+(`VK_EXT_map_memory_placed`): GX's device is made before bbhost's, so its
+pool is given a host mapping of bbhost's, whose bytes are copied at the GPU's
+start - writes to it wait meanwhile - and the video memory is mapped over it.
+In pieces: NVIDIA's driver places that memory up to 124 MiB at a time, so the
+mapping is recorded as pieces of 32 MiB side by side
+(`BBHOST_GXVK_ARENA_PIECE_MB` sets it, 1 to 124), each an allocation of its
+own placed over its part and imported on its own, and a binding across two
+pieces takes today's path (the exit report counts it). The room is what the
+driver counts in use: the heap's 160 MiB must fit beside it with 16 MiB to
+spare, which an RTX 4070's 246 MiB window without resizable BAR holds next to
+the params ring; the constant-buffer copies' ring then goes in host memory.
+A step that fails is undone - the heap host memory again, with every write
+GX made - and the log says which and why; `=2` then binds in place as `=1`
+does - with the heap in bbhost's pieces when the driver has no placed
+mappings (lavapipe), in the game's region on Windows.
 
 ## Tools
 
