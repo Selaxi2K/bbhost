@@ -35,6 +35,7 @@
 #include "decomp/decomp.h"
 #include "decomp/guest.h"
 
+#include <algorithm>
 #include <atomic>
 #include <bit>
 #include <cstdint>
@@ -283,12 +284,53 @@ constexpr u64 kConverted[] = {
 const u64* g_converted = kConverted;
 std::size_t g_converted_count = sizeof kConverted / sizeof kConverted[0];
 
-inline bool converted_class(u64 object) {
-    if (!object) return true;
-    const u64 vt = load<u64>(object);
+// The converted classes' vtables as the game has them, in a small open table that conv_build fills when the smooth
+// steps start (and the tests when they change the list): one probe or two a class where the list's scan took up to
+// one compare a converted class, for every motion, module and binder of every smooth instance, every frame. A list
+// it was not built for is scanned as before.
+constexpr std::size_t kConvSlots = 128;
+struct ConvTable {
+    const u64* list = nullptr;
+    std::size_t count = 0;
+    u64 slot[kConvSlots] = {};
+};
+ConvTable g_conv;
+inline std::size_t conv_slot(u64 vt) { return static_cast<std::size_t>(((vt >> 3) * 0x9E3779B97F4A7C15ull) >> 57) & (kConvSlots - 1); }
+void conv_build() {
+    ConvTable t;
+    t.list = g_converted;
+    t.count = g_converted_count;
+    for (std::size_t i = 0; i < g_converted_count && i < kConvSlots / 2; ++i) {
+        const u64 vt = game_address(g_converted[i]);
+        std::size_t h = conv_slot(vt);
+        while (t.slot[h] && t.slot[h] != vt) h = (h + 1) & (kConvSlots - 1);
+        t.slot[h] = vt;
+    }
+    if (g_converted_count > kConvSlots / 2) t.list = nullptr;  // too many for the table: scanned
+    g_conv = t;
+}
+inline bool converted_vt(u64 vt) {
+    if (!vt) return false;
+    if (g_conv.list == g_converted && g_conv.count == g_converted_count && g_conv.list) {
+        for (std::size_t h = conv_slot(vt);; h = (h + 1) & (kConvSlots - 1)) {
+            const u64 seen = g_conv.slot[h];
+            if (seen == vt) return true;
+            if (!seen) return false;
+        }
+    }
     for (std::size_t i = 0; i < g_converted_count; ++i)
         if (vt == game_address(g_converted[i])) return true;
     return false;
+}
+inline bool converted_class(u64 object) { return !object || converted_vt(load<u64>(object)); }
+
+// A node tree's next node, as sub_2c4f0e0 (kNodeNext) walks it: its first child (+0x70), else the next sibling
+// (+0x68) of it or of the nearest parent (+0x60) that has one, else none.
+inline u64 node_next(u64 node) {
+    if (const u64 child = load<u64>(node + 0x70)) return child;
+    for (; node; node = load<u64>(node + 0x60))
+        if (const u64 sibling = load<u64>(node + 0x68)) return sibling;
+    return 0;
 }
 
 // The classes that kept an instance on the held frames: their vtables and counts, a small open table
@@ -325,10 +367,13 @@ bool motion_converted(u64 motion, int depth, u64& kept) {
     return false;
 }
 
-// The first class of the instance's off the list (its vtable), or 0 when every one is on it.
-u64 first_unconverted(u64 instance) {
-    const auto next_of = game_function<NextFn>(kNodeNext);
-    for (u64 node = load<u64>(instance + 0x78); node; node = next_of(node)) {
+// The first class of the instance's off the list (its vtable), or 0 when every one is on it. With `marks`, the same
+// walk collects the instance's ribbons and GPU particle types 0x2713 for ribbon_mark (up to kMarks; past that
+// `*nmarks` is kMarks + 1 and mark_ribbons walks them again).
+constexpr int kMarks = 16;
+u64 first_unconverted(u64 instance, u64* marks = nullptr, int* nmarks = nullptr) {
+    const u64 binder_vt = game_address(0x56e3100), ribbon_vt = game_address(kGxTypeRibbon), vt2713 = game_address(kGxType2713);
+    for (u64 node = load<u64>(instance + 0x78); node; node = node_next(node)) {
         u64 kept = 0;
         if (!motion_converted(load<u64>(node + 0x90), 0, kept)) return kept;
         for (const u64 slot : {0x98ull, 0xa0ull, 0xa8ull}) {
@@ -339,10 +384,14 @@ u64 first_unconverted(u64 instance) {
             const u64 target = load<u64>(item + 0x20);
             if (!converted_class(target)) return load<u64>(target);
             // a GX binder's type instance (the GPU particle systems' kinds)
-            if (target && load<u64>(target) == game_address(0x56e3100)) {
+            if (target && load<u64>(target) == binder_vt) {
                 const u64 holder = load<u64>(target + 0x10);
                 const u64 type = holder ? load<u64>(holder + 8) : 0;
                 if (!converted_class(type)) return load<u64>(type);
+                if (marks && type && (load<u64>(type) == ribbon_vt || load<u64>(type) == vt2713)) {
+                    if (*nmarks < kMarks) marks[*nmarks] = type;
+                    if (*nmarks <= kMarks) ++*nmarks;
+                }
             }
         }
     }
@@ -351,8 +400,7 @@ u64 first_unconverted(u64 instance) {
 
 // The instance's ribbons and GPU particle types 0x2713 marked for this frame (ribbon_mark); false when one finds no slot.
 bool mark_ribbons(u64 instance) {
-    const auto next_of = game_function<NextFn>(kNodeNext);
-    for (u64 node = load<u64>(instance + 0x78); node; node = next_of(node))
+    for (u64 node = load<u64>(instance + 0x78); node; node = node_next(node))
         for (u64 item = load<u64>(node + 0x80 + 0x30); item; item = load<u64>(item + 0x18)) {
             const u64 target = load<u64>(item + 0x20);
             if (!target || load<u64>(target) != game_address(0x56e3100)) continue;
@@ -388,9 +436,8 @@ u8 smooth_update(u64 instance, u64 context, float step) {
     }
     const u64 definition = load<u64>(instance + 0x38);
     if (!definition) return 1;
-    const auto next_of = game_function<NextFn>(kNodeNext);
     for (u64 node = load<u64>(instance + 0x78); node;) {
-        const u64 next = next_of(node);
+        const u64 next = node_next(node);
         if (!sfx_node::update(node, st, definition, context)) {
             game_function<NodeFn>(kNodeRelease)(node);
             game_function<NodeFn>(kNodeClear)(node);
@@ -413,10 +460,12 @@ DECOMP_LEAF u8 sfx_instance_update(u64 instance, u64 context, float step) {
     if (g_smooth.load(std::memory_order_relaxed) && !(flags & 4) && (flags & 1)) {
         const u64 sfx = load<u64>(game_address(kSprjSfx));
         if (!(sfx && load<u32>(sfx + 0x8c))) {  // the game's own still frame stays the game's
-            if (const u64 kept = first_unconverted(instance)) {
+            u64 marks[kMarks];
+            int nmarks = 0;
+            if (const u64 kept = first_unconverted(instance, marks, &nmarks)) {
                 g_smooth_kept.fetch_add(1, std::memory_order_relaxed);
                 count_kept(kept);
-            } else if (!mark_ribbons(instance)) {
+            } else if (nmarks > kMarks ? !mark_ribbons(instance) : !std::all_of(marks, marks + nmarks, [](u64 t) { return ribbon_mark(t); })) {
                 g_smooth_kept.fetch_add(1, std::memory_order_relaxed);
                 count_kept(game_address(kGxTypeRibbon));  // no room to mark a ribbon (or a 0x2713) this frame: held, as at 30
             } else {
@@ -432,9 +481,8 @@ DECOMP_LEAF u8 sfx_instance_update(u64 instance, u64 context, float step) {
     }
     const u64 definition = load<u64>(instance + 0x38);
     if (!definition) return 1;
-    const auto next_of = game_function<NextFn>(kNodeNext);
     for (u64 node = load<u64>(instance + 0x78); node;) {
-        const u64 next = next_of(node);
+        const u64 next = node_next(node);
         float copy = s;
         if (!node_held(node, &copy, definition, context)) {
             game_function<NodeFn>(kNodeRelease)(node);
@@ -863,7 +911,10 @@ void decomp_sfx_frame_time(float frame, float from, float into) {
     g_frame_into.store(into, std::memory_order_relaxed);
 }
 
-void decomp_sfx_smooth(bool on) { g_smooth.store(on ? 1u : 0u, std::memory_order_relaxed); }
+void decomp_sfx_smooth(bool on) {
+    if (on) conv_build();
+    g_smooth.store(on ? 1u : 0u, std::memory_order_relaxed);
+}
 
 bool decomp_sfx_gate_placed() { return decomp_placed("sub_2c4ff30") == 1 && decomp_placed("sub_131e660") == 1; }
 
