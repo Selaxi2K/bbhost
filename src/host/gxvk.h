@@ -210,8 +210,10 @@ void arena_handout(std::uint64_t pool, std::uint64_t node);
 bool arena_bind(std::uint64_t va, std::uint64_t bytes, std::uint64_t serial, Use use, bool stored);
 // The binding found no one buffer over the heap to bind it in.
 void arena_no_backing();
-// Today's path over the heap, counted where it runs (the work stage 1c takes away).
-enum ArenaNote : int { kArenaSnapshotCb, kArenaSnapshotVertex, kArenaGpuPending, kArenaLocated, kArenaNotes };
+// Today's path over the heap, counted where it runs: the work stage 1c takes
+// away, and the command processor's reads of descriptor tables in the heap -
+// slow once the heap is in write-combined video memory (BBHOST_GXVK_ARENA=2).
+enum ArenaNote : int { kArenaSnapshotCb, kArenaSnapshotVertex, kArenaGpuPending, kArenaTableRead, kArenaNotes };
 void arena_note(ArenaNote what, std::uint64_t bytes);
 // The exit report (gx_resources_report calls it).
 void arena_report();

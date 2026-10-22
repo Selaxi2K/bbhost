@@ -412,7 +412,7 @@ void arena_report() {
     const auto v = [](const std::atomic<std::uint64_t>& a) { return static_cast<ull>(a.load(std::memory_order_relaxed)); };
     if (g_mode == Arena::kOff) {
         std::string notes;
-        static const char* const kNoteName[kArenaNotes] = {"constant-buffer snapshots", "vertex snapshots", "GPU writes pending", "located"};
+        static const char* const kNoteName[kArenaNotes] = {"constant-buffer snapshots", "vertex snapshots", "GPU writes pending", "descriptor-table reads"};
         for (int n = 0; n < kArenaNotes; ++n) {
             char b[96];
             std::snprintf(b, sizeof b, "%s%s %llu (%llu MiB)", n ? ", " : "", kNoteName[n], v(g_noted[n]), v(g_noted_bytes[n]) >> 20);
@@ -448,7 +448,7 @@ void arena_report() {
              v(g_handouts), v(g_outside), static_cast<ull>(live_max), v(g_violations_order), v(g_samples_checked), v(g_samples_skipped),
              v(g_violations_bytes), g_in_place.load() ? "" : " - in place stopped at the first");
     static const char* const kNoteName[kArenaNotes] = {"constant-buffer snapshots", "vertex snapshots", "GPU writes pending",
-                                                       "located"};
+                                                       "descriptor-table reads"};
     std::string notes;
     for (int n = 0; n < kArenaNotes; ++n) {
         char b[96];

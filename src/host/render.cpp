@@ -9861,6 +9861,12 @@ bool resolve_resource_impl(const gcn::ResourcePath& path, const std::uint32_t* u
     const std::uint64_t addr = interp_base(cur, path.final_vsharp) + static_cast<std::uint64_t>(path.final_offset_dw) * 4;
     if (!hle_kernel_va_mapped(addr, static_cast<std::size_t>(ndw) * 4)) return false;
     if (touched) touched->push_back({addr, static_cast<std::uint64_t>(ndw) * 4});
+    // GX's upload heap holds the commits' tables: what the command processor
+    // reads of it on the CPU (stage 1c's census, and with the heap moved).
+    if (gxvk::census() || gxvk::arena_wanted()) {
+        std::uint64_t lo = 0, hi = 0;
+        if (gxvk::arena_heap(&lo, &hi) && addr >= lo && addr < hi) gxvk::arena_note(gxvk::kArenaTableRead, static_cast<std::uint64_t>(ndw) * 4);
+    }
     // The table was usually dumped by the constant engine a packet ago, into
     // the command stream rather than memory: read it as the draw will see it.
     read_guest_locked(addr, static_cast<std::size_t>(ndw) * 4, out);
@@ -12837,6 +12843,12 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                 return !(e && e[0] == '0');
             }();
             bool snapshot = false;
+            // The census: a GPU write still to land on the heap (none expected: nothing GPU-written lies there).
+            if (gxvk::census()) {
+                std::uint64_t lo = 0, hi = 0;
+                if (gxvk::arena_heap(&lo, &hi) && base >= lo && base < hi && gpu_writes_pending_locked(base, bytes))
+                    gxvk::arena_note(gxvk::kArenaGpuPending, bytes);
+            }
             if (!realign && snapshot_cpu && !in_heap && version == kCopyVersionNone && !in_window && !b.written && !twin &&
                 !gpu_writes_pending_locked(base, bytes)) {
                 realign = snapshot = true;
