@@ -428,16 +428,6 @@ struct Gpu {
     VkPipelineCache opt_cache = VK_NULL_HANDLE;
     VkDebugUtilsMessengerEXT messenger = VK_NULL_HANDLE;
     bool has_maint8 = false;
-    // VK_EXT_map_memory_placed with VK_KHR_map_memory2, enabled only for GX on
-    // Vulkan's arena when it moves GX's upload heap (BBHOST_GXVK_ARENA=2,
-    // gpu.cpp arena_place_locked): its map function and the alignment a
-    // placed mapping takes.
-    bool has_placed_map = false;
-    const char* placed_missing = "not asked for";  // why has_placed_map is false, for the arena's log
-    void* map_memory2 = nullptr;  // PFN_vkMapMemory2KHR
-    void* unmap_memory2 = nullptr;  // PFN_vkUnmapMemory2KHR: an undone move's unmaps
-    bool unmap_reserve = false;     // memoryUnmapReserve: an unmap may keep its range reserved
-    VkDeviceSize placed_align = 0;
     // Vulkan 1.3's pipelineCreationCacheControl: a pipeline can be asked for
     // only if the pipeline cache already has it (VK_PIPELINE_CREATE_FAIL_ON_
     // PIPELINE_COMPILE_REQUIRED_BIT), which answers without compiling.
