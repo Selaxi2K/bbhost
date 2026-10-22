@@ -13850,7 +13850,9 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
                 // its snapshot - the CPU's copy of what the draw reads, made
                 // as it records (shadow_snapshot_locked), which the record's
                 // other elements share - so no import either; an import only
-                // otherwise.
+                // otherwise - which is also the binding of a record read in
+                // place (BBHOST_SHADOW_IN_PLACE, an integrated GPU's told
+                // meshes).
                 const std::uint64_t record_bytes = w[2] ? static_cast<std::uint64_t>(w[2]) * stride : fe.offset + bytes;
                 Located m;
                 if (record_bytes >= fe.offset + bytes && shadow_mirror_locked(va - fe.offset, record_bytes, m)) {
