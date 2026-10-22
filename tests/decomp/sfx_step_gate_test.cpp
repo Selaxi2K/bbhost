@@ -1463,6 +1463,235 @@ int check_records(int cases, u64 sfx) {
     return bad;
 }
 
+// --- the classifications kept between whole steps ---------------------------------------------
+
+// classify against first_unconverted's own answer, frame by frame, under the real converted list: frames at 120 (a whole
+// step, then three between), the instance's nodes and classes changed the ways the game changes them - on a whole
+// step a node set up, a binder bound, a module made or let go (any class, off the list too); between them only a
+// pending binder taken by the GX side or a GX binder's type made (a ribbon among them). With a whole step the answer
+// is the walk's; between them the decision must be the walk's, or held where the walk now finds the instance all on the
+// list (its unconverted binder taken since), and a smooth instance's marks hold every type the walk would mark. Then the
+// cases the slot's checks are for: an instance not updated on the whole step (the serial), another instance at a
+// released or reused address (the shape, the release), a GX binder bound between whole steps (its type to mark).
+void cache_classes(u64 n, bool off) {
+    const int mk = g_rng.range(0, 2);
+    store<u64>(n + 0x90, mk == 0 ? 0 : motion_on(mk - 1));
+    store<u64>(n + 0x98, g_rng.chance(0.5) ? object_of(any(kOnModules)) : 0);
+    store<u64>(n + 0xa0, 0);
+    store<u64>(n + 0xa8, off ? object_of(kOffModule) : g_rng.chance(0.3) ? object_of(any(kOnModules)) : 0);
+    store<u64>(n + 0xb0, 0);
+    const int pending = g_rng.range(0, 2);
+    for (int k = 0; k < pending; ++k) pend(n, g_rng.chance(0.5) ? object_of(kCpuBinder) : gx_binder(any(kOnGxTypes)));
+}
+// A GX binder whose record has no type yet (the GX side makes it).
+u64 unbound_binder() {
+    const u64 b = object_of(kGxBinder), holder = block(0x20);
+    store<u64>(holder + 8, 0);
+    store<u64>(b + 0x10, holder);
+    return b;
+}
+void add_child(u64 inst, u64 n) {
+    const u64 root = load<u64>(inst + 0x78);
+    store<u64>(n + 0x60, root);
+    store<u64>(n + 0x68, 0);
+    store<u64>(n + 0x70, 0);
+    if (!load<u64>(root + 0x70)) {
+        store<u64>(root + 0x70, n);
+        return;
+    }
+    u64 sib = load<u64>(root + 0x70);
+    while (load<u64>(sib + 0x68)) sib = load<u64>(sib + 0x68);
+    store<u64>(sib + 0x68, n);
+}
+std::vector<u64> tree_nodes(u64 inst) {
+    std::vector<u64> v;
+    for (u64 n = load<u64>(inst + 0x78); n; n = node_next(n)) v.push_back(n);
+    return v;
+}
+struct CacheSeen {
+    long frames = 0, reused = 0, held_kept = 0;
+} g_seen_cache;
+
+// One frame's classify against the walk; `between`: the cached answer may hold an instance the walk finds all on the
+// list, and its marks may hold more types. Returns a reason it differs, or nullptr.
+const char* cache_frame(u64 inst, bool between) {
+    decomp_sfx_gate_frame(between);
+    const u64 reused_before = g_class_reused.load();
+    u64 m1[kMarks], m2[kMarks];
+    int n1 = 0, n2 = 0;
+    const u64 k1 = classify(inst, m1, &n1);
+    const u64 k2 = first_unconverted(inst, m2, &n2);
+    ++g_seen_cache.frames;
+    g_seen_cache.reused += static_cast<long>(g_class_reused.load() - reused_before);
+    if (!between) {
+        if (k1 != k2) return "with a whole step: another class kept";
+        if (!k1 && (n1 != n2 || !std::equal(m1, m1 + std::min(n1, kMarks), m2))) return "with a whole step: other marks";
+        return nullptr;
+    }
+    if (!k1 && k2) return "between whole steps: smooth where the walk keeps it";
+    if (k1 && !k2) {
+        ++g_seen_cache.held_kept;
+        return nullptr;
+    }
+    if (!k1) {
+        if (n2 > kMarks) return n1 > kMarks ? nullptr : "between whole steps: too many marks not seen";
+        for (int i = 0; i < n2; ++i)
+            if (std::find(m1, m1 + std::min(n1, kMarks), m2[i]) == m1 + std::min(n1, kMarks)) return "between whole steps: a type to mark missing";
+    }
+    return nullptr;
+}
+
+int check_class_cache(int cases, u64 sfx) {
+    g_converted = kConverted;
+    g_converted_count = sizeof kConverted / sizeof kConverted[0];
+    decomp_sfx_smooth(true);
+    int bad = 0;
+    auto fail = [&](int c, const char* what, const char* why) {
+        if (++bad <= 6 && !g_quiet) std::printf("class cache %s %d: %s\n", what, c, why);
+    };
+    for (int c = 0; c < cases; ++c) {
+        g_blocks.clear();
+        Instance s = make_instance();
+        while (s.nodes.empty()) s = make_instance();
+        store<u32>(s.inst + 0x88, 1);
+        for (const u64 n : s.nodes) cache_classes(n, g_rng.chance(0.15));
+        const char* why = nullptr;
+        for (int f = 0; f < 12 && !why; ++f) {
+            const bool between = f % 4 != 0;
+            std::vector<u64> nodes = tree_nodes(s.inst);
+            if (!between) {
+                // a whole step: what the game sets up or lets go then
+                const int what = g_rng.range(0, 5);
+                if (what == 0) {
+                    const u64 n = node(s.inst, 1, 3);
+                    cache_classes(n, g_rng.chance(0.2));
+                    add_child(s.inst, n);
+                } else if (what == 1) {
+                    const u64 n = nodes[g_rng.range(0, static_cast<int>(nodes.size()) - 1)];
+                    pend(n, g_rng.chance(0.15) ? object_of(kOffModule) : g_rng.chance(0.4) ? unbound_binder() : gx_binder(any(kOnGxTypes)));
+                } else if (what == 2) {
+                    const u64 n = nodes[g_rng.range(0, static_cast<int>(nodes.size()) - 1)];
+                    store<u64>(n + 0xa8, g_rng.chance(0.3) ? object_of(kOffModule) : 0);
+                }
+            } else {
+                // between whole steps: a pending binder taken, or a GX binder's type made
+                const u64 n = nodes[g_rng.range(0, static_cast<int>(nodes.size()) - 1)];
+                if (g_rng.chance(0.3) && load<u64>(n + 0xb0)) store<u64>(n + 0xb0, load<u64>(load<u64>(n + 0xb0) + 0x18));
+                for (u64 item = load<u64>(n + 0xb0); item; item = load<u64>(item + 0x18)) {
+                    const u64 t = load<u64>(item + 0x20);
+                    if (!t || load<u64>(t) != game_address(kGxBinder)) continue;
+                    const u64 holder = load<u64>(t + 0x10);
+                    if (holder && !load<u64>(holder + 8) && g_rng.chance(0.5)) {
+                        const int kind = g_rng.range(0, 3);
+                        store<u64>(holder + 8, object_of(kind == 0 ? kGxTypeRibbon : kind == 1 ? kOffGxType : any(kOnGxTypes)));
+                    }
+                }
+            }
+            why = cache_frame(s.inst, between);
+        }
+        if (why) fail(c, "case", why);
+    }
+    // the serial: classified between whole steps, not updated on the next whole step, given a class off the list then
+    for (int c = 0; c < 200; ++c) {
+        g_blocks.clear();
+        Instance s = make_instance();
+        while (s.nodes.empty()) s = make_instance();
+        store<u32>(s.inst + 0x88, 1);
+        for (const u64 n : s.nodes) cache_classes(n, false);
+        if (cache_frame(s.inst, false) || cache_frame(s.inst, true)) continue;
+        decomp_sfx_gate_frame(false);  // the next whole step, without this instance
+        store<u64>(s.nodes[0] + 0xa8, object_of(kOffModule));
+        u64 m[kMarks];
+        int n = 0;
+        decomp_sfx_gate_frame(true);
+        if (!classify(s.inst, m, &n)) {
+            fail(c, "serial", "a classification kept from the last whole step");
+            break;
+        }
+    }
+    // the shape: another instance made at the address between whole steps (a new definition and node tree)
+    for (int c = 0; c < 200; ++c) {
+        g_blocks.clear();
+        Instance s = make_instance();
+        while (s.nodes.empty()) s = make_instance();
+        store<u32>(s.inst + 0x88, 1);
+        for (const u64 n : s.nodes) cache_classes(n, false);
+        if (cache_frame(s.inst, false) || cache_frame(s.inst, true)) continue;
+        store<u64>(s.inst + 0x38, definition(2));
+        const u64 root = node(s.inst, 1, 3);
+        cache_classes(root, true);
+        store<u64>(s.inst + 0x78, root);
+        u64 m[kMarks];
+        int n = 0;
+        decomp_sfx_gate_frame(true);
+        if (!classify(s.inst, m, &n)) {
+            fail(c, "shape", "another instance at the address took the old one's classification");
+            break;
+        }
+    }
+    // the release: the instance released and another made at its address with the same definition and nodes, one of
+    // its classes off the list
+    for (int c = 0; c < 200; ++c) {
+        g_blocks.clear();
+        Instance s = make_instance();
+        while (s.nodes.empty()) s = make_instance();
+        store<u32>(s.inst + 0x88, 1);
+        for (const u64 n : s.nodes) cache_classes(n, false);
+        if (cache_frame(s.inst, false) || cache_frame(s.inst, true)) continue;
+        const u64 def = load<u64>(s.inst + 0x38), root = load<u64>(s.inst + 0x78), child = load<u64>(root + 0x70);
+        store<u32>(s.inst + 0x88, 1 | 4);
+        sfx_instance_update(s.inst, s.ctx, 0.0f);  // its last update: the game's lets its tree go
+        store<u32>(s.inst + 0x88, 1);
+        store<u64>(s.inst + 0x38, def);
+        store<u64>(s.inst + 0x78, root);
+        store<u64>(root + 0x60, 0);
+        store<u64>(root + 0x68, 0);
+        store<u64>(root + 0x70, child);
+        if (child) {
+            store<u64>(child + 0x60, root);
+            store<u64>(child + 0x68, 0);
+            store<u64>(child + 0x70, 0);
+        }
+        store<u32>(root + 0x78, 1);
+        cache_classes(root, true);
+        u64 m[kMarks];
+        int n = 0;
+        decomp_sfx_gate_frame(true);
+        if (!classify(s.inst, m, &n)) {
+            fail(c, "release", "an instance made at a released one's address took its classification");
+            break;
+        }
+    }
+    // a GX binder bound between whole steps: its ribbon marked on that frame
+    for (int c = 0; c < 200; ++c) {
+        g_blocks.clear();
+        Instance s = make_instance();
+        while (s.nodes.empty()) s = make_instance();
+        store<u32>(s.inst + 0x88, 1);
+        for (const u64 n : s.nodes) cache_classes(n, false);
+        const u64 b = unbound_binder();
+        pend(s.nodes[0], b);
+        if (cache_frame(s.inst, false) || cache_frame(s.inst, true)) continue;
+        const u64 ribbon = object_of(kGxTypeRibbon);
+        store<u64>(load<u64>(b + 0x10) + 8, ribbon);
+        u64 m[kMarks];
+        int n = 0;
+        decomp_sfx_gate_frame(true);
+        const u64 k = classify(s.inst, m, &n);
+        if (k || std::find(m, m + std::min(n, kMarks), ribbon) == m + std::min(n, kMarks)) {
+            fail(c, "binding", "a GX binder bound between whole steps: its ribbon not marked");
+            break;
+        }
+    }
+    decomp_sfx_gate_frame(false);
+    decomp_sfx_smooth(false);
+    if (!g_quiet)
+        std::printf("decomp_sfx_step_gate: %d class cache cases (%ld frames, %ld classifications taken from the whole step, %ld held a "
+                    "frame longer than the walk would), %d differ\n",
+                    cases, g_seen_cache.frames, g_seen_cache.reused, g_seen_cache.held_kept, bad);
+    return bad;
+}
+
 // --- GPU particle type 0x2713 under the smooth steps -------------------------------------
 
 // A smooth instance's 0x2713 record (marked for the frame): its type reads its curves at the whole step's elapsed time
@@ -2364,6 +2593,20 @@ int main() {
         }
     }
     g_sfx_gate_mutant = 0;
+    // The classifications kept between whole steps.
+    g_quiet = false;
+    g_rng.specials = false;
+    const int ccbad = check_class_cache(kCases / 2, sfx);
+    if (ccbad) return 1;
+    g_quiet = true;
+    for (const int m : {51, 52, 53, 54}) {
+        g_sfx_gate_mutant = m;
+        if (!check_class_cache(400, sfx)) {
+            std::printf("decomp_sfx_step_gate: mutant %d not caught by the class cache\n", m);
+            ++missed;
+        }
+    }
+    g_sfx_gate_mutant = 0;
     // GPU particle type 0x2713 under the smooth steps.
     g_quiet = false;
     g_rng.specials = false;
@@ -2477,6 +2720,6 @@ int main() {
         }
     }
     g_sfx_gate_mutant = 0;
-    std::printf("decomp_sfx_step_gate: %d of 45 mutants caught\n", 45 - missed);
+    std::printf("decomp_sfx_step_gate: %d of 49 mutants caught\n", 49 - missed);
     return missed ? 1 : 0;
 }

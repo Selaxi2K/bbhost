@@ -371,7 +371,7 @@ bool motion_converted(u64 motion, int depth, u64& kept) {
 // walk collects the instance's ribbons and GPU particle types 0x2713 for ribbon_mark (up to kMarks; past that
 // `*nmarks` is kMarks + 1 and mark_ribbons walks them again).
 constexpr int kMarks = 16;
-u64 first_unconverted(u64 instance, u64* marks = nullptr, int* nmarks = nullptr) {
+u64 first_unconverted(u64 instance, u64* marks = nullptr, int* nmarks = nullptr, bool* unbound = nullptr) {
     const u64 binder_vt = game_address(0x56e3100), ribbon_vt = game_address(kGxTypeRibbon), vt2713 = game_address(kGxType2713);
     for (u64 node = load<u64>(instance + 0x78); node; node = node_next(node)) {
         u64 kept = 0;
@@ -387,6 +387,7 @@ u64 first_unconverted(u64 instance, u64* marks = nullptr, int* nmarks = nullptr)
             if (target && load<u64>(target) == binder_vt) {
                 const u64 holder = load<u64>(target + 0x10);
                 const u64 type = holder ? load<u64>(holder + 8) : 0;
+                if (!type && unbound) *unbound = true;  // the GX side makes its type when it binds the record
                 if (!converted_class(type)) return load<u64>(type);
                 if (marks && type && (load<u64>(type) == ribbon_vt || load<u64>(type) == vt2713)) {
                     if (*nmarks < kMarks) marks[*nmarks] = type;
@@ -410,6 +411,88 @@ bool mark_ribbons(u64 instance) {
                 return false;
         }
     return true;
+}
+
+// The instances' classifications (classify), kept for the frames between whole steps. An instance's node tree, the
+// classes its nodes use and its pending binders change only in what the effects count, on whole steps - the node
+// state machine sets nodes up, binds binders and frees the dead ones then - except a GX binder's type, which the GX
+// side makes when it first binds the record. So a classification made since the last whole step stands on a frame
+// between them while the instance still has its definition (+0x38), its root node (+0x78) and that node's first child
+// (+0x70), and every GX binder it met had its type; at most kSlotMarks ribbons and 0x2713 types to mark are kept with
+// it (more: classified every frame). A frame with a whole step always classifies anew. One 64-byte slot an instance,
+// by its address (a collision is classified again), behind a sequence word: a writer takes it odd by
+// compare-and-swap or leaves it, readers check it even and unchanged around their reads. A released instance's slot
+// is cleared at its last update (+0x88 bit 2), so an instance made later at the same address starts afresh.
+constexpr std::size_t kClassSlots = 2048;
+constexpr int kSlotMarks = 2;
+struct alignas(64) ClassSlot {
+    std::atomic<u32> seq{0};
+    std::atomic<u32> serial{0};
+    std::atomic<u64> inst{0}, def{0}, root{0}, child{0}, kept{0};
+    std::atomic<u64> marks[kSlotMarks] = {};
+};
+ClassSlot g_class_slots[kClassSlots];
+std::atomic<u32> g_step_serial{1};  // frames with a whole step so far
+std::atomic<u64> g_class_made{0}, g_class_reused{0};
+inline ClassSlot& class_slot(u64 instance) {
+    return g_class_slots[static_cast<std::size_t>(((instance >> 4) * 0x9E3779B97F4A7C15ull) >> 53) & (kClassSlots - 1)];
+}
+
+// The instance's first class off the list (0: none) and, when there is none, its ribbons and 0x2713 types to mark
+// (`*nmarks` past kMarks: too many to collect), as first_unconverted finds them - kept for the frames to the next
+// whole step.
+u64 classify(u64 instance, u64* marks, int* nmarks) {
+    const u64 def = load<u64>(instance + 0x38), root = load<u64>(instance + 0x78), child = root ? load<u64>(root + 0x70) : 0;
+    const u32 serial = g_step_serial.load(std::memory_order_relaxed);
+    ClassSlot& slot = class_slot(instance);
+    *nmarks = 0;
+    if (g_between.load(std::memory_order_relaxed)) {
+        const u32 s1 = slot.seq.load(std::memory_order_acquire);
+        if (!(s1 & 1) && slot.inst.load(std::memory_order_relaxed) == instance &&
+            (slot.serial.load(std::memory_order_relaxed) == serial || MUTANT(51)) &&
+            ((slot.def.load(std::memory_order_relaxed) == def && slot.root.load(std::memory_order_relaxed) == root &&
+              slot.child.load(std::memory_order_relaxed) == child) ||
+             MUTANT(52))) {
+            const u64 kept = slot.kept.load(std::memory_order_relaxed);
+            u64 kept_marks[kSlotMarks];
+            for (int i = 0; i < kSlotMarks; ++i) kept_marks[i] = slot.marks[i].load(std::memory_order_relaxed);
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (slot.seq.load(std::memory_order_relaxed) == s1) {
+                g_class_reused.fetch_add(1, std::memory_order_relaxed);
+                for (int i = 0; i < kSlotMarks && kept_marks[i]; ++i) marks[(*nmarks)++] = kept_marks[i];
+                return kept;
+            }
+        }
+    }
+    bool unbound = false;
+    const u64 kept = first_unconverted(instance, marks, nmarks, &unbound);
+    g_class_made.fetch_add(1, std::memory_order_relaxed);
+    if ((!unbound || MUTANT(53)) && *nmarks <= kSlotMarks) {
+        u32 s = slot.seq.load(std::memory_order_relaxed);
+        if (!(s & 1) && slot.seq.compare_exchange_strong(s, s + 1, std::memory_order_relaxed)) {
+            std::atomic_thread_fence(std::memory_order_release);
+            slot.inst.store(instance, std::memory_order_relaxed);
+            slot.serial.store(serial, std::memory_order_relaxed);
+            slot.def.store(def, std::memory_order_relaxed);
+            slot.root.store(root, std::memory_order_relaxed);
+            slot.child.store(child, std::memory_order_relaxed);
+            slot.kept.store(kept, std::memory_order_relaxed);
+            for (int i = 0; i < kSlotMarks; ++i) slot.marks[i].store(!kept && i < *nmarks ? marks[i] : 0, std::memory_order_relaxed);
+            slot.seq.store(s + 2, std::memory_order_release);
+        }
+    }
+    return kept;
+}
+
+// A released instance's classification let go (its address may hold another instance next).
+void forget_class(u64 instance) {
+    ClassSlot& slot = class_slot(instance);
+    u32 s = slot.seq.load(std::memory_order_relaxed);
+    if (slot.inst.load(std::memory_order_relaxed) != instance || (s & 1)) return;
+    if (!slot.seq.compare_exchange_strong(s, s + 1, std::memory_order_relaxed)) return;
+    std::atomic_thread_fence(std::memory_order_release);
+    if (slot.inst.load(std::memory_order_relaxed) == instance) slot.inst.store(0, std::memory_order_relaxed);
+    slot.seq.store(s + 2, std::memory_order_release);
 }
 
 u8 smooth_update(u64 instance, u64 context, float step) {
@@ -457,12 +540,13 @@ u8 smooth_update(u64 instance, u64 context, float step) {
 // are skipped and each node runs node_held(), which frees none.
 DECOMP_LEAF u8 sfx_instance_update(u64 instance, u64 context, float step) {
     const u32 flags = load<u32>(instance + 0x88);
+    if (g_smooth.load(std::memory_order_relaxed) && (flags & 4) && !MUTANT(54)) forget_class(instance);
     if (g_smooth.load(std::memory_order_relaxed) && !(flags & 4) && (flags & 1)) {
         const u64 sfx = load<u64>(game_address(kSprjSfx));
         if (!(sfx && load<u32>(sfx + 0x8c))) {  // the game's own still frame stays the game's
             u64 marks[kMarks];
             int nmarks = 0;
-            if (const u64 kept = first_unconverted(instance, marks, &nmarks)) {
+            if (const u64 kept = classify(instance, marks, &nmarks)) {
                 g_smooth_kept.fetch_add(1, std::memory_order_relaxed);
                 count_kept(kept);
             } else if (nmarks > kMarks ? !mark_ribbons(instance) : !std::all_of(marks, marks + nmarks, [](u64 t) { return ribbon_mark(t); })) {
@@ -892,6 +976,7 @@ DECOMP_LEAF void sfx_gx_record_update(u64 record, u64 item) {
 
 void decomp_sfx_gate_frame(bool between) {
     g_between.store(between ? 1u : 0u, std::memory_order_relaxed);
+    if (!between) g_step_serial.fetch_add(1, std::memory_order_relaxed);
     if (between) g_frames_between.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -946,8 +1031,9 @@ void report() {
              static_cast<ull>(g_warmups_held.load()), g_hold_warmup.load());
     if (!g_smooth.load()) return;
     host_log("decomp: the smooth effect steps: %llu instance updates took them, %llu stayed on the held frames for a class off the converted "
-             "list (%zu classes on it)",
-             static_cast<ull>(g_smooth_updates.load()), static_cast<ull>(g_smooth_kept.load()), g_converted_count);
+             "list (%zu classes on it); their classes looked at %llu times, %llu more taken from the frame's whole step",
+             static_cast<ull>(g_smooth_updates.load()), static_cast<ull>(g_smooth_kept.load()), g_converted_count,
+             static_cast<ull>(g_class_made.load()), static_cast<ull>(g_class_reused.load()));
     host_log("decomp:   FFX light updates by the frame's time: %llu, %llu of them after the whole step's own; light fades by the frame's time: %llu",
              static_cast<ull>(g_lights_smooth.load()), static_cast<ull>(g_lights_counted.load()), static_cast<ull>(g_fades_smooth.load()));
     host_log("decomp:   ribbon updates: %llu between whole steps (the head by the frame's time, nothing inserted), %llu on frames with one, "
