@@ -697,9 +697,10 @@ renamed constant buffer, Map rename and ring allocation comes from it. GX
 hands a range out again only after an end-of-pipe label behind the work that
 used it has landed, and a label lands only once the host's submission has
 completed, so a renamed copy holds what its draws read until the GPU has
-done with them: in the census, 70% of constant-buffer bindings lie in the
-heap. `BBHOST_GXVK_ARENA=1` binds those where they are, in the heap's
-import, without the snapshot copy or the lookups. Every run it is used
+done with them: in the census, 70% of constant-buffer bindings and 10% of
+vertex records lie in the heap. `BBHOST_GXVK_ARENA=1` binds those where they
+are, in the heap's import - a vertex record as far as its draw reads -
+without the snapshot copy or the lookups. Every run it is used
 proves the rule again: each hand-out is a record, each binding stamps the
 record it lies in with its submission, and a hand-out over a record's memory
 needs that submission completed; and one binding in 64 has its bytes hashed

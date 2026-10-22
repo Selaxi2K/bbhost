@@ -13746,15 +13746,38 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
                 continue;
             }
         }
+        // GX's upload heap (stage 1c, BBHOST_GXVK_ARENA=1): a record in a renamed
+        // copy is bound where GX wrote it, as far as its draw reads - no copy
+        // version, window, mirror, snapshot or import to find (host/gxvk_arena.cpp
+        // proves the copy holds those bytes until the GPU has done with them).
         Located loc;
-        const int version = copy_version_lookup_locked(va, need, &loc);
+        bool heap_record = false;
+        if (gxvk::arena_wanted()) {
+            const std::uint64_t rec_va = va - fe.offset;
+            std::uint64_t lo = 0, hi = 0;
+            if (gxvk::arena_heap(&lo, &hi) && rec_va >= lo && rec_va < hi) {
+                const std::uint64_t rec_bytes = w[2] ? static_cast<std::uint64_t>(w[2]) * stride : fe.offset + bytes;
+                const std::uint64_t reads = draw_read_bytes(w, stride, rec_bytes);
+                if (reads >= fe.offset + bytes && gxvk::arena_bind(rec_va, reads, g.flushes, gxvk::kUseVertex, false)) {
+                    Located whole;
+                    if (heap_located_locked(rec_va, reads, whole)) {
+                        loc = {whole.buffer, whole.offset + fe.offset, whole.avail - fe.offset};
+                        heap_record = true;
+                        placed_need = std::min(placed_need, reads - fe.offset);
+                    } else {
+                        gxvk::arena_no_backing();
+                    }
+                }
+            }
+        }
+        const int version = heap_record ? kCopyVersionNone : copy_version_lookup_locked(va, need, &loc);
         if (version == kCopyVersionStraddles) copy_versions_put_in_place_locked(kCvStraddle);
         // In one of the draw's CPU-written windows (YEBIS, host_gpu_draw_window):
         // the copy taken as the draw records, never the ring slot, which the
         // CPU may rewrite for a draw sixteen on before this one runs.
         bool windowed = false, mirrored = false, snapped = false;
         Located snap;  // snapped: the record's snapshot
-        if (version != kCopyVersionInside) {
+        if (!heap_record && version != kCopyVersionInside) {
             windowed = !t_draw_windows.empty() && draw_window_locked(va, need, loc);
             if (!windowed && !imports_whole()) {
                 // Window imports: the record from the buffer shadow's mirror
@@ -13843,7 +13866,11 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
                 gxvk::census_binding(gxvk::kUseVertex, o.vtx_obj[fe.slot], record_va, draw_read_bytes(w, stride, record_bytes), o.call_seq, g.flushes);
             bool in_place = false;
             bool shadow_served = false;  // a mirror serves the record (BBHOST_VB_RACE=2)
-            if (mirrored) {
+            if (heap_record) {
+                // The heap's import, from the record's start, as far as it holds.
+                ns.whole = {loc.buffer, loc.offset - fe.offset, std::min<std::uint64_t>(record_bytes, loc.avail + fe.offset)};
+                in_place = true;
+            } else if (mirrored) {
                 ns.whole = {loc.buffer, loc.offset - fe.offset, record_bytes};  // the mirror already (window imports)
             } else if (snapped) {
                 ns.whole = snap;  // the snapshot already (window imports)
