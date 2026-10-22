@@ -650,7 +650,7 @@ views, then GX's state as pipeline pieces, then command lists recorded into
 Vulkan command buffers in parallel and completions on timeline semaphores,
 after which guest memory is no longer what the GPU reads for GX's objects.
 
-**Buffers (the first stage, off by default while it is measured).** A census
+**Buffers (the first stage).** A census
 (`BBHOST_GXVK_CENSUS=1`) measured what it rests on at Central Yharnam, Old
 Yharnam, Nightmare of Mensis and Cainhurst: GX makes 53-60 thousand buffers
 in such a session, 92% of them constant buffers without data; its immutable
@@ -666,10 +666,10 @@ alike, which canaries confirmed at every binding and death (1 of 2.2 million
 checks failed). The dword at +0x44 is not spare in a constant buffer's
 holder: GX counts in its upper half.
 
-`BBHOST_GXVK_BUFFERS=1` gives such a buffer - immutable, or default with
-initial data; no CPU access; a vertex or index bind and nothing the GPU
-writes - an entry in a host table when GX's CreateBuffer (on the decomp
-list) makes it, and the entry's handle in the holder's +0x14. The GX call
+Such a buffer - immutable, or default with initial data; no CPU access; a
+vertex or index bind and nothing the GPU writes - gets an entry in a host
+table when GX's CreateBuffer (on the decomp list) makes it, and the entry's
+handle in the holder's +0x14. The GX call
 copies the handle into the draw's record beside the holder; the command
 processor binds the entry's device-local copy - placed in a pool and filled
 from the buffer's memory in the uploads of the first recording that binds it
@@ -689,6 +689,15 @@ beside it - the vertex input, the bytes as today's path finds them, the
 buffer's bytes against their hash when copied, the device copy read back -
 and the exit report counts the bindings by handle, the fallbacks by reason
 and any disagreement.
+
+GX's buffers are bound by handle by default (`BBHOST_GXVK_BUFFERS=0` keeps
+today's path), except on an integrated GPU or with tight memory: there the
+draws read GX's buffers where they are - the buffer shadow in place, or no
+shadow - so a copy would hold memory and buy nothing, and today's path stays
+unless `BBHOST_GXVK_BUFFERS=1`. On an RTX 4070 at Old Yharnam, uncapped, the
+command processor takes 1.31 ms a flip less by handle and the frame rate goes
+from 81.9 to 92.0; at 60 it takes 0.26-1.15 ms a flip less at four places,
+with the GPU's time and the frame pacing unchanged.
 
 **The upload heap (the stage's second part, off by default while it is
 measured).** GX's device gives its block pool one region - GX's upload heap,

@@ -39,12 +39,23 @@
 
 namespace gxvk {
 
-// BBHOST_GXVK_BUFFERS: 0 (the default) today's path; 1 GX buffers bound by
-// their handles; 2 both, compared; "census" the census alone (as
-// BBHOST_GXVK_CENSUS=1, which can join the others). Read once.
+// BBHOST_GXVK_BUFFERS: unset, GX buffers bound by their handles (1), except on
+// an integrated GPU or with tight memory, where the draws read GX's buffers
+// where they are (the buffer shadow in place there, or no shadow) and a
+// buffer's copy would hold memory and buy nothing: today's path (0) there.
+// 0 today's path; 1 by handle on any GPU; 2 both, compared; "census" the
+// census alone (as BBHOST_GXVK_CENSUS=1, which can join the others). Read
+// once, as the GX hooks are installed: the device's kind is asked before the
+// device is made (host_gpu_integrated, host_gpu_memory_tight).
 enum class Buffers : int { kOff = 0, kOn = 1, kCompare = 2 };
 Buffers buffers_mode();
 bool census();
+// The mode for the switch's value (null or empty: unset) on a device whose
+// draws read GX's buffers in place (an integrated GPU, tight memory) or not.
+inline Buffers buffers_mode_for(const char* env, bool reads_in_place) {
+    if (!env || !*env) return reads_in_place ? Buffers::kOff : Buffers::kOn;
+    return env[0] == '1' ? Buffers::kOn : env[0] == '2' ? Buffers::kCompare : Buffers::kOff;
+}
 
 // A GX buffer holder's spare dwords: +0x14, the reference count's upper half
 // (every locked access GX makes to the count is to the dword at +0x10), and
@@ -102,7 +113,8 @@ void census_constant_bound(std::uint64_t va, std::uint64_t bytes, std::uint64_t 
 // The exit report (gx_resources_report calls it).
 void census_report();
 
-// --- GX buffers by handle (BBHOST_GXVK_BUFFERS=1; 2 compares) ---
+// --- GX buffers by handle (BBHOST_GXVK_BUFFERS: the default, except on an integrated GPU or with
+// tight memory; 2 compares) ---
 //
 // A GX buffer the host can keep - immutable, or default with initial data;
 // no CPU access; bound as vertex or index data, and as nothing the GPU

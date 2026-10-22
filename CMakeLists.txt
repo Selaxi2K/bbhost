@@ -567,6 +567,10 @@ if(UNIX)
   target_include_directories(gxvk_watch_test PRIVATE src)
   target_link_libraries(gxvk_watch_test PRIVATE Threads::Threads)
   add_test(NAME gxvk_watch_test COMMAND gxvk_watch_test)
+  # BBHOST_GXVK_BUFFERS's modes, unset and given, by the device's kind.
+  add_executable(gxvk_buffers_mode_test tests/gxvk_buffers_mode_test.cpp)
+  target_include_directories(gxvk_buffers_mode_test PRIVATE src)
+  add_test(NAME gxvk_buffers_mode_test COMMAND gxvk_buffers_mode_test)
   # The buffer shadow's page copies grow a run only where both ends meet.
   add_executable(copy_runs_test tests/copy_runs_test.cpp)
   target_include_directories(copy_runs_test PRIVATE src)

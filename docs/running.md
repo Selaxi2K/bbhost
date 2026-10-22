@@ -245,6 +245,11 @@ meshes in the game's own vertex and index buffers are read where they are,
 with no copy (`BBHOST_SHADOW_IN_PLACE=0` copies them as before; `=1` reads
 them in place on any GPU), and vertex data left in host memory is not copied
 for each draw either (`BBHOST_VERTEX_STAGE=1` copies it as on a discrete GPU).
+On other GPUs, unless memory is tight, the game's own immutable vertex and
+index buffers are bound from copies of their own, made in video memory as
+they are first drawn, so the command processor does not look each draw's
+bytes up (`BBHOST_GXVK_BUFFERS=0` goes back to the mirrors; `=1` makes the
+copies on an integrated GPU or with tight memory too).
 
 **AMD on Linux, no picture.** AMD's kernel driver only imports anonymous
 memory, so bbhost passes the game's memory to the GPU through `/dev/udmabuf`.

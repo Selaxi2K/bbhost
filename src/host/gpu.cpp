@@ -2804,6 +2804,7 @@ bool small_vram(const Candidate& c) {
     return start_vram_free(c) < (7680ull << 20);
 }
 std::atomic<int> g_small{-1};  // small_vram of the device run on, -1 until known (the first answer holds)
+std::atomic<int> g_integrated{-1};  // whether the device run on is an integrated GPU, -1 until known
 
 // OBS's game capture for Vulkan is an implicit layer (in graphics-hook64.dll)
 // that the loader puts into every Vulkan program while OBS is installed,
@@ -2963,6 +2964,9 @@ bool init_locked() {
             host_log("gpu: the device chosen has %s memory than the one the guest patches were sized for", g.tight ? "less" : "more");
         if (g.tight) host_log("gpu: %llu MiB in all heaps: tight memory (BBHOST_TIGHT_MEMORY=0 says otherwise) - no buffer shadow, fewer spares during loads, live resolution up to 1080p's pixels",
                               static_cast<unsigned long long>(c.heaps >> 20));
+        if (g_integrated.exchange(g.integrated ? 1 : 0) == (g.integrated ? 0 : 1))
+            host_log("gpu: the device chosen is %s, unlike the one GX's buffers were decided for (host/gxvk.h)",
+                     g.integrated ? "an integrated GPU" : "not an integrated GPU");
 #if !defined(_WIN32)
         g.can_dmabuf = c.memory_fd && c.dma_buf;
 #endif
@@ -7908,51 +7912,62 @@ bool host_gpu_init(const char* const* instance_exts, std::uint32_t n_exts, bool 
     return init_locked();
 }
 
+namespace {
+// What the host asks of the device before it makes it - tight memory, small
+// video memory, an integrated GPU - from an instance of its own, without
+// extensions, choosing the device as the real one will: one probe for all
+// three, and each one's first answer holds (the device's own, when it is
+// made first).
+void probe_before_device() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        bool tight = false, small = false, integrated = false;
+        if (g_enabled) {
+            obs_capture_policy();  // before the first instance, this one
+            VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+            app.pApplicationName = "bbhost";
+            app.apiVersion = VK_API_VERSION_1_3;
+            VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+            ici.pApplicationInfo = &app;
+            VkInstance instance = VK_NULL_HANDLE;
+            if (vkCreateInstance(&ici, nullptr, &instance) == VK_SUCCESS) {
+                std::vector<Candidate> usable;
+                const int chosen = choose_device(instance, false, usable);
+                if (chosen >= 0) {
+                    const Candidate& c = usable[static_cast<std::size_t>(chosen)];
+                    tight = memory_tight(c);
+                    small = small_vram(c);
+                    integrated = c.type_rank == 3;
+                }
+                vkDestroyInstance(instance, nullptr);
+            }
+        }
+        int unknown = -1;
+        g_tight.compare_exchange_strong(unknown, tight ? 1 : 0);
+        unknown = -1;
+        g_small.compare_exchange_strong(unknown, small ? 1 : 0);
+        unknown = -1;
+        g_integrated.compare_exchange_strong(unknown, integrated ? 1 : 0);
+    });
+}
+}  // namespace
+
 bool host_gpu_memory_tight() {
     if (const int t = g_tight.load(); t >= 0) return t == 1;
-    bool tight = false;
-    if (g_enabled) {
-        obs_capture_policy();  // before the first instance, this one
-        // Before the device: an instance of its own, without extensions.
-        VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
-        app.pApplicationName = "bbhost";
-        app.apiVersion = VK_API_VERSION_1_3;
-        VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
-        ici.pApplicationInfo = &app;
-        VkInstance instance = VK_NULL_HANDLE;
-        if (vkCreateInstance(&ici, nullptr, &instance) == VK_SUCCESS) {
-            std::vector<Candidate> usable;
-            const int chosen = choose_device(instance, false, usable);
-            if (chosen >= 0) tight = memory_tight(usable[static_cast<std::size_t>(chosen)]);
-            vkDestroyInstance(instance, nullptr);
-        }
-    }
-    int unknown = -1;
-    g_tight.compare_exchange_strong(unknown, tight ? 1 : 0);
+    probe_before_device();
     return g_tight.load() == 1;
 }
 
 bool host_gpu_small_vram() {
     if (const int s = g_small.load(); s >= 0) return s == 1;
-    bool small = false;
-    if (g_enabled) {
-        obs_capture_policy();  // before the first instance
-        VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
-        app.pApplicationName = "bbhost";
-        app.apiVersion = VK_API_VERSION_1_3;
-        VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
-        ici.pApplicationInfo = &app;
-        VkInstance instance = VK_NULL_HANDLE;
-        if (vkCreateInstance(&ici, nullptr, &instance) == VK_SUCCESS) {
-            std::vector<Candidate> usable;
-            const int chosen = choose_device(instance, false, usable);
-            if (chosen >= 0) small = small_vram(usable[static_cast<std::size_t>(chosen)]);
-            vkDestroyInstance(instance, nullptr);
-        }
-    }
-    int unknown = -1;
-    g_small.compare_exchange_strong(unknown, small ? 1 : 0);
+    probe_before_device();
     return g_small.load() == 1;
+}
+
+bool host_gpu_integrated() {
+    if (const int i = g_integrated.load(); i >= 0) return i == 1;
+    probe_before_device();
+    return g_integrated.load() == 1;
 }
 
 bool host_gpu_available() {

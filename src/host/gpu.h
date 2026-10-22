@@ -319,6 +319,9 @@ bool host_gpu_memory_tight();
 // small-video-memory settings apply. Before the device exists, as
 // host_gpu_memory_tight.
 bool host_gpu_small_vram();
+// Whether the GPU run on is an integrated one (its video memory is the
+// system's RAM). Before the device exists, as host_gpu_memory_tight.
+bool host_gpu_integrated();
 // Queues one compute dispatch. Returns false when the shader could not be
 // translated or queued (the caller logs and continues). Queued work runs at
 // the next host_gpu_flush().
