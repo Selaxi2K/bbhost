@@ -671,6 +671,10 @@ if(UNIX)
   target_link_libraries(host_lists_test PRIVATE pthread)
   add_test(NAME host_lists_test COMMAND host_lists_test)
   set_tests_properties(host_lists_test PROPERTIES ENVIRONMENT "BBHOST_HOST_LISTS=2")
+  # The decomp's install report in parts a log line holds (tests/decomp_lines_test.cpp).
+  add_executable(decomp_lines_test tests/decomp_lines_test.cpp)
+  target_include_directories(decomp_lines_test PRIVATE src)
+  add_test(NAME decomp_lines_test COMMAND decomp_lines_test)
   # The blend state of a colour target a draw writes no channel of (tests/masked_blend_test.cpp).
   add_executable(masked_blend_test tests/masked_blend_test.cpp)
   target_include_directories(masked_blend_test PRIVATE src)

@@ -496,6 +496,11 @@ Switches for a run:
 | `BBHOST_DECOMP_OFF=name,...` | these functions stay the game's |
 | `BBHOST_DECOMP_COMPARE=1` | functions with a compare mode run it instead |
 
+The log says at start how many are ours ("decomp: 203 of 204 functions ours,
+1 the game's"), then names them in parts a log line holds: "decomp: the
+game's (1/1): ..." for those switched off or not placed, then "decomp: ours
+(1/3): ...".
+
 ## How one is checked
 
 **Without the game.** `tests/decomp/eboot_kit.h` loads the executable into a
