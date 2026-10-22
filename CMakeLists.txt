@@ -379,6 +379,7 @@ set(BBHOST_DECOMP_SOURCES
   src/decomp/gx/present.cpp
   src/decomp/gx/resources.cpp
   src/decomp/gx/water_gate.cpp
+  src/decomp/gx/upload_heap.cpp
   src/decomp/gnmx/cue.cpp
   src/decomp/yebis/gnm.cpp
   src/decomp/yebis/context.cpp

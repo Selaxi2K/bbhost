@@ -38,6 +38,7 @@
 #include "core/write_watch.h"
 #include "decomp/decomp.h"
 #include "decomp/gx/resources.h"
+#include "decomp/gx/upload_heap.h"
 #include "engine/addr.h"
 #include "engine/graphics_patch.h"
 #include "guest_abi.h"
@@ -904,10 +905,18 @@ GUEST_ABI std::int64_t pool_hook(std::uint64_t, const std::uint64_t* saved) {
     return 0;
 }
 
-// The block pool's initialisation (BBHOST_GXVK_CENSUS): rdi = the pool, rdx =
-// its region, rcx = the region's bytes.
+// The block pool's initialisation (BBHOST_GXVK_CENSUS), the game's: rdi = the
+// pool, rdx = its region, rcx = the region's bytes.
 GUEST_ABI std::int64_t pool_init_hook(std::uint64_t, const std::uint64_t* saved) {
     gxvk::census_heap(saved[5], saved[3], saved[2]);
+    return 0;
+}
+
+// The same, ours (decomp/gx/upload_heap.cpp): it tells us of the pool and its
+// region, and keeps the game's region (0).
+GUEST_ABI std::uint64_t upload_region_entry(std::uint64_t pool, std::uint64_t region, std::uint64_t bytes, std::uint64_t bytes_out) {
+    (void)bytes_out;
+    gxvk::census_heap(pool, region, bytes);
     return 0;
 }
 
@@ -1579,7 +1588,6 @@ void gx_resources_install(ElfImage* image) {
     if (g_census || gxvk::census()) hook(kPoolBlock, kPoolBlockPrologue, sizeof(kPoolBlockPrologue), reinterpret_cast<void*>(&pool_hook), 0);
     if (gxvk::census()) {
         hook(kPoolAligned, kPoolAlignedPrologue, sizeof(kPoolAlignedPrologue), reinterpret_cast<void*>(&pool_hook), 0);
-        hook(kPoolInit, kPoolInitPrologue, sizeof(kPoolInitPrologue), reinterpret_cast<void*>(&pool_init_hook), 0);
         hook(kCreateUav, kPrologue58, sizeof(kPrologue58), reinterpret_cast<void*>(&view_create_hook), 5);
     }
     hook(kCreateInputLayout, kInputLayoutPrologue, sizeof(kInputLayoutPrologue), reinterpret_cast<void*>(&object_create_hook), 0);
@@ -1597,6 +1605,17 @@ void gx_resources_install(ElfImage* image) {
 // other creators are.
 void gx_resources_install_late(ElfImage* image) {
     if (!g_gx_res_after_thunk) return;
+    // The upload heap's pool, for the census: ours of its init tells the host
+    // of it (the entry above); the game's is hooked at its prologue.
+    if (gxvk::census()) {
+        if (decomp_placed("gx_upload_pool_init") == 1) {
+            decomp_gx::g_upload_region_entry = hle_wrap_fn(reinterpret_cast<void*>(&upload_region_entry));
+        } else {
+            const std::uint64_t at = image->mem.slide + (kPoolInit - kPreferredGuestSlide);
+            if (!engine_prologue_hook(image, at, kPoolInitPrologue, sizeof(kPoolInitPrologue), reinterpret_cast<void*>(&pool_init_hook), 0))
+                host_log("gx-resources: 0x%llx is not the prologue expected; not hooked", static_cast<unsigned long long>(kPoolInit));
+        }
+    }
     const int placed = decomp_placed("gx_create_buffer");
     if (placed) {
         decomp_gx::g_buffer_made_host = reinterpret_cast<void*>(&buffer_made_entry);
