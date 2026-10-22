@@ -37,6 +37,7 @@ std::uint64_t landed() { return 0; }
 namespace gxvk {
 bool census() { return false; }
 }  // namespace gxvk
+std::uint64_t hle_kernel_map_host(std::uint64_t) { return 0; }  // the move (BBHOST_GXVK_ARENA=2) is not tested here
 
 namespace {
 

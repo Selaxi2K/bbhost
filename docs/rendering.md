@@ -708,6 +708,12 @@ when it is bound and again when its submission has completed. A violation
 sends every binding of the heap back to today's path for the rest of the run,
 and the exit report says so. `BBHOST_GXVK_ARENA=compare` keeps today's path
 and checks every binding of the heap as in place would bind it.
+`BBHOST_GXVK_ARENA=2` also moves the heap into video memory the CPU writes,
+where the driver can place a mapping at an address of ours
+(`VK_EXT_map_memory_placed`) and the memory budget has room: GX's device is
+made before bbhost's, so its pool is given a host mapping of bbhost's, whose
+bytes are copied at the GPU's start - writes to it wait meanwhile - and the
+video memory is mapped over it.
 
 ## Tools
 

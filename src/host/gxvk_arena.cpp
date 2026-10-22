@@ -24,6 +24,7 @@
 // every one). Off (0, the default) nothing here runs.
 #include "host/gxvk.h"
 
+#include "hle/modules.h"
 #include "host/gpu.h"
 #include "host/label_landing.h"
 #include "log.h"
@@ -58,7 +59,7 @@ const Arena g_mode = [] {
     const char* e = std::getenv("BBHOST_GXVK_ARENA");
     if (!e || !*e) return Arena::kOff;
     if (std::strcmp(e, "compare") == 0) return Arena::kCompare;
-    return e[0] == '1' ? Arena::kInPlace : Arena::kOff;
+    return e[0] == '1' ? Arena::kInPlace : e[0] == '2' ? Arena::kMoved : Arena::kOff;
 }();
 #endif
 
@@ -95,6 +96,11 @@ std::size_t g_sample_head = 0, g_sample_n = 0;
 std::uint32_t g_sample_tick = 0;
 
 std::atomic<bool> g_in_place{true};  // false after a violation
+// BBHOST_GXVK_ARENA=2: the host mapping the pool was given, to move at the
+// GPU's start; and while it moves, its range (the fault handler's).
+std::atomic<std::uint64_t> g_move_va{0}, g_move_bytes{0};
+std::atomic<std::uint64_t> g_moving_lo{0}, g_moving_hi{0};
+std::atomic<int> g_moved{-1};  // -1 not tried, 0 failed, 1 moved
 std::atomic<int> g_said{0};
 
 std::atomic<std::uint64_t> g_handouts{0}, g_outside{0}, g_bound[kUses] = {}, g_bound_bytes[kUses] = {};
@@ -177,8 +183,24 @@ void check_samples_locked(std::uint64_t done) {
 Arena arena_mode() { return g_mode; }
 
 std::uint64_t arena_region(std::uint64_t pool, std::uint64_t region, std::uint64_t bytes, std::uint64_t* out_bytes) {
-    (void)out_bytes;
     if (g_mode == Arena::kOff && !census()) return 0;  // the census counts today's path over the heap
+#if !defined(_WIN32)
+    // BBHOST_GXVK_ARENA=2: the pool gets a host mapping of our own, low enough
+    // for a V# (40 bits) and GPU-visible as the kernel's own host mappings
+    // are; at the GPU's start its bytes move into video memory placed over it
+    // (gpu.cpp). The game's region stays allocated, unused.
+    if (g_mode == Arena::kMoved && !g_move_va.load(std::memory_order_relaxed)) {
+        const std::uint64_t len = (bytes + 0xffff) & ~std::uint64_t{0xffff};
+        if (const std::uint64_t va = hle_kernel_map_host(len)) {
+            g_move_bytes.store(len, std::memory_order_relaxed);
+            g_move_va.store(va, std::memory_order_release);
+            host_log("gxvk arena: GX's upload heap goes to 0x%llx (%llu MiB) to move at the GPU's start, not the game's region 0x%llx",
+                     static_cast<ull>(va), static_cast<ull>(len >> 20), static_cast<ull>(region));
+            region = va;
+            *out_bytes = bytes;
+        }
+    }
+#endif
     // The pool's bounds as its init sets them: 16-byte aligned.
     const std::uint64_t pad = (0u - static_cast<std::uint32_t>(region)) & 0xfu;
     const std::uint64_t lo = region + pad, hi = lo + ((bytes - pad) & ~std::uint64_t{0xf});
@@ -195,10 +217,11 @@ std::uint64_t arena_region(std::uint64_t pool, std::uint64_t region, std::uint64
         g_hi.store(hi, std::memory_order_relaxed);
         g_lo.store(lo, std::memory_order_release);
     }
+    if (g_move_va.load(std::memory_order_relaxed) == region) return region;  // BBHOST_GXVK_ARENA=2: ours
     if (g_mode != Arena::kOff)
         host_log("gxvk arena: GX's upload heap is 0x%llx, %llu MiB: its bindings %s, under the release proof (BBHOST_GXVK_ARENA=0: today's path)",
                  static_cast<ull>(lo), static_cast<ull>((hi - lo) >> 20),
-                 g_mode == Arena::kInPlace ? "in place" : "checked as they would be bound in place, and bound as today");
+                 g_mode == Arena::kCompare ? "checked as they would be bound in place, and bound as today" : "in place");
     return 0;  // the game's region stays: stage 1c binds it where it is
 }
 
@@ -308,7 +331,37 @@ bool arena_bind(std::uint64_t va, std::uint64_t bytes, std::uint64_t serial, Use
     }
     g_bound[use].fetch_add(1, std::memory_order_relaxed);
     g_bound_bytes[use].fetch_add(bytes, std::memory_order_relaxed);
-    return g_mode == Arena::kInPlace;
+    return g_mode == Arena::kInPlace || g_mode == Arena::kMoved;
+}
+
+bool arena_move_pending(std::uint64_t* va, std::uint64_t* bytes) {
+    if (g_moved.load(std::memory_order_relaxed) >= 0) return false;
+    const std::uint64_t v = g_move_va.load(std::memory_order_acquire);
+    if (!v) return false;
+    *va = v;
+    *bytes = g_move_bytes.load(std::memory_order_relaxed);
+    return true;
+}
+
+void arena_moving(bool on) {
+    if (on) {
+        g_moving_hi.store(g_move_va.load() + g_move_bytes.load(), std::memory_order_relaxed);
+        g_moving_lo.store(g_move_va.load(), std::memory_order_release);
+    } else {
+        g_moving_lo.store(0, std::memory_order_release);
+    }
+}
+
+void arena_moved(bool ok, const char* what) {
+    g_moved.store(ok ? 1 : 0, std::memory_order_relaxed);
+    host_log("gxvk arena: GX's upload heap %s %s", ok ? "moved into" : "stays in host memory:", what);
+}
+
+__attribute__((no_stack_protector)) bool arena_move_fault(std::uint64_t addr) {
+    const std::uint64_t lo = g_moving_lo.load(std::memory_order_acquire);
+    if (!lo || addr < lo || addr >= g_moving_hi.load(std::memory_order_relaxed)) return false;
+    while (g_moving_lo.load(std::memory_order_acquire)) __builtin_ia32_pause();
+    return true;
 }
 
 void arena_no_backing() { g_fell[kWhyNoBacking].fetch_add(1, std::memory_order_relaxed); }
