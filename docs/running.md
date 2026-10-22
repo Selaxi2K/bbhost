@@ -182,6 +182,16 @@ that log. Overlays that hook Vulkan are a common cause: OBS's game capture is
 kept out automatically on AMD cards (`[video] obs_capture` changes that), and
 OBS's Window Capture records bbhost without any hook.
 
+**A crash just after arriving somewhere, with `fmod ring:` in the log.** FMOD,
+the game's sound library, lists every sound it has loaded, and it frees the one
+subsound object a stream of many sounds (a voice bank) shares even when that
+object refused to be released because an event still plays it - leaving it in
+the list. The next sound loaded beside it then writes into memory the game has
+used again since. bbhost takes such a sound out of the list first and keeps
+it; the log's `fmod ring:` lines say when it did. `BBHOST_FMOD_GUARD=0` is the
+game's own behaviour; `BBHOST_FMOD_CHECK=1` also logs FMOD's sounds as they
+come and go and checks the list as sounds are loaded.
+
 **Wrong picture.** Wrong colours, a green or black screen, missing parts:
 press F12 in the game while it shows. bbhost writes that frame, every render
 target the last draws wrote and the draw list into a folder of its own beside
