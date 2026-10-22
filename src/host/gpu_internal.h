@@ -927,9 +927,12 @@ Located locate(std::uint64_t va, std::uint64_t bytes = 1);
 // With past_end (and window imports) the range may run on into the next
 // chunk's span by up to kChunkOverlap, as one import of this chunk's.
 const Chunk* dmem_import(std::uint32_t chunk, std::uint64_t in, std::uint64_t bytes, bool past_end = false);
-// Whether direct memory is imported whole (the default) rather than by window
-// on demand (BBHOST_IMPORT_WINDOWS=1, or gpu.import_windows in the config).
-// Decided once - at the GPU's start, or at an earlier first ask - and read
+// Whether direct memory is imported whole (the default on a discrete GPU, and
+// under Linux) rather than by window on demand (BBHOST_IMPORT_WINDOWS=1,
+// gpu.import_windows in the config, or the default of an integrated GPU under
+// Windows; host/import_mode.h). Decided once - at the GPU's
+// start, or at an earlier first ask when the environment or config says, else
+// once the device is chosen - and read
 // inline after that: the command processor asks dozens of times a draw (a
 // call to a function-local static was 1.2-1.5% of bb-cp0 at 60 fps).
 extern std::atomic<signed char> g_imports_whole;  // -1 until decided, then 1 or 0

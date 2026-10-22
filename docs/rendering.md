@@ -199,10 +199,14 @@ over several windows replaces the ones it covers, so no page is imported
 twice, and a dispatch imports what its shader reads and stores (an import a
 draw waits for is counted in the log's `frames:` and `stall:` lines, `imports
 waited for N in M ms`, and the exit report gives the driver's time by the
-thread that waited). It is off by default (`gpu.import_windows` in the config
-turns it on too): the work under way moves each of those uses off guest
-memory, and windows are then only the
-fallback for what is not moved yet. The Steam Deck kit turns it on: there the
+thread that waited). It is on by default on an integrated GPU under Windows,
+where whole spans kept about 1.5 GB more of the game's memory resident for the
+GPU. It is off on a graphics card of its own, and under Linux, where window
+imports have not been measured on an integrated GPU yet (AMD's imports go
+through udmabuf there). `gpu.import_windows`, true or false, decides it either
+way. The work under way moves each of those uses off guest memory, and
+windows are then only the fallback for what is not moved yet. The Steam Deck
+kit turns it on: there the
 memory shared with the GPU stays under the driver's budget and the start is
 about 3 s sooner, at the same frame rate (its device-local twins, below, stay
 off: on an APU they are the same memory plus copies). One such move,

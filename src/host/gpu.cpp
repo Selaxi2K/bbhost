@@ -11,6 +11,7 @@
 #include "host/arena_memory.h"
 #include "host/arena_move.h"
 #include "host/arena_move_vk.h"
+#include "host/import_mode.h"
 #include "host/import_prefetch.h"
 #include "host/label_landing.h"
 #include "host/ring_budget.h"
@@ -187,7 +188,15 @@ VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(VkDebugUtilsMessageSeverityFlagBit
 // Window imports: direct memory imported a window at a time, on demand -
 // BBHOST_IMPORT_WINDOWS=1, or gpu.import_windows = true in the config (the
 // Steam Deck kit's default: the host heap under its budget, the start ~3 s
-// sooner, the same frames and frame rate). Off by default elsewhere: a tenth
+// sooner, the same frames and frame rate), and by default on an integrated
+// GPU under Windows, where the whole spans kept ~1.5 GB more of the game's
+// memory resident for the GPU, all of it counted as the process's GPU memory
+// (a Radeon 680M at a lamp, with the told meshes read in place from their
+// windows: Task Manager's shared GPU memory 8.0 -> 6.2 GB, the working set
+// 12.7 -> 11.1 GB, the frame rate and the frames the same;
+// imports_whole_decide). Not yet under Linux, where an integrated GPU imports
+// through udmabuf dma-bufs with tight memory, unmeasured with windows there.
+// Off by default on a discrete GPU: a tenth
 // of the draws keep page-table walks through V#s and pointers the host does
 // not resolve (the exit report's "walk" lines), and what they reach must
 // already be imported or they read the sink. Off, each chunk's GPU-visible
@@ -1139,10 +1148,23 @@ void import_windows(std::uint64_t va, std::uint64_t bytes) {
 }
 
 std::atomic<signed char> g_imports_whole{-1};
+std::atomic<signed char> g_integrated_known{-1};  // the chosen device is integrated (1) or not (0); -1 before
+// BBHOST_IMPORT_WINDOWS (1 windows, 0 whole spans), else gpu.import_windows
+// (true, false), else by the device and the platform: windows on an
+// integrated GPU under Windows, whole spans elsewhere (host/import_mode.h).
+// Asked before the device is chosen with neither set, it answers whole spans
+// without deciding (nothing is imported before).
 bool imports_whole_decide() {
-    bool whole;
-    if (const char* e = std::getenv("BBHOST_IMPORT_WINDOWS"); e && *e) whole = e[0] != '1';
-    else whole = config_value("gpu.import_windows") != "true";
+#if defined(_WIN32)
+    constexpr bool kWindowsHost = true;
+#else
+    constexpr bool kWindowsHost = false;
+#endif
+    const std::string cfg = config_value("gpu.import_windows");
+    const import_mode::Mode m = import_mode::decide(std::getenv("BBHOST_IMPORT_WINDOWS"), cfg.c_str(),
+                                                    g_integrated_known.load(std::memory_order_relaxed), kWindowsHost);
+    if (m == import_mode::Mode::kUndecided) return true;
+    const bool whole = m == import_mode::Mode::kWhole;
     g_imports_whole.store(whole ? 1 : 0, std::memory_order_relaxed);
     return whole;
 }
@@ -2976,6 +2998,8 @@ bool init_locked() {
         g.has_push_descriptor = c.push;
         g.has_device_fault = c.fault;
         g.integrated = c.type_rank == 3;
+        g_integrated_known.store(g.integrated ? 1 : 0, std::memory_order_relaxed);
+        if (g_imports_whole.load(std::memory_order_relaxed) < 0) imports_whole_decide();  // by the device, unless set
         twins_decide(c.type_rank == 4);
         g.tight = memory_tight(c);
         {
@@ -11358,7 +11382,8 @@ void host_gpu_report() {
         host_log("gpu: guest memory imports (%s): %llu made, %llu MiB in %llu ms of the driver's time - bindings %llu (%llu MiB), device "
                  "addresses %llu (%llu MiB), walks %llu (%llu MiB), prefetch %llu (%llu MiB), whole spans %llu (%llu MiB); %llu replaced "
                  "others, %llu retired (%llu MiB); live %llu MiB in %zu imports, flexible %llu MiB",
-                 imports_whole() ? "whole spans" : "by window: BBHOST_IMPORT_WINDOWS=1 or gpu.import_windows", static_cast<ull>(g_imports_made.load()),
+                 imports_whole() ? "whole spans" : "by window: BBHOST_IMPORT_WINDOWS=1, gpu.import_windows or an integrated GPU under Windows",
+                 static_cast<ull>(g_imports_made.load()),
                  mib(g_import_bytes), static_cast<ull>(g_import_us.load() / 1000), static_cast<ull>(g_import_who_n[kIwBinding].load()),
                  mib(g_import_who_bytes[kIwBinding]), static_cast<ull>(g_import_who_n[kIwAddress].load()), mib(g_import_who_bytes[kIwAddress]),
                  static_cast<ull>(g_import_who_n[kIwWalk].load()), mib(g_import_who_bytes[kIwWalk]),

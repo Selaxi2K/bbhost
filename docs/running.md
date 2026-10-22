@@ -246,12 +246,13 @@ meshes in the game's own vertex and index buffers are read where they are,
 with no copy (`BBHOST_SHADOW_IN_PLACE=0` copies them as before; `=1` reads
 them in place on any GPU), and vertex data left in host memory is not copied
 for each draw either (`BBHOST_VERTEX_STAGE=1` copies it as on a discrete GPU).
-With window imports (`BBHOST_IMPORT_WINDOWS=1`, or `import_windows = true`
-under `[gpu]`; see [rendering.md](rendering.md)) the meshes are read in place
-too, from their windows, which a thread of their own imports as the game makes
-its buffers (`BBHOST_SHADOW_IN_PLACE_WINDOWS=0` copies them into the mirrors
-instead, as window imports did before; `BBHOST_IMPORT_PREFETCH_MESHES=0`
-imports their windows at their first draw).
+With window imports (the default on an integrated GPU under Windows;
+`BBHOST_IMPORT_WINDOWS` or `import_windows` under `[gpu]` decide it; see
+[rendering.md](rendering.md)) the meshes are read in place too, from their
+windows, which a thread of their own imports as the game makes its buffers
+(`BBHOST_SHADOW_IN_PLACE_WINDOWS=0` copies them into the mirrors instead, as
+window imports did before; `BBHOST_IMPORT_PREFETCH_MESHES=0` imports their
+windows at their first draw).
 On other GPUs, unless memory is tight or video memory small, the game's own
 immutable vertex and index buffers are bound from copies of their own, made
 in video memory as they are first drawn, so the command processor does not
@@ -278,8 +279,9 @@ showed 2.9 GB and bbhost 7.8 GB. To compare the two, read the dedicated
 column on a card of its own, or turn on the Memory counter (F10), which shows
 bbhost's own count under the FPS counter: the video memory in use, how much of
 it is cache that bbhost gives back when memory runs short, and the shared
-memory. With window imports (`import_windows = true` under `[gpu]`) only the
-memory the GPU uses is imported: on that laptop the shared column fell by
+memory. With window imports (`import_windows = true` under `[gpu]`, the
+default on an integrated GPU under Windows) only the memory the GPU uses is
+imported: on that laptop the shared column fell by
 about 2.7 GB on the RTX and 2.1 GB on the 680M, at the cost of waits when a
 place is first drawn (the log's `imports waited for`).
 
