@@ -281,11 +281,23 @@ void test_refused_shared() {
     wr(sub + kShared, 0);
     CHECK(!refused_shared(sub));  // a stream's only subsound has no shared block: its own release frees it
     wr(sub + kShared, sub);
-    // What the guard does at the stream's free of it: out of the ring, kept as a sound of its own.
+    // The bytes it holds: FMOD's {size, flags} header 8 bytes before the object
+    // (here in the stream's block, which ends there) and before its name block.
+    wr32(sub - 8, 0x260);
+    const std::uint64_t name = alloc(0x110) + 8;
+    wr32(name - 8, 0x108);
+    wr(sub + 0x30, name);
+    CHECK(owned_bytes(sub, kReadable) == 0x260 + 0x108);
+    wr(sub + 0xd0, 0x10);  // an owned pointer outside readable memory counts nothing
+    CHECK(owned_bytes(sub, kReadable) == 0x260 + 0x108);
+    wr(sub + 0xd0, 0);
+    // What the guard does at the stream's free of it: out of the ring, kept as a sound of its own
+    // that nothing plays again.
     CHECK(unlink(sub, kReadable));
     orphan(sub);
     CHECK(rd(sub + kParent) == 0 && rd(sub + kShared) == 0 && rd(sub + kStreamSample) == 0 && !linked(sub, kReadable));
-    CHECK(rd32(sub + kFlags) == 0x200 && is_sound(kVt, sub));  // still a sound: its user's release finds one
+    CHECK(rd32(sub + kOpenState) == kOpenStateError);  // playSound, getLength, getSubSound refuse it; an event waits
+    CHECK(rd32(sub + kFlags) == 0x200 && is_sound(kVt, sub));  // still a sound: the event's release finds one
     bool ok = false;
     const auto m = members(g, &ok);
     CHECK(ok && m.size() == 1 && m[0] == stream);

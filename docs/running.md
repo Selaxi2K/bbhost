@@ -188,9 +188,11 @@ subsound object a stream of many sounds (a voice bank) shares even when that
 object refused to be released because an event still plays it - leaving it in
 the list. The next sound loaded beside it then writes into memory the game has
 used again since. bbhost takes such a sound out of the list first and keeps
-it; the log's `fmod ring:` lines say when it did. `BBHOST_FMOD_GUARD=0` is the
-game's own behaviour; `BBHOST_FMOD_CHECK=1` also logs FMOD's sounds as they
-come and go and checks the list as sounds are loaded.
+it, marked so that nothing plays it again; the log's `fmod ring:` lines say
+when it did, and the one at exit how many it kept (a few hundred bytes each
+that are never freed). `BBHOST_FMOD_GUARD=0` is the game's own behaviour;
+`BBHOST_FMOD_CHECK=1` also logs FMOD's sounds as they come and go and checks
+the list as sounds are loaded.
 
 **Wrong picture.** Wrong colours, a green or black screen, missing parts:
 press F12 in the game while it shows. bbhost writes that frame, every render

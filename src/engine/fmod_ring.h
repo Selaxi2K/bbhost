@@ -30,9 +30,11 @@
 // (0x11ab3a0) first takes a sound out of its group, under the same critical
 // section, when the block it is about to free is a sound that is still
 // linked, and logs who freed it. At that one free of a refusing shared
-// subsound it also keeps the object, as a sound of its own (no parent, no
-// shared block), so that whoever still holds it - the event, the other
-// release - does not use freed memory; its user's release frees it later.
+// subsound it also keeps the object, as a sound of its own that nothing can
+// play again (orphan() below), so that whoever still holds it - the event,
+// the other release - does not use freed memory. An event's programmer
+// sound kept so is never freed: a leak of a few hundred bytes each time,
+// which the exit report counts.
 //
 // BBHOST_FMOD_CHECK=1 adds the detector: a history of the sounds' births,
 // links, releases, subsound moves and frees (thread, callers); a walk of the
@@ -48,6 +50,8 @@ struct ElfImage;
 
 void fmod_ring_install(ElfImage* image);
 void fmod_ring_crash_report();
+// The exit report's line: sounds taken out of the ring, those kept, leaked.
+void fmod_ring_report();
 
 namespace fmod_ring {
 
@@ -65,6 +69,10 @@ constexpr std::uint64_t kSubIndex = 0xc8;
 constexpr std::uint64_t kSystem = 0x188;     // SystemI*
 constexpr std::uint64_t kOpenState = 0x1c0;  // FMOD_OPENSTATE
 constexpr std::uint64_t kStreamSample = 0x238;  // a stream's sample buffer, which its subsound object shares
+constexpr std::uint32_t kOpenStateError = 2;    // FMOD_OPENSTATE_ERROR
+// The blocks SoundI::release frees besides the object: the name, a subsound
+// table, two sync-point buffers and the sync-point list.
+constexpr std::uint64_t kOwnedBlocks[] = {0x30, 0xd0, 0x198, 0x1a0, 0x1b0};
 // SoundGroupI and SystemI.
 constexpr std::uint64_t kHead = 0x30;
 constexpr std::uint64_t kMaster = 0x9668;
@@ -135,14 +143,45 @@ inline bool refused_shared(std::uint64_t obj) {
 }
 
 // What the guard makes of such a subsound instead of letting its stream free
-// it: a sound of its own (no parent, no shared block), which its user's own
-// release later frees like any other sound. Its codec, async data and stream
-// channel were the stream's, and the stream's release has cleared them; the
-// stream's sample buffer it also points at was released by the stream too.
+// it: a sound of its own (no parent, no shared block). Its codec, async data
+// and stream channel were the stream's, and the stream's release has cleared
+// them; the stream's sample buffer it also points at was released by the
+// stream too, so that is cleared here.
+//
+// Its open state becomes FMOD_OPENSTATE_ERROR, so that nothing plays it
+// again: an event that starts its programmer sound once more gets this
+// object back from the game (its sound object still holds the line), and
+// with the state left READY the event's start (0x11dd4f4) and the system's
+// channel allocation for a stream (0x1109fbc) would read through its cleared
+// codec. getOpenState reports the error with every pointer it follows
+// checked, and the event then waits on it until it is stopped; the system's
+// playSound (0x1115d93), getLength and getSubSound refuse it as not ready.
+//
+// Its fate: an event's programmer sound (0x200) is never freed. The event
+// system lets it go in EventSound::releaseSound (0x11f7c50: the channel
+// stopped by handle, 0x200 cleared at 0x11f7c8b, SOUNDDEF_RELEASE to the
+// game), and the game's callback (0x2c2c660) does nothing for
+// SOUNDDEF_RELEASE - the stream owned it. So it leaks: the object and the
+// blocks it owns, a few hundred bytes, each time the path is taken (counted
+// in the exit report). One whose release was under way on another thread
+// (0x20) is freed by that release, which now finds no shared block.
 inline void orphan(std::uint64_t obj) {
     wr(obj + kParent, 0);
     wr(obj + kShared, 0);
     wr(obj + kStreamSample, 0);
+    wr32(obj + kOpenState, kOpenStateError);
+}
+
+// The bytes FMOD's allocator recorded for a sound and the blocks it owns (its
+// {size, flags} header sits 8 bytes before each block).
+template <typename Readable>
+std::uint64_t owned_bytes(std::uint64_t obj, Readable readable) {
+    std::uint64_t n = readable(obj - 8, 4) ? rd32(obj - 8) : 0;
+    for (const std::uint64_t off : kOwnedBlocks) {
+        const std::uint64_t b = rd(obj + off);
+        if (b && readable(b - 8, 4)) n += rd32(b - 8);
+    }
+    return n;
 }
 
 // The first node of the ring at `head` (a group's +0x30) that is not a live

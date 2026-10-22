@@ -345,6 +345,7 @@ void exit_reports() {
     key_prompts_report();
     decomp_report();
     mouse_camera_report();
+    fmod_ring_report();
 }
 
 #if !defined(_WIN32)

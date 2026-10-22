@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace {
@@ -64,6 +65,11 @@ std::uint64_t g_slide = 0;
 Vtables g_vt{};
 bool g_guard = false, g_check = false;
 std::atomic<std::uint64_t> g_guarded{0};
+// The refusing shared subsounds kept (orphan()), with the bytes each holds; one
+// freed later (a release was under way on another thread) leaves the map.
+std::mutex g_kept_mu;
+std::unordered_map<std::uint64_t, std::uint64_t> g_kept;  // under g_kept_mu
+std::atomic<std::uint64_t> g_kept_count{0}, g_kept_freed{0}, g_kept_live{0};
 
 std::uint64_t va(std::uint64_t bn) { return g_slide + (bn - kPreferredGuestSlide); }
 std::uint64_t bn(std::uint64_t a) { return a - g_slide + kPreferredGuestSlide; }
@@ -238,6 +244,18 @@ void check_ring(bool lock, const char* when) {
 GUEST_ABI std::int64_t free_hook(std::uint64_t, const std::uint64_t* saved) {
     const std::uint64_t p = saved[4];  // rsi
     if (p < 0x10000 || !is_sound(g_vt, p)) return 0;
+    if (g_kept_live.load(std::memory_order_relaxed)) {
+        // A kept sound freed after all: the release that was under way.
+        std::lock_guard<std::mutex> lk(g_kept_mu);
+        if (g_kept.erase(p)) {
+            g_kept_live.fetch_sub(1, std::memory_order_relaxed);
+            const std::uint64_t f = g_kept_freed.fetch_add(1) + 1;
+            if (f <= 16) {
+                host_log("fmod ring: kept sound %llx freed by its own release (%llu so far)",
+                         static_cast<unsigned long long>(p), static_cast<unsigned long long>(f));
+            }
+        }
+    }
     const bool linked_now = linked(p, readable);
     if (g_check) note('F', p, linked_now ? 1 : 0, rd32(p + kFlags), saved);
     if (!linked_now || !g_guard) {
@@ -259,12 +277,19 @@ GUEST_ABI std::int64_t free_hook(std::uint64_t, const std::uint64_t* saved) {
     }
     if (!done) return 0;
     const std::uint64_t n = g_guarded.fetch_add(1) + 1;
+    if (keep) {
+        const std::uint64_t bytes = owned_bytes(p, readable);
+        std::lock_guard<std::mutex> lk(g_kept_mu);
+        if (g_kept.emplace(p, bytes).second) g_kept_live.fetch_add(1, std::memory_order_relaxed);
+        g_kept_count.fetch_add(1, std::memory_order_relaxed);
+    }
     if (g_check) note(keep ? 'K' : 'X', p, n, 0, saved);
     if (n <= 64 || (n & (n - 1)) == 0) {
         std::uint64_t r[4];
         callers(saved, r, 4);
         describe(keep ? "a stream's shared subsound that refused its release, about to be freed still in its sound group; "
-                        "taken out of the ring and kept as a sound of its own"
+                        "taken out of the ring and kept as a sound of its own that nothing plays again (a programmer "
+                        "sound kept so is never freed)"
                       : "freed while still in its sound group; taken out of the ring first",
                  p);
         host_log("fmod ring:   freed from %llx, callers %llx %llx %llx (%llu so far)",
@@ -385,9 +410,27 @@ void fmod_ring_install(ElfImage* image) {
              ok ? "" : " - a hook was not placed");
 }
 
+void fmod_ring_report() {
+    if (!g_guard) return;
+    const std::uint64_t n = g_guarded.load(), k = g_kept_count.load(), f = g_kept_freed.load();
+    // try_lock: the report also runs from a signal (SIGTERM, a crash) that may
+    // land on a thread inside the free hook.
+    std::uint64_t live = g_kept_live.load(), bytes = 0;
+    {
+        std::unique_lock<std::mutex> lk(g_kept_mu, std::try_to_lock);
+        if (lk.owns_lock()) {
+            live = g_kept.size();
+            for (const auto& kv : g_kept) bytes += kv.second;
+        }
+    }
+    host_log("fmod ring: the guard took %llu freed sound(s) out of the ring; kept %llu refusing shared subsound(s), %llu "
+             "freed since by a release under way, %llu never freed (%llu bytes)",
+             static_cast<unsigned long long>(n), static_cast<unsigned long long>(k), static_cast<unsigned long long>(f),
+             static_cast<unsigned long long>(live), static_cast<unsigned long long>(bytes));
+}
+
 void fmod_ring_crash_report() {
-    const std::uint64_t n = g_guarded.load();
-    if (g_guard && n) host_log("fmod ring: the guard took %llu freed sound(s) out of the ring", static_cast<unsigned long long>(n));
+    if (g_guard && g_guarded.load()) fmod_ring_report();
     if (!g_check) return;
     check_ring(false, "the crash");
     log_recent(24);
