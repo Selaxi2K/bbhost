@@ -6955,8 +6955,9 @@ std::string image_heap_report() {
 // goes, by owner and kind, and how much of it is what the run must hold
 // against what caches took because the card had room - the mirrors, textures
 // no bind has looked up for a while, free room in the image heap's blocks -
-// which give it back when video memory runs short. Every 300 flips and at
-// exit, beside the "memory by heap" line. BBHOST_VRAM_REPORT=0: not made.
+// which give it back when video memory runs short. Every 1,800 flips
+// (BBHOST_VRAM_REPORT_FLIPS) and at exit, after the "memory by heap" line.
+// BBHOST_VRAM_REPORT=0: not made.
 namespace {
 std::atomic<std::uint64_t> g_spare_play_blocks{1};  // the memory keeper's spare in play (start_memory_reserve)
 std::uint64_t g_vram_peak_usage = 0;                // the most the driver counted in the video memory heap at a report

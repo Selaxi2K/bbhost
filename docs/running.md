@@ -222,7 +222,8 @@ memory (browsers, OBS, a second game) shrink the budget. On a GPU with under
 memory`). `BBHOST_VRAM_RESERVE_MB=0` goes back to placing everything until
 an allocation fails, `BBHOST_SMALL_VRAM=0` turns the small mode off.
 
-The same report says where the video memory goes: `gpu: video memory (MiB)`
+Every 1,800 flips (`BBHOST_VRAM_REPORT_FLIPS=<n>` changes it) the log also
+says where the video memory goes: `gpu: video memory (MiB)`
 gives what the driver counts against its budget, what bbhost's own
 allocations hold and the driver's own share; `video memory held` lists what
 the game needs now (render targets, textures in use, buffers by owner) and
