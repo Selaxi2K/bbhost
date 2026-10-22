@@ -12596,6 +12596,29 @@ bool draw_window_locked(std::uint64_t base, std::uint64_t bytes, Located& out) {
     return false;
 }
 
+// GX's upload heap's buffer (stage 1c, host/gxvk.h): the one import over the
+// whole heap, found at its first binding (the renderer's lock held). With
+// none - the heap across two imports - its bindings take today's path.
+bool heap_located_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
+    static Located heap;
+    static std::uint64_t heap_lo = 0;
+    static bool tried = false;
+    if (!tried) {
+        std::uint64_t lo = 0, hi = 0;
+        if (!gxvk::arena_heap(&lo, &hi)) return false;
+        tried = true;
+        const Located l = locate(lo, hi - lo);
+        if (l.buffer && l.avail >= hi - lo) {
+            heap = l;
+            heap_lo = lo;
+        }
+        host_log("gxvk arena: the heap's bytes are %s", heap.buffer ? "one import's: bound there" : "not in one import: today's path");
+    }
+    if (!heap.buffer || va < heap_lo || va - heap_lo + bytes > heap.avail) return false;
+    loc = {heap.buffer, heap.offset + (va - heap_lo), heap.avail - (va - heap_lo)};
+    return true;
+}
+
 // BBHOST_CB_RECORD_PROOF (host/cb_proof.h): the bytes a binding is about to
 // be copied from or read in place, against the copy its draw's records took at
 // the GX call - for the bindings that come from the records' constant-buffer
@@ -12695,10 +12718,19 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
         // memory itself - a copy would take the stores in its place - after any
         // copy-back to it is in place, as the page-table walk it replaces had.
         int version = kCopyVersionNone;
-        if (outcome == kUnmapped && b.written) {
+        // GX's upload heap (stage 1c, BBHOST_GXVK_ARENA=1): a renamed copy is
+        // bound where GX wrote it - it holds those bytes until the GPU has done
+        // with it, which host/gxvk_arena.cpp proves as it binds - with no
+        // copy-version, window, twin or pending-write lookup and no snapshot.
+        bool in_heap = false;
+        if (outcome == kUnmapped && gxvk::arena_wanted() && gxvk::arena_bind(base, bytes, g.flushes, gxvk::kUseConstant, b.written)) {
+            in_heap = heap_located_locked(base, bytes, loc);
+            if (!in_heap) gxvk::arena_no_backing();
+        }
+        if (!in_heap && outcome == kUnmapped && b.written) {
             if (copy_version_lookup_locked(base, bytes, &loc) != kCopyVersionNone) copy_versions_put_in_place_locked(kCvWalks);
             loc = Located{};
-        } else if (outcome == kUnmapped) {
+        } else if (!in_heap && outcome == kUnmapped) {
             version = copy_version_lookup_locked(base, bytes, &loc);
         }
         if (version == kCopyVersionStraddles) {
@@ -12714,7 +12746,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
             return !(e && e[0] == '0');
         }();
         bool copy_only = false;
-        if (outcome == kUnmapped && version == kCopyVersionNone &&
+        if (!in_heap && outcome == kUnmapped && version == kCopyVersionNone &&
             (b.written || t_draw_windows.empty() || !(in_window = draw_window_locked(base, bytes, loc)))) {
             copy_only = !imports_whole() && snapshots_on && !b.written && bytes && bytes <= (1u << 20) &&
                         !gpu_writes_pending_locked(base, bytes) && hle_kernel_va_mapped(base, bytes) && !twin_covers_locked(base, bytes);
@@ -12776,7 +12808,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
             bool realign = realign_mode == 1 ? (bias % 16) != 0 : realign_mode == 2 ? (bias % 16) == 0 : realign_mode == 3;
             // A GX buffer kept as a device-local twin (BBHOST_GX_TWINS=1): bound
             // in place, the twin; its guest bytes are stale, so no copy of them.
-            const bool twin = twin_covers_locked(base, bytes);
+            const bool twin = !in_heap && twin_covers_locked(base, bytes);
             if (t_snapshot_cbs && !realign) {
                 realign = true;  // BBHOST_SF_SNAPSHOT: the bytes as recorded
                 bump(g_sf_cb_snapshots);
@@ -12805,10 +12837,15 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                 return !(e && e[0] == '0');
             }();
             bool snapshot = false;
-            if (!realign && snapshot_cpu && version == kCopyVersionNone && !in_window && !b.written && !twin &&
+            if (!realign && snapshot_cpu && !in_heap && version == kCopyVersionNone && !in_window && !b.written && !twin &&
                 !gpu_writes_pending_locked(base, bytes)) {
                 realign = snapshot = true;
                 if (host_tooling()) bump(g_cb_snapshots);
+                // The census: the copies stage 1c takes away.
+                if (gxvk::census()) {
+                    std::uint64_t lo = 0, hi = 0;
+                    if (gxvk::arena_heap(&lo, &hi) && base >= lo && base < hi) gxvk::arena_note(gxvk::kArenaSnapshotCb, bytes);
+                }
             }
             if (cb_proof::g_on) {
                 const cb_proof::Path path = b.written                         ? cb_proof::kPathStored

@@ -151,6 +151,7 @@ add_executable(bbhost
   src/host/cb_proof.cpp
   src/host/gxvk_census.cpp
   src/host/gxvk_buffers.cpp
+  src/host/gxvk_arena.cpp
   src/hle/gx_trace.cpp
   src/hle/audio.cpp
   src/hle/net.cpp
@@ -553,6 +554,10 @@ if(UNIX)
   target_include_directories(flip_pacing_test PRIVATE src)
   add_test(NAME flip_pacing_test COMMAND flip_pacing_test)
   # The copy watch: its granules, then its ranges searched in halves (host/gxvk_watch.h).
+  add_executable(gxvk_arena_test tests/gxvk_arena_test.cpp src/host/gxvk_arena.cpp)
+  target_include_directories(gxvk_arena_test PRIVATE src)
+  target_compile_definitions(gxvk_arena_test PRIVATE GXVK_ARENA_TESTING GXVK_ARENA_MUTANTS)
+  add_test(NAME gxvk_arena_test COMMAND gxvk_arena_test)
   add_executable(gxvk_watch_test tests/gxvk_watch_test.cpp)
   target_include_directories(gxvk_watch_test PRIVATE src)
   target_link_libraries(gxvk_watch_test PRIVATE Threads::Threads)

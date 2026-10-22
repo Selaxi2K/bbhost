@@ -165,4 +165,50 @@ void memory_released(std::uint64_t va, std::uint64_t bytes);
 // command processor's side reports with the GPU's).
 void buffers_report();
 
+// --- Stage 1c: GX's upload heap bound in place (host/gxvk_arena.cpp) ---
+//
+// The heap - the one region GX's device gives its block pool, where every
+// renamed constant buffer, Map rename and ring allocation lies - is handed
+// out again only after the GPU has finished the work that used it, so a
+// range of it the command processor binds can be bound where it is: no
+// snapshot, no lookup. The release order is proven for every binding and
+// the bytes for a sample of them, every run; a violation sends every
+// binding of the heap back to today's path.
+// BBHOST_GXVK_ARENA: 0 (the default) today's path; 1 in place; compare:
+// today's path, with every binding of the heap checked as 1 would bind it.
+enum class Arena : int { kOff = 0, kInPlace = 1, kCompare = 2 };
+Arena arena_mode();
+inline bool arena_wanted() { return arena_mode() != Arena::kOff; }
+// The pool's init (decomp/gx/upload_heap.cpp's entry): the pool and the
+// region it is made over. Returns the region to use instead and writes its
+// bytes, or 0 to keep the game's (stage 1c keeps it).
+std::uint64_t arena_region(std::uint64_t pool, std::uint64_t region, std::uint64_t bytes, std::uint64_t* out_bytes);
+// The heap's bounds, once its pool is made.
+bool arena_heap(std::uint64_t* lo, std::uint64_t* hi);
+// A hand-out by the block pool (the registry's pool hooks, as they return):
+// the pool and the node it returned.
+void arena_handout(std::uint64_t pool, std::uint64_t node);
+// The command processor, as it binds [va, +bytes) for `use` in submission
+// `serial`: true when the range lies in one of the heap's hand-outs and is
+// to be bound in place (its submission is stamped on the hand-out); false
+// for today's path (counted by reason when the range lies in the heap).
+// `stored`: the shader stores to it.
+bool arena_bind(std::uint64_t va, std::uint64_t bytes, std::uint64_t serial, Use use, bool stored);
+// The binding found no one buffer over the heap to bind it in.
+void arena_no_backing();
+// Today's path over the heap, counted where it runs (the work stage 1c takes away).
+enum ArenaNote : int { kArenaSnapshotCb, kArenaSnapshotVertex, kArenaGpuPending, kArenaLocated, kArenaNotes };
+void arena_note(ArenaNote what, std::uint64_t bytes);
+// The exit report (gx_resources_report calls it).
+void arena_report();
+#ifdef GXVK_ARENA_TESTING
+// tests/gxvk_arena_test.cpp: everything forgotten, and the mode set.
+void arena_test_reset(Arena mode);
+struct ArenaTestCounts {
+    std::uint64_t violations_order = 0, violations_bytes = 0, samples_checked = 0, fell = 0;
+    bool in_place = true;
+};
+ArenaTestCounts arena_test_counts();
+#endif
+
 }  // namespace gxvk

@@ -690,6 +690,24 @@ buffer's bytes against their hash when copied, the device copy read back -
 and the exit report counts the bindings by handle, the fallbacks by reason
 and any disagreement.
 
+**The upload heap (the stage's second part, off by default while it is
+measured).** GX's device gives its block pool one region - GX's upload heap,
+160 MiB, made by the pool's init, which is on the decomp list - and every
+renamed constant buffer, Map rename and ring allocation comes from it. GX
+hands a range out again only after an end-of-pipe label behind the work that
+used it has landed, and a label lands only once the host's submission has
+completed, so a renamed copy holds what its draws read until the GPU has
+done with them: in the census, 70% of constant-buffer bindings lie in the
+heap. `BBHOST_GXVK_ARENA=1` binds those where they are, in the heap's
+import, without the snapshot copy or the lookups. Every run it is used
+proves the rule again: each hand-out is a record, each binding stamps the
+record it lies in with its submission, and a hand-out over a record's memory
+needs that submission completed; and one binding in 64 has its bytes hashed
+when it is bound and again when its submission has completed. A violation
+sends every binding of the heap back to today's path for the rest of the run,
+and the exit report says so. `BBHOST_GXVK_ARENA=compare` keeps today's path
+and checks every binding of the heap as in place would bind it.
+
 ## Tools
 
 | Tool | What it does |
