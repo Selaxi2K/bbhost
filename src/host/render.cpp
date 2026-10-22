@@ -13385,13 +13385,22 @@ const bool g_vertex_table_from_memory = [] {
     const char* e = std::getenv("BBHOST_VERTEX_TABLE_FROM_MEMORY");
     return !(e && e[0] == '0');
 }();
-// BBHOST_VERTEX_STAGE (on unless 0): a vertex-input range the buffer shadow
-// keeps in host memory is copied into device memory for its draw
-// (shadow_stage_locked) instead of fetched from the import.
-const bool g_vertex_stage = [] {
-    const char* e = std::getenv("BBHOST_VERTEX_STAGE");
-    return !(e && e[0] == '0');
-}();
+// BBHOST_VERTEX_STAGE (on unless 0, but off by default on an integrated GPU):
+// a vertex-input range the buffer shadow keeps in host memory is copied into
+// device memory for its draw (shadow_stage_locked) instead of fetched from
+// the import. On an integrated GPU the import is that memory already, and the
+// copy only costs the GPU its bandwidth: on the Radeon 680M at the first
+// Central Yharnam lamp a run (title, menu, a minute in the world) made 12 GB
+// of such copies, 26.98 fps with them against 27.65 without. Read at the
+// first draw, after the device is known.
+bool vertex_stage_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_VERTEX_STAGE");
+        if (e && *e) return e[0] != '0';
+        return !g.integrated;
+    }();
+    return on;
+}
 // BBHOST_VERTEX_INPUT_NO_GX (on unless 0): a draw that carries no GX geometry -
 // YEBIS's post passes, the wrapper's own Scaleform, gamma and present draws -
 // takes vertex input from its fetch shader's table the same way
@@ -13736,7 +13745,7 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
                         }
                         ns.whole = {};
                         in_place = true;
-                    } else if (g_vertex_stage && shadow_stage_locked(record_va, record_bytes, ns.whole)) {
+                    } else if (vertex_stage_on() && shadow_stage_locked(record_va, record_bytes, ns.whole)) {
                         bump(g_vertex_staged_records);
                     } else {
                         ns.whole = {};

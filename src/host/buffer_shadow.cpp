@@ -180,19 +180,23 @@ struct Mirror {
     std::vector<Window> windows;
 };
 constexpr std::uint32_t kBlockPages = 1024;  // 64 MiB blocks
-// A window's pages (BBHOST_SHADOW_WINDOWS): 64 MiB on a discrete GPU, 16 on an
-// integrated one, or BBHOST_SHADOW_WINDOW_MB (a power of two from 16 to 512).
+// A window's pages (BBHOST_SHADOW_WINDOWS): 64 MiB on a discrete GPU, 4 on an
+// integrated one, or BBHOST_SHADOW_WINDOW_MB (a power of two from 1 to 512).
 // Larger windows hold more pages no draw reads, smaller ones send more ranges
 // across a window's edge to host memory - on an integrated GPU the same RAM:
 // on the Radeon 680M at a lamp 16 MiB windows held 1,248 MiB where 64 MiB ones
 // held 1,728, at the same frame rate, with 6.8 M ranges read in place instead
-// of 1.6 M. Read when the first mirror is made, after the device is known.
+// of 1.6 M. With the told pages read in place (BBHOST_SHADOW_IN_PLACE) the
+// copies left are scattered: 228 MiB of them kept 63 windows of 16 MiB
+// (1,008 MiB), and in 4 MiB windows 464 MiB, at the same frame rate and with
+// no range read in place changing under its draws. Read when the first
+// mirror is made, after the device is known.
 std::uint32_t window_pages() {
     static const std::uint32_t pages = [] {
-        std::uint64_t mb = g.integrated ? 16 : 64;
+        std::uint64_t mb = g.integrated ? 4 : 64;
         if (const char* e = std::getenv("BBHOST_SHADOW_WINDOW_MB"); e && *e) {
             const std::uint64_t v = std::strtoull(e, nullptr, 10);
-            if (v >= 16 && v <= 512 && (v & (v - 1)) == 0) mb = v;
+            if (v >= 1 && v <= 512 && (v & (v - 1)) == 0) mb = v;
         }
         return static_cast<std::uint32_t>((mb << 20) / kPageBytes);
     }();

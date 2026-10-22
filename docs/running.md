@@ -225,13 +225,14 @@ and `BBHOST_HEAP_DRAIN=0` turn the split and the draining off);
 `BBHOST_TESS_RING=whole` and `BBHOST_SCRATCH_RETURN=0` keep the tessellation
 ring and the texture upload scratch at their largest from the start. On a GPU
 without sparse binding (AMD, integrated GPUs) the vertex data's mirrors are
-made 64 MiB at a time as the game's meshes need them (16 MiB on an
+made 64 MiB at a time as the game's meshes need them (4 MiB on an
 integrated GPU; `BBHOST_SHADOW_WINDOW_MB` sets it), rather than a whole
 gigabyte each (`BBHOST_SHADOW_WINDOWS=0` goes back to whole ones). On an
 integrated GPU, where those mirrors would be the same memory again, the
 meshes in the game's own vertex and index buffers are read where they are,
 with no copy (`BBHOST_SHADOW_IN_PLACE=0` copies them as before; `=1` reads
-them in place on any GPU).
+them in place on any GPU), and vertex data left in host memory is not copied
+for each draw either (`BBHOST_VERTEX_STAGE=1` copies it as on a discrete GPU).
 
 **AMD on Linux, no picture.** AMD's kernel driver only imports anonymous
 memory, so bbhost passes the game's memory to the GPU through `/dev/udmabuf`.
