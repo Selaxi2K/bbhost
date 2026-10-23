@@ -6858,8 +6858,8 @@ bool world_settled() {
         const char* e = std::getenv("BBHOST_CACHE_SETTLE_S");
         return (e && *e ? std::strtoull(e, nullptr, 10) : 30ull) * 1000;
     }();
-    const std::uint64_t ended = g_loading_ended_ms.load(std::memory_order_relaxed);
-    return ended && !loading_screen_now() && static_cast<std::uint64_t>(steady_ms()) - ended >= settle_ms;
+    return apu_memory::settled(g_loading_ended_ms.load(std::memory_order_relaxed), static_cast<std::uint64_t>(steady_ms()), loading_screen_now(),
+                               settle_ms);
 }
 bool cache_budget_pressing(std::uint64_t more) { return world_settled() && cache_over_budget(more); }
 std::uint64_t cache_budget_excess() { return apu_memory::excess(g_cache_budget.load(std::memory_order_relaxed), bb_memory_local_bytes()); }
@@ -7296,7 +7296,8 @@ std::string video_memory_report_locked(bool at_exit) {
 // image heap blocks, 7-9 ms, show no such frame). The staging made again at
 // the next load cost ~30 ms a chunk of pinning besides. BBHOST_STAGING_RETURN=1
 // (or gpu.staging_return = true; host/apu_memory.h) gives it back in play as
-// before: down to the floor after 30 s, a chunk every two seconds, each free
+// before: down to the floor once the world has settled (30 s after the latest
+// load, a death restarting the count), a chunk every two seconds, each free
 // timed for the exit report and logged with its flip.
 // BBHOST_MEMORY_KEEPER=0 restores the old fixed reserve (six blocks and
 // 768 MiB at boot, never given back) for comparison.
@@ -7422,7 +7423,6 @@ void start_memory_reserve() {
                  staging_return ? ", given back to the start's in play (BBHOST_STAGING_RETURN, gpu.staging_return)"
                                 : ", kept in play (BBHOST_STAGING_RETURN=1 or gpu.staging_return = true gives it back)");
         make_staging(floor);
-        auto over_floor_since = std::chrono::steady_clock::time_point{};
         // One piece of memory goes back at a time, two seconds apart: freeing
         // half a gigabyte of upload staging in one go (eight vkFreeMemory of
         // pinned, mapped memory) stalled the frames behind it ~100 ms in every
@@ -7432,8 +7432,8 @@ void start_memory_reserve() {
         // MiB chunk every two seconds, a smaller one (BBHOST_STAGING_CHUNK_MB)
         // as much sooner: each vkFreeMemory is a stall in the driver that the
         // frame behind it can meet, and a smaller chunk's is shorter.
-        auto last_staging_given = std::chrono::steady_clock::time_point{};
-        const auto staging_pace = std::chrono::milliseconds(std::max<std::uint64_t>(250, 2000 * (staging_chunk_bytes() >> 20) / 64));
+        std::uint64_t last_staging_given_ms = 0;
+        const std::uint64_t staging_pace_ms = std::max<std::uint64_t>(250, 2000 * (staging_chunk_bytes() >> 20) / 64);
         bool was_loading = false;
         for (;;) {
             {
@@ -7485,7 +7485,8 @@ void start_memory_reserve() {
             }
             // In play: empty blocks above the spare go back after 10 s, one a
             // turn, two seconds apart (with BBHOST_STAGING_RETURN=1 also
-            // staging over the floor for 30 s, down to it, a chunk a turn).
+            // staging over the floor once the world has settled - 30 s after
+            // the latest load - down to it, a chunk a turn).
             std::vector<VkDeviceMemory> gone;
             std::vector<DevBuffer> chunks;
             DevBuffer scratch_gone;
@@ -7527,16 +7528,12 @@ void start_memory_reserve() {
                     g.scratch_free.pop_back();
                     g_scratch_returned.fetch_add(1, std::memory_order_relaxed);
                 }
-                if (staging_return && g.staging_free_bytes > floor) {
-                    if (over_floor_since == std::chrono::steady_clock::time_point{}) over_floor_since = now;
-                    if (now - over_floor_since >= std::chrono::seconds(30) && (reserve_short || now - last_staging_given >= staging_pace) &&
-                        gone.empty() && !g.staging_free.empty()) {
-                        chunks.push_back(g.staging_free.back());
-                        g.staging_free_bytes -= g.staging_free.back().size;
-                        g.staging_free.pop_back();
-                    }
-                } else {
-                    over_floor_since = {};
+                if (apu_memory::staging_give_now(staging_return, g.staging_free_bytes, floor, world_settled(), reserve_short,
+                                                 static_cast<std::uint64_t>(steady_ms()), last_staging_given_ms, staging_pace_ms) &&
+                    gone.empty() && !g.staging_free.empty()) {
+                    chunks.push_back(g.staging_free.back());
+                    g.staging_free_bytes -= g.staging_free.back().size;
+                    g.staging_free.pop_back();
                 }
             }
             if (scratch_gone.buffer) {
@@ -7569,7 +7566,7 @@ void start_memory_reserve() {
                     ms_memory += std::chrono::duration<double, std::milli>(e - d).count();
                 }
                 last_given = std::chrono::steady_clock::now();
-                if (!chunks.empty()) last_staging_given = last_given;
+                if (!chunks.empty()) last_staging_given_ms = static_cast<std::uint64_t>(steady_ms());
                 if (!chunks.empty()) {
                     // Counted for the exit report (staging_pool_stats): what
                     // the frees cost is the question giving it back answers.
@@ -10548,8 +10545,10 @@ VkDeviceAddress guest_device_address(std::uint64_t va, std::size_t bytes) {
 }  // namespace gpu
 
 void host_gpu_set_loading(bool loading) {
-    if (gpu::g_loading_screen.exchange(loading) != loading) {
-        if (!loading) gpu::g_loading_ended_ms.store(static_cast<std::uint64_t>(gpu::steady_ms()), std::memory_order_relaxed);
+    if (const bool was = gpu::g_loading_screen.exchange(loading); was != loading) {
+        gpu::g_loading_ended_ms.store(apu_memory::latest_load_end(gpu::g_loading_ended_ms.load(std::memory_order_relaxed), was, loading,
+                                                                  static_cast<std::uint64_t>(gpu::steady_ms())),
+                                      std::memory_order_relaxed);
         gpu::g_keeper_cv.notify_one();
     }
     gpu::precompile_set_loading(loading);
