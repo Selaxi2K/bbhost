@@ -110,6 +110,9 @@ struct Chunk {
     std::uint64_t size = 0;
     std::uint64_t lo = 0;
     std::vector<VkDeviceMemory> pieces;  // dma-buf imports bound into a sparse `buffer` (gpu.cpp, dmabuf_span)
+    // The idle census (BBHOST_IMPORT_IDLE_CENSUS=1, gpu.cpp): when it was made
+    // and last found by dmem_import (steady ms, flip).
+    std::uint64_t made_ms = 0, used_ms = 0, used_flip = 0;
 };
 // SCE_KERNEL_PROT_GPU_READ | SCE_KERNEL_PROT_GPU_WRITE: a mapping the GPU can reach.
 constexpr int kGuestProtGpu = 0x30;

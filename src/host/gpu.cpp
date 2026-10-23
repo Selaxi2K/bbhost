@@ -1061,6 +1061,98 @@ void install_import_locked(std::uint32_t index, Chunk* c) {
 }
 }  // namespace
 
+// ---- The window imports' idle census (BBHOST_IMPORT_IDLE_CENSUS=1; off, nothing is counted) ----
+// How long each import goes without a use - a binding, a device address, a
+// walk, a copy: every dmem_import that finds it - and what letting one go
+// after 60 s without a use would give back, against the imports it would
+// have had to make again: a use after such a gap is one, of its size, waited
+// for by whoever needed it (on a Radeon 680M 5-46 ms a 16 MiB window). Also
+// by game frames (1,800 and 3,600 flips: 30 and 60 s at 60 fps), for a run
+// slower than the game's own pace (lavapipe).
+namespace {
+std::int64_t steady_ms();  // below, beside the image heap
+const bool g_idle_census = [] {
+    const char* e = std::getenv("BBHOST_IMPORT_IDLE_CENSUS");
+    return e && e[0] == '1';
+}();
+constexpr std::uint64_t kIdleLetGoMs = 60000;
+// Uses after a gap of 10-60 s, 60-120 s, 120 s or more: how many, and the imports' MiB.
+std::uint64_t g_idle_gap_n[3] = {}, g_idle_gap_bytes[3] = {};
+std::uint64_t g_idle_uses = 0;
+// Uses that letting go after 60 s (and after 1,800 / 3,600 flips) would have made imports again.
+std::uint64_t g_idle_again_n = 0, g_idle_again_bytes = 0, g_idle_again_f30_n = 0, g_idle_again_f30_bytes = 0, g_idle_again_f60_n = 0,
+              g_idle_again_f60_bytes = 0;
+// At the census reports: the live imports idle 60 s or more (and 3,600 flips or more), their sum (for the mean) and most.
+std::uint64_t g_idle_reports = 0, g_idle_over_sum = 0, g_idle_over_max = 0, g_idle_over_f_sum = 0, g_idle_over_f_max = 0;
+
+void idle_note_use_locked(Chunk& c) {
+    if (!g_idle_census) return;
+    const std::uint64_t now = static_cast<std::uint64_t>(steady_ms()), flip = hle_video_flip_count();
+    if (c.used_ms) {
+        const std::uint64_t gap = now - c.used_ms, gapf = flip - c.used_flip;
+        if (gap >= 10000) {
+            const int b = gap < 60000 ? 0 : gap < 120000 ? 1 : 2;
+            ++g_idle_gap_n[b];
+            g_idle_gap_bytes[b] += c.size;
+        }
+        if (gap >= kIdleLetGoMs) {
+            ++g_idle_again_n;
+            g_idle_again_bytes += c.size;
+        }
+        if (gapf >= 1800) {
+            ++g_idle_again_f30_n;
+            g_idle_again_f30_bytes += c.size;
+        }
+        if (gapf >= 3600) {
+            ++g_idle_again_f60_n;
+            g_idle_again_f60_bytes += c.size;
+        }
+    }
+    ++g_idle_uses;
+    c.used_ms = now;
+    c.used_flip = flip;
+}
+}  // namespace
+
+// The census line (the video memory report and the exit report).
+std::string import_idle_report_locked() {
+    if (!g_idle_census) return {};
+    const std::uint64_t now = static_cast<std::uint64_t>(steady_ms()), flip = hle_video_flip_count();
+    std::uint64_t live = 0, n = 0, under10 = 0, to60 = 0, over = 0, over_f = 0;
+    for (const DmemChunk& d : g.dmem) {
+        for (const auto& c : d.imports) {
+            live += c->size;
+            ++n;
+            const std::uint64_t idle = c->used_ms ? now - c->used_ms : 0;
+            (idle < 10000 ? under10 : idle < kIdleLetGoMs ? to60 : over) += c->size;
+            if (c->used_ms && flip - c->used_flip >= 3600) over_f += c->size;
+        }
+    }
+    ++g_idle_reports;
+    g_idle_over_sum += over;
+    g_idle_over_max = std::max(g_idle_over_max, over);
+    g_idle_over_f_sum += over_f;
+    g_idle_over_f_max = std::max(g_idle_over_f_max, over_f);
+    const auto mib = [](std::uint64_t b) { return static_cast<unsigned long long>(b >> 20); };
+    const double ms_per_mib = g_import_bytes.load() ? static_cast<double>(g_import_us.load()) / 1e3 / (static_cast<double>(g_import_bytes.load()) / (1 << 20)) : 0;
+    char buf[1024];
+    std::snprintf(buf, sizeof(buf),
+                  "import idle census: live %llu MiB in %llu imports; idle now under 10 s %llu, 10-60 s %llu, 60 s or more %llu MiB (3,600 "
+                  "flips or more %llu MiB); at the %llu reports so far idle 60 s or more mean %llu, most %llu MiB (3,600 flips: mean %llu, "
+                  "most %llu); uses %llu, after a gap of 10-60 s %llu (%llu MiB), 60-120 s %llu (%llu MiB), 120 s or more %llu (%llu MiB); "
+                  "letting an import go after 60 s idle would have made %llu again (%llu MiB), after 1,800 flips %llu (%llu MiB), after 3,600 "
+                  "flips %llu (%llu MiB) - at this run's %.3f ms a MiB of the driver's time, %.0f ms",
+                  mib(live), static_cast<unsigned long long>(n), mib(under10), mib(to60), mib(over), mib(over_f),
+                  static_cast<unsigned long long>(g_idle_reports), mib(g_idle_over_sum / g_idle_reports), mib(g_idle_over_max),
+                  mib(g_idle_over_f_sum / g_idle_reports), mib(g_idle_over_f_max), static_cast<unsigned long long>(g_idle_uses),
+                  static_cast<unsigned long long>(g_idle_gap_n[0]), mib(g_idle_gap_bytes[0]), static_cast<unsigned long long>(g_idle_gap_n[1]),
+                  mib(g_idle_gap_bytes[1]), static_cast<unsigned long long>(g_idle_gap_n[2]), mib(g_idle_gap_bytes[2]),
+                  static_cast<unsigned long long>(g_idle_again_n), mib(g_idle_again_bytes), static_cast<unsigned long long>(g_idle_again_f30_n),
+                  mib(g_idle_again_f30_bytes), static_cast<unsigned long long>(g_idle_again_f60_n), mib(g_idle_again_f60_bytes), ms_per_mib,
+                  ms_per_mib * static_cast<double>(g_idle_again_bytes >> 20));
+    return buf;
+}
+
 const Chunk* dmem_import(std::uint32_t index, std::uint64_t in, std::uint64_t bytes, bool past_end) {
     if (index >= gcn::kDmemChunks) return nullptr;
     DmemChunk& d = g.dmem[index];
@@ -1102,7 +1194,10 @@ const Chunk* dmem_import(std::uint32_t index, std::uint64_t in, std::uint64_t by
     // refused with a lost device.
     if (in >= kChunkBytes || (!past_end && bytes > kChunkBytes - in)) return nullptr;
     const std::uint32_t w0 = static_cast<std::uint32_t>(in >> kImportWindowShift);
-    if (const Chunk* c = d.window[w0]; c && chunk_covers(*c, in, bytes)) return c;
+    if (Chunk* c = d.window[w0]; c && chunk_covers(*c, in, bytes)) {
+        idle_note_use_locked(*c);
+        return c;
+    }
     const std::uint64_t reach = past_end ? span_reach(index) : std::min<std::uint64_t>(d.span_hi, kChunkBytes);
     if (in < d.span_lo || in >= reach || bytes > reach - in) return nullptr;  // not GPU-visible: the sink
     constexpr std::uint64_t kWindow = 1ull << kImportWindowShift;
@@ -1123,6 +1218,8 @@ const Chunk* dmem_import(std::uint32_t index, std::uint64_t in, std::uint64_t by
     if (!c) return nullptr;
     note_import_asker_locked(c->size);
     install_import_locked(index, c);
+    if (g_idle_census) c->made_ms = static_cast<std::uint64_t>(steady_ms());
+    idle_note_use_locked(*c);
     return c;
 }
 
@@ -7165,6 +7262,8 @@ std::string video_memory_report_locked(bool at_exit) {
                       "together at most %llu", peaks.c_str(), mib(device_peak));
         out += buf;
     }
+    // The window imports' idle census (BBHOST_IMPORT_IDLE_CENSUS=1).
+    if (const std::string idle = import_idle_report_locked(); !idle.empty()) out += "\n[bbhost]   " + idle;
     const auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
     std::snprintf(buf, sizeof(buf), " (the census took %lld us)", static_cast<long long>(us));
     out += buf;

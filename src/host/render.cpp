@@ -976,6 +976,17 @@ const int g_vb_race_level = [] {
 const bool g_vb_race = g_vb_race_level != 0;
 // By [mirrored][class]: ranges checked and changed before their submission retired.
 std::uint64_t g_vb_class_checked[2][kPlaceClasses] = {}, g_vb_class_changed[2][kPlaceClasses] = {};
+// =2: the mirror pages (64 KiB, by guest address; a range by its first 256) a
+// draw read from a mirror, and those that changed while the draw was queued -
+// what reading them in place, as an integrated GPU reads the meshes, would
+// have raced on; and the changed ranges' bytes. Bounded sets.
+std::unordered_set<std::uint64_t> g_vb_mirror_pages_read, g_vb_mirror_pages_changed;
+std::uint64_t g_vb_mirror_changed_bytes = 0;
+void vb_mirror_pages_note(std::unordered_set<std::uint64_t>& set, std::uint64_t va, std::uint64_t bytes) {
+    if (set.size() >= (1u << 20)) return;
+    const std::uint64_t p0 = va >> 16, p1 = (va + bytes - 1) >> 16;
+    for (std::uint64_t p = p0; p <= p1 && p < p0 + 256; ++p) set.insert(p);
+}
 std::deque<VbWatch> g_vb_watch;
 std::uint64_t g_vb_checked = 0, g_vb_changed = 0, g_vb_changed_bytes = 0;
 std::uint64_t g_vb_gpu_written = 0;  // changed by a GPU write recorded with or after the draw: not a race
@@ -1112,6 +1123,10 @@ void vb_race_class_report() {
         }
     }
     if (!line.empty()) host_log("vb race: changed/checked by the pages' class:%s", line.c_str());
+    if (!g_vb_mirror_pages_read.empty())
+        host_log("vb race: mirror pages (64 KiB) draws read from a mirror %zu, of them changed while such a draw was queued %zu (the changed "
+                 "ranges %llu MiB) - what reading them in place would have raced on",
+                 g_vb_mirror_pages_read.size(), g_vb_mirror_pages_changed.size(), static_cast<unsigned long long>(g_vb_mirror_changed_bytes >> 20));
 }
 
 void vb_race_exit_report_locked() {
@@ -1131,14 +1146,17 @@ void vb_race_retired_locked(std::uint64_t serial) {
         const bool changed =
             hle_kernel_va_mapped(w.va, w.bytes) && (w.mirrored ? vb_race_hash_ends(w.va, w.bytes) : vb_race_hash(w.va, w.bytes)) != w.hash;
         ++g_vb_class_checked[w.mirrored][w.cls < kPlaceClasses ? w.cls : 0];
+        if (w.mirrored) vb_mirror_pages_note(g_vb_mirror_pages_read, w.va, w.bytes);
         // A GPU write recorded with or after the draw (a simulation dispatch
         // rewriting its ring): the draw read before it in the GPU's order.
         if (changed && gpu_wrote_since_locked(w.va, w.bytes, w.serial)) {
             ++g_vb_gpu_written;
         } else if (changed && w.mirrored) {
             // The mirror's copy kept what the draw recorded: no race now, one
-            // in place - counted by class only.
+            // in place - counted by class, and the pages.
             ++g_vb_class_changed[1][w.cls < kPlaceClasses ? w.cls : 0];
+            vb_mirror_pages_note(g_vb_mirror_pages_changed, w.va, w.bytes);
+            g_vb_mirror_changed_bytes += w.bytes;
         } else if (changed) {
             ++g_vb_changed;
             g_vb_changed_bytes += w.bytes;
