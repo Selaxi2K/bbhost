@@ -2,7 +2,10 @@
 //
 // The heap is the one region GX's device gives its block pool, which every
 // renamed constant buffer, Map rename, ring allocation and draw table comes
-// from (decomp/gx/upload_heap.cpp tells us of it). GX hands a range of it out
+// from (decomp/gx/upload_heap.cpp tells us of it). The pool hands out from
+// both ends - the deferred contexts from the heap's start, the immediate
+// context from its top - and both ends' hand-outs are records here
+// (engine/gx_resources.cpp's pool hooks). GX hands a range of it out
 // again only after an end-of-pipe label behind the work that used it has
 // landed, and a label lands only once the host's submission has completed;
 // so a range the command processor binds holds the same bytes until the GPU
