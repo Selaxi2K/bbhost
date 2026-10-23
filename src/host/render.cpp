@@ -12750,24 +12750,33 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
             version = kCopyVersionNone;
         }
         bool in_window = false;  // loc is a window's copy (a capture reads its guest bytes)
-        // Window imports (BBHOST_IMPORT_WINDOWS=1): memory the game writes on
-        // the CPU, which the draw takes as a snapshot copied as it records
-        // (BBHOST_CB_SNAPSHOT, below), is read by the CPU alone - no import.
+        // Memory the game writes on the CPU, which the draw takes as a snapshot
+        // copied as it records (BBHOST_CB_SNAPSHOT, below), is read by the CPU
+        // alone: no import with window imports (BBHOST_IMPORT_WINDOWS=1), and
+        // with whole spans no lookup of the import either - locate, ~2% of the
+        // command processor at the Nightmare of Mensis on a Steam Deck, for a
+        // binding the snapshot then replaced. (Whether a GPU write is still to
+        // land on the range is asked once, for both.)
         static const bool snapshots_on = [] {
             const char* e = std::getenv("BBHOST_CB_SNAPSHOT");
             return !(e && e[0] == '0');
         }();
+        int pending_known = -1;
+        const auto gpu_pending = [&]() {
+            if (pending_known < 0) pending_known = gpu_writes_pending_locked(base, bytes) ? 1 : 0;
+            return pending_known == 1;
+        };
         bool copy_only = false;
         if (!in_heap && outcome == kUnmapped && version == kCopyVersionNone &&
             (b.written || t_draw_windows.empty() || !(in_window = draw_window_locked(base, bytes, loc)))) {
-            copy_only = !imports_whole() && snapshots_on && !b.written && bytes && bytes <= (1u << 20) &&
-                        !gpu_writes_pending_locked(base, bytes) && hle_kernel_va_mapped(base, bytes) && !twin_covers_locked(base, bytes);
+            copy_only = snapshots_on && !b.written && bytes && bytes <= (1u << 20) && !gpu_pending() && hle_kernel_va_mapped(base, bytes) &&
+                        !twin_covers_locked(base, bytes);
             if (!copy_only) {
                 // (The reason is worked out only for the census, BBHOST_IMPORT_CENSUS=1.)
                 const ImportSite site(b.written                         ? "a shader's buffer, stored to"
                                       : imports_whole() || !import_census_on() ? "a shader's buffer, read"
                                       : bytes > (1u << 20)              ? "a shader's buffer, read (over 1 MiB)"
-                                      : gpu_writes_pending_locked(base, bytes) ? "a shader's buffer, read (a GPU write pending)"
+                                      : gpu_pending()                   ? "a shader's buffer, read (a GPU write pending)"
                                                                         : "a shader's buffer, read (not copied)");
                 loc = locate(base, std::min<std::uint64_t>(bytes, g.ssbo_max_range ? g.ssbo_max_range : bytes));
             }
@@ -12855,8 +12864,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                 if (gxvk::arena_heap(&lo, &hi) && base >= lo && base < hi && gpu_writes_pending_locked(base, bytes))
                     gxvk::arena_note(gxvk::kArenaGpuPending, bytes);
             }
-            if (!realign && snapshot_cpu && !in_heap && version == kCopyVersionNone && !in_window && !b.written && !twin &&
-                !gpu_writes_pending_locked(base, bytes)) {
+            if (!realign && snapshot_cpu && !in_heap && version == kCopyVersionNone && !in_window && !b.written && !twin && !gpu_pending()) {
                 realign = snapshot = true;
                 if (host_tooling()) bump(g_cb_snapshots);
                 // The census: the copies stage 1c takes away.
