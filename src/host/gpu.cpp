@@ -7631,6 +7631,16 @@ std::size_t g_copy_binding_next = 0;
 }  // namespace
 
 void note_copy_binding_locked(const VkDescriptorBufferInfo& info, std::uint64_t guest) {
+    // Only the draw and dispatch captures ask (copy_binding_guest_locked).
+    // Written at every constant-buffer snapshot - ~4,300 a frame at the
+    // Nightmare of Mensis on a Steam Deck - its lines were among the command
+    // processor's cache misses there.
+    static const bool wanted = [] {
+        const char* d = std::getenv("BBHOST_CAPTURE_DRAW");
+        const char* c = std::getenv("BBHOST_CAPTURE_DISPATCH");
+        return (d && *d) || (c && *c);
+    }();
+    if (!wanted) return;
     g_copy_bindings[g_copy_binding_next++ % 64] = {info.buffer, info.offset, info.range, guest};
 }
 std::uint64_t copy_binding_guest_locked(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize range) {
