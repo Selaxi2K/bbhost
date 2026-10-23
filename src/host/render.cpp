@@ -10621,8 +10621,14 @@ bool rt_return_one_locked(RtImage& r) { return rt_remake_locked(r, false); }
 // went back, the mirrors stayed at 512 MiB while the draws asked for more,
 // and 16.8 million draws read their vertices across the bus: 53 fps
 // uncapped, the GPU at 18.5 ms a flip, against 90 when a block went back.
+// And while the mirrors are refused room (shadow_room_refusals_locked, as the
+// textures' drain takes its lean thresholds then), a block holding up to
+// 160 MiB is emptied for them, not only one holding 64: in another run there
+// the targets' 665 MiB of free room lay over six blocks, none holding 64 MiB
+// or less, the mirrors stayed at 448 MiB, and Mensis ran 48.7 fps (GPU
+// 20.3 ms a flip). BBHOST_HEAP_TARGET_DRAIN_PRESSED=0 keeps the 64 MiB.
 std::uint64_t g_td_blocks = 0, g_td_emptied = 0, g_td_targets = 0, g_td_bytes = 0, g_td_dropped = 0, g_td_refused = 0,
-              g_td_pinned = 0, g_td_gave_up = 0, g_td_relocating = 0;
+              g_td_pinned = 0, g_td_gave_up = 0, g_td_relocating = 0, g_td_pressed = 0;
 }  // namespace
 
 void drain_target_blocks_locked() {
@@ -10636,6 +10642,14 @@ void drain_target_blocks_locked() {
     const std::uint64_t now = steady_ms();
     if (now - last_ms < 1000) return;
     last_ms = now;
+    static const bool pressed_on = [] {
+        const char* e = std::getenv("BBHOST_HEAP_TARGET_DRAIN_PRESSED");
+        return !(e && e[0] == '0');
+    }();
+    static std::uint64_t refusals_seen = 0;
+    const std::uint64_t refusals = shadow_room_refusals_locked();
+    const bool pressed = pressed_on && refusals != refusals_seen;  // the mirrors refused room since the last turn
+    refusals_seen = refusals;
     int block = image_heap_avoided_block_locked();
     if (block >= 0 && image_heap_block_used_locked(block) == 0) {  // emptied: the keeper gives it back
         image_heap_avoid_block_locked(-1);
@@ -10653,8 +10667,9 @@ void drain_target_blocks_locked() {
         if (now < quiet_until_ms) return;
         std::uint64_t used = 0, room = 0;
         const int c = image_heap_target_drain_candidate_locked(&used, &room);
-        constexpr std::uint64_t kMostUsed = 64ull << 20, kSpare = 32ull << 20;
-        if (c < 0 || used > kMostUsed || room < used + kSpare) return;
+        constexpr std::uint64_t kMostUsed = 64ull << 20, kMostUsedPressed = 160ull << 20, kSpare = 32ull << 20;
+        if (c < 0 || used > (pressed ? kMostUsedPressed : kMostUsed) || room < used + kSpare) return;
+        if (used > kMostUsed) ++g_td_pressed;
         if (textures_block_pinned_locked(c)) {
             if (!textures_relocate_block_locked(c)) {
                 ++g_td_pinned;
@@ -10698,13 +10713,15 @@ void drain_target_blocks_locked() {
 
 std::string target_drain_report() {
     if (!g_td_blocks && !g_td_pinned) return {};
-    char buf[320];
+    char buf[400];
     std::snprintf(buf, sizeof(buf),
                   "; targets' blocks drained %llu (emptied %llu, given up %llu, no room for a target %llu, a GPU-written surface in it %llu, "
-                  "its GPU-written surfaces moved too %llu): targets moved %llu (%llu MiB), textures and copies let go %llu MiB",
+                  "its GPU-written surfaces moved too %llu, holding over 64 MiB for the mirrors %llu): targets moved %llu (%llu MiB), "
+                  "textures and copies let go %llu MiB",
                   static_cast<unsigned long long>(g_td_blocks), static_cast<unsigned long long>(g_td_emptied),
                   static_cast<unsigned long long>(g_td_gave_up), static_cast<unsigned long long>(g_td_refused),
                   static_cast<unsigned long long>(g_td_pinned), static_cast<unsigned long long>(g_td_relocating),
+                  static_cast<unsigned long long>(g_td_pressed),
                   static_cast<unsigned long long>(g_td_targets), static_cast<unsigned long long>(g_td_bytes >> 20),
                   static_cast<unsigned long long>(g_td_dropped >> 20));
     return buf;
