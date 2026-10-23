@@ -486,6 +486,11 @@ bool mutex_unlock_fast(void** slot, Thread* self) {
     return false;
 }
 
+Thread* mutex_owner(void** slot) {
+    Mutex* m = get<Mutex>(slot, kMagicMutex);
+    return m ? m->owner.load(std::memory_order_relaxed) : nullptr;
+}
+
 // ---------------------------------------------------------------- mutexattr
 int mutexattr_init(void** slot) {
     if (!slot) {

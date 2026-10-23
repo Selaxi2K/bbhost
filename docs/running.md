@@ -194,6 +194,18 @@ that are never freed). `BBHOST_FMOD_GUARD=0` is the game's own behaviour;
 `BBHOST_FMOD_CHECK=1` also logs FMOD's sounds as they come and go and checks
 the list as sounds are loaded.
 
+**A crash on a loading screen, or `sf text:` in the log.** Scaleform, the
+game's menu library, works out how a piece of text is laid out when it hands a
+menu's changes to the renderer, and the renderer uses that layout without
+checking that it exists. A text changed by another part of the game while
+that hand-over is under way reaches the renderer without one, and the
+renderer's first use of it crashes the game (the loading screen's tips are
+such a text). bbhost leaves out the part of that text's update that needs the
+layout, and does it once the layout arrives; the log's `sf text:` lines say
+when, and the one at exit how often. `BBHOST_SF_TEXT_GUARD=0` is the game's
+own behaviour; `BBHOST_SF_TEXT_CHECK=1` also counts the menus' changes by
+whether the thread making them held the menu's lock.
+
 **Wrong picture.** Wrong colours, a green or black screen, missing parts:
 press F12 in the game while it shows. bbhost writes that frame, every render
 target the last draws wrote and the draw list into a folder of its own beside

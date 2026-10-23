@@ -61,6 +61,9 @@ int mutex_unlock(void** slot);
 // initializer, contention, a sleeper to wake, an error to report).
 bool mutex_lock_fast(void** slot, Thread* self);
 bool mutex_unlock_fast(void** slot, Thread* self);
+// The thread holding the mutex in `slot` right now; nullptr when it is free
+// or the slot holds no mutex. A snapshot, for diagnostics.
+Thread* mutex_owner(void** slot);
 
 // Mutex attr.
 int mutexattr_init(void** slot);
