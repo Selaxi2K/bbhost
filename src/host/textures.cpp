@@ -1,6 +1,7 @@
 // Textures and samplers for the renderer: T#/S# words resolved from the
 // stage's user data become Vulkan images (untiled on upload) and samplers.
 // Render targets sampled as textures alias the render target image.
+#include "host/apu_memory.h"
 #include "host/gpu_internal.h"
 
 #if !defined(_WIN32)
@@ -1844,6 +1845,27 @@ std::atomic<std::uint64_t> g_census_hash_skipped{0}, g_census_check_hashed{0}, g
     g_cp_dirty_settled{0};
 std::atomic<std::uint64_t> g_ahead_used{0}, g_ahead_replaced{0}, g_ahead_bind_before_prep{0};
 
+// Textures a bind made itself - on the binding thread, the command processor's
+// side - rather than finding one made ahead (the exit report): those held back
+// from ahead creation (the reserve or the caches' budget), those evicted or
+// drained since they were made, and the rest (no GX resource made them, or
+// made ahead was off). What a cache's budget costs shows here: each is an
+// image made and an upload queued where a bind would have found one ready.
+// Under the renderer's lock; the reasons map is bounded (cleared when full,
+// its later binds then counted with the rest).
+namespace {
+enum BindReason : std::uint8_t { kBindHeld = 1, kBindGone = 2 };
+std::unordered_map<std::uint64_t, std::uint8_t> g_bind_reason;
+std::uint64_t g_bind_made = 0, g_bind_made_bytes = 0, g_bind_made_held = 0, g_bind_made_gone = 0, g_bind_reason_cleared = 0;
+void note_bind_reason_locked(std::uint64_t base, std::uint8_t why) {
+    if (g_bind_reason.size() >= (1u << 18)) {
+        g_bind_reason.clear();
+        ++g_bind_reason_cleared;
+    }
+    g_bind_reason[base] = why;
+}
+}  // namespace
+
 // Keeps a surface in step with the guest memory behind it. Split out of
 // texture_view() so a memo hit runs it too: it is the one part of resolving a
 // T# that is not a function of the descriptor.
@@ -2848,6 +2870,14 @@ VkImageView texture_view_uncached(const std::uint32_t* w, bool storage, bool& di
         }
         it = g_surfaces.emplace(base, sf).first;
         note_surface_added(it->second);
+        if (!t_force_async) {
+            ++g_bind_made;
+            g_bind_made_bytes += it->second.memory.size;
+            if (auto r = g_bind_reason.find(base); r != g_bind_reason.end()) {
+                ++(r->second == kBindHeld ? g_bind_made_held : g_bind_made_gone);
+                g_bind_reason.erase(r);
+            }
+        }
         ++g_tiling_hist[tiling];
         if (sf.base < 0x157010000ull && sf.base + sf.total_src > 0x15700c000ull) {
             host_log("texture: surface 0x%llx %ux%u type=%u tiling=%u src=%zu overlaps 0x15700c000-0x157010000 (end 0x%llx)",
@@ -3192,14 +3222,16 @@ std::atomic<std::uint64_t> g_ahead_surfaces{0}, g_ahead_already{0}, g_ahead_fail
 // While video memory is down to the reserve and a block (where the image heap
 // may no longer grow for textures, and the eviction looks for room), none is
 // made ahead: 62-64% of those are never bound, and each would take video
-// memory a bound texture wants - or go to host memory for nothing. The first
-// bind makes it, as before ahead creation. BBHOST_AHEAD_HOLD=0: always made.
+// memory a bound texture wants - or go to host memory for nothing. The same
+// over the caches' budget (BBHOST_CACHE_BUDGET_MB, an integrated GPU's: no
+// reserve applies there). The first bind makes it, as before ahead creation.
+// BBHOST_AHEAD_HOLD=0: always made.
 bool ahead_held_back() {
     static const bool on = [] {
         const char* e = std::getenv("BBHOST_AHEAD_HOLD");
         return !(e && e[0] == '0');
     }();
-    return on && vram_within_reserve(256ull << 20);
+    return on && (vram_within_reserve(256ull << 20) || cache_over_budget(256ull << 20));
 }
 
 std::atomic<std::uint64_t> g_ahead_replaced_gen{0}, g_ahead_adopted{0};
@@ -3237,7 +3269,9 @@ bool textures_create_ahead_locked(const std::uint32_t* w, std::uint64_t gen) {
     }
     if (ahead_held_back()) {
         if (g_ahead_held.fetch_add(1, std::memory_order_relaxed) == 0)
-            host_log("texture: video memory is down to the reserve: textures are made at their first bind, not ahead, until there is room");
+            host_log("texture: %s: textures are made at their first bind, not ahead, until there is room",
+                     vram_within_reserve(256ull << 20) ? "video memory is down to the reserve" : "the video memory we hold is over the caches' budget");
+        note_bind_reason_locked(base, kBindHeld);
         return false;
     }
     bool dims_ok = true, arrayed = false;
@@ -3952,23 +3986,35 @@ void textures_before_submit() {
 // next bind makes one again from the guest memory that holds its texels.
 // Never one a shader or a copy wrote (its image holds what guest memory does
 // not). On a 6 GB card the made-ahead textures alone were 0.16-0.59 GiB.
-std::uint64_t g_evicted_surfaces = 0, g_evicted_bytes = 0, g_evicted_ahead = 0;
+// Over the caches' budget (BBHOST_CACHE_BUDGET_MB; no reserve applies on an
+// integrated GPU) the same textures go, as much as the video memory we hold
+// is over it and 256 MiB a second at most: the room they leave is what the
+// drain then empties blocks with, which the keeper gives back.
+std::uint64_t g_evicted_surfaces = 0, g_evicted_bytes = 0, g_evicted_ahead = 0, g_evicted_budget = 0;
 
 void evict_cold_surfaces_locked() {
     static const std::uint64_t idle_ms = [] {
         const char* e = std::getenv("BBHOST_VRAM_EVICT_S");
         return (e && *e ? std::strtoull(e, nullptr, 10) : 20ull) * 1000;
     }();
-    if (!idle_ms || !vram_reserve_bytes()) return;
+    if (!idle_ms || (!vram_reserve_bytes() && !cache_budget_bytes())) return;
     static std::uint64_t last_ms = 0;
     const std::uint64_t now = now_ms();
     if (now - last_ms < 1000) return;
     last_ms = now;
     constexpr std::uint64_t kWant = 256ull << 20;
-    if (!vram_within_reserve(kWant)) return;
-    const std::uint64_t free_in_blocks = image_heap_vram_free_locked(kHeapTextures);
-    if (free_in_blocks >= kWant) return;
-    const std::uint64_t target = kWant - free_in_blocks;
+    std::uint64_t target = 0;
+    bool budget = false;
+    if (vram_within_reserve(kWant)) {
+        const std::uint64_t free_in_blocks = image_heap_vram_free_locked(kHeapTextures);
+        if (free_in_blocks >= kWant) return;
+        target = kWant - free_in_blocks;
+    } else if (const std::uint64_t over = cache_budget_excess()) {
+        target = std::min(over, kWant);
+        budget = true;
+    } else {
+        return;
+    }
     struct Cold {
         bool used;  // false: made ahead and never bound - these go first
         std::uint64_t used_ms, base;
@@ -3991,6 +4037,7 @@ void evict_cold_surfaces_locked() {
         freed += sf.memory.size;
         ++n;
         if (!c.used) ++g_evicted_ahead;
+        note_bind_reason_locked(c.base, kBindGone);
         for (auto& v : sf.views) defer_destroy_view(v.second);
         defer_destroy_image(sf.image, sf.memory);
         if (g_last_view_surface == &sf) g_last_view_surface = nullptr;
@@ -4001,10 +4048,12 @@ void evict_cold_surfaces_locked() {
     bump_view_epoch();
     g_evicted_surfaces += n;
     g_evicted_bytes += freed;
+    if (budget) g_evicted_budget += n;
     static int logs = 0;
     if (logs++ < 12)
-        host_log("texture: video memory down to the reserve: %llu textures not bound for %llu s evicted (%llu MiB; %llu so far, %llu MiB, "
+        host_log("texture: %s: %llu textures not bound for %llu s evicted (%llu MiB; %llu so far, %llu MiB, "
                  "%llu of them made ahead and never bound)",
+                 budget ? "the video memory we hold is over the caches' budget" : "video memory down to the reserve",
                  static_cast<unsigned long long>(n), static_cast<unsigned long long>(idle_ms / 1000),
                  static_cast<unsigned long long>(freed >> 20), static_cast<unsigned long long>(g_evicted_surfaces),
                  static_cast<unsigned long long>(g_evicted_bytes >> 20), static_cast<unsigned long long>(g_evicted_ahead));
@@ -4023,7 +4072,10 @@ void evict_cold_surfaces_locked() {
 // back, as any empty one. While the mirrors' live share is refused room
 // (a card with little video memory, where every mirror page the image heap
 // holds idle sends vertex reads across the bus), half a block of free room
-// is enough, a block with up to 192 MiB in use is drained, 32 MiB a turn.
+// is enough, a block with up to 192 MiB in use is drained, 32 MiB a turn -
+// the lean thresholds (host/apu_memory.h), which a lean image heap
+// (BBHOST_HEAP_LEAN) and the video memory we hold over the caches' budget
+// (BBHOST_CACHE_BUDGET_MB) take too.
 std::uint64_t g_drained_blocks = 0, g_drained_surfaces = 0, g_drained_bytes = 0, g_drain_skipped = 0;
 
 void drain_texture_blocks_locked() {
@@ -4040,9 +4092,9 @@ void drain_texture_blocks_locked() {
     const std::uint64_t refusals = shadow_room_refusals_locked();
     const bool pressed = refusals != refusals_seen;
     refusals_seen = refusals;
-    constexpr std::uint64_t kBlock = 256ull << 20, kHotMs = 2000;
-    const std::uint64_t holes_at = pressed ? kBlock / 2 : kBlock * 3 / 2, most_used = pressed ? 192ull << 20 : 128ull << 20,
-                        hot_per_turn = pressed ? 32ull << 20 : 16ull << 20;
+    constexpr std::uint64_t kHotMs = 2000;
+    const apu_memory::DrainLimits lim = apu_memory::drain_limits(pressed || heap_lean_on() || cache_over_budget());
+    const std::uint64_t holes_at = lim.holes_at, most_used = lim.most_used, hot_per_turn = lim.hot_per_turn;
     std::vector<int> skip;
     for (int tries = 0; tries < 4; ++tries) {
         std::uint64_t holes = 0, used = 0;
@@ -4077,6 +4129,7 @@ void drain_texture_blocks_locked() {
             if (recent) hot += sf.memory.size;
             bytes += sf.memory.size;
             ++n;
+            note_bind_reason_locked(base, kBindGone);
             for (auto& v : sf.views) defer_destroy_view(v.second);
             defer_destroy_image(sf.image, sf.memory);
             if (g_last_view_surface == &sf) g_last_view_surface = nullptr;
@@ -5024,6 +5077,15 @@ void textures_report() {
              static_cast<unsigned long long>(g_ahead_bind_before_prep.load()), static_cast<unsigned long long>(g_ahead_replaced.load()),
              static_cast<unsigned long long>(g_retired_surfaces.load()), static_cast<unsigned long long>(g_retired_bytes.load() >> 20),
              static_cast<unsigned long long>(g_retire_kept_live.load()));
+    host_log("texture: made by a bind on the binding thread, none made ahead to find: %llu (%llu MiB) - %llu held back from ahead creation "
+             "(%llu holds: the reserve or the caches' budget), %llu evicted or drained since they were made, %llu the rest%s; evicted over the "
+             "caches' budget %llu",
+             static_cast<unsigned long long>(g_bind_made), static_cast<unsigned long long>(g_bind_made_bytes >> 20),
+             static_cast<unsigned long long>(g_bind_made_held), static_cast<unsigned long long>(g_ahead_held.load()),
+             static_cast<unsigned long long>(g_bind_made_gone),
+             static_cast<unsigned long long>(g_bind_made - g_bind_made_held - g_bind_made_gone),
+             g_bind_reason_cleared ? " (the reasons' map was full and cleared: some counted with the rest)" : "",
+             static_cast<unsigned long long>(g_evicted_budget));
     host_log("texture: identity: binds through a view of another generation than the surface's: surface replaced %llu, kept (the view's "
              "resource is gone) %llu, taken by the new resource it was written for %llu; made ahead over such an image instead taken %llu; uploads "
              "of a GX resource's image not write-watched %llu; checks of a shader-written one not hashed %llu",

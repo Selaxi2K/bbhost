@@ -755,6 +755,17 @@ std::uint64_t vram_reserve_bytes();
 // Whether video memory is down to the reserve (headroom under reserve +
 // `more` bytes); false when the reserve is off.
 bool vram_within_reserve(std::uint64_t more = 0);
+// The caches' budget and the lean image heap (gpu.cpp, host/apu_memory.h),
+// set with the reserve once the device is chosen: the budget in bytes (0:
+// none); whether the video memory we hold, with `more` about to be made, is
+// over it; how far over it is (0 under it); whether the image heap is lean -
+// no spare block in play, the textures' blocks drained at the lean
+// thresholds. Any thread.
+void cache_budget_init();
+std::uint64_t cache_budget_bytes();
+bool cache_over_budget(std::uint64_t more = 0);
+std::uint64_t cache_budget_excess();
+bool heap_lean_on();
 // Textures kept out of the reserve so far (placed in host memory instead).
 std::uint64_t vram_reserve_refusals();
 // Whether what a shortage put in host memory comes back once video memory has

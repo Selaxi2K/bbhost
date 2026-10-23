@@ -96,6 +96,19 @@ fps_cap = 30
 # Deck kit's toml sets true (its shared memory stays under the driver's
 # budget). BBHOST_IMPORT_WINDOWS=0 or 1 overrides this setting.
 # import_windows = false
+# Memory bbhost keeps in play beyond what it draws with, for integrated GPUs
+# (where no video memory reserve trims it) and any GPU you want leaner:
+# - staging_return: the upload staging held from a load on (up to 768 MB) goes
+#   back down to 256 MB in play, 64 MB every two seconds from 30 s after a load.
+# - cache_budget_mb: past this many MB of video memory held, textures are made
+#   when first drawn rather than ahead, unused ones go and the image heap
+#   drains sooner (0: no budget).
+# - heap_lean: the image heap keeps no spare block in play and drains sooner.
+# All off by default; BBHOST_STAGING_RETURN, BBHOST_CACHE_BUDGET_MB and
+# BBHOST_HEAP_LEAN override them.
+# staging_return = false
+# cache_budget_mb = 0
+# heap_lean = false
 
 [startup]
 # Bloodborne 1.09: skip FromSoftware, Japan Studio and SCE logos, and the

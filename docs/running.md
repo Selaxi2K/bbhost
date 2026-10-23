@@ -253,6 +253,23 @@ windows, which a thread of their own imports as the game makes its buffers
 (`BBHOST_SHADOW_IN_PLACE_WINDOWS=0` copies them into the mirrors instead, as
 window imports did before; `BBHOST_IMPORT_PREFETCH_MESHES=0` imports their
 windows at their first draw).
+An integrated GPU keeps no reserve, so nothing trims what bbhost keeps in
+play there: the textures made ahead of their first bind (most are never
+bound), textures not used for a while, free room in the image heap and the
+upload staging held from a load on. Three switches give them back, on any GPU
+and off by default for now:
+- `BBHOST_STAGING_RETURN=1` (or `staging_return = true` under `[gpu]`): the
+  upload staging goes back down to 256 MiB in play, 64 MiB every two seconds
+  from 30 s after a load. The log gives each free's time and flip, and the
+  exit line `given back in play` their total.
+- `BBHOST_CACHE_BUDGET_MB=<n>` (or `cache_budget_mb = <n>` under `[gpu]`): a
+  budget for the video memory bbhost holds. Over it, textures are made at their
+  first bind instead of ahead, those not bound for 20 s go, the textures'
+  blocks drain sooner and empty blocks go back at once. The exit line `made by
+  a bind` counts the textures a bind then had to make itself.
+- `BBHOST_HEAP_LEAN=1` (or `heap_lean = true` under `[gpu]`): the image heap
+  keeps no spare block in play and drains the textures' blocks sooner.
+
 On other GPUs, unless memory is tight or video memory small, the game's own
 immutable vertex and index buffers are bound from copies of their own, made
 in video memory as they are first drawn, so the command processor does not
