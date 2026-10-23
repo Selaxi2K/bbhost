@@ -12906,9 +12906,12 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                 // draw of the submission reads the memory as it stands when the
                 // GPU runs it, so all of them see one state. (Copying again
                 // could only pick up the next frame's values, which the game
-                // may already be writing.) Whole-ring snapshots only - not the
-                // pushed ones (`exact`), each bound where its own copy is; the
-                // copy stays where it is for the rest of the lap (segment_serial).
+                // may already be writing.) A whole-ring binding takes the first
+                // copy's bias, a pushed one (`exact`) the first copy's offset;
+                // the copy stays where it is for the rest of the lap
+                // (segment_serial). Pushed, each binding had copied its own: on
+                // AMD's drivers, which bind at any dword, every snapshot at the
+                // Nightmare of Mensis - ~10,400 copies a frame, 2.7 MiB.
                 // BBHOST_CB_SNAPSHOT_DEDUPE=0: each binding copies its own.
                 // =check: shares as by default, but first compares the copy
                 // with the guest's bytes now and counts those that changed
@@ -12931,7 +12934,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                 // Pushed (`exact`), each draw's ranges go into the command
                 // buffer anyway: the snapshot is bound where it is.
                 const bool whole_ring = !exact && snapshot && g.ssbo_max_range >= kScratch;
-                if (dedupe && whole_ring && scratch.map) {
+                if (dedupe && snapshot && (whole_ring || exact) && scratch.map) {
                     memo = &snap_memo[((base >> 4) ^ (base >> 14)) & 1023];
                     bool share = memo->base == base && memo->serial == g.record_serial && memo->lap == scratch_lap && memo->bytes >= bytes;
                     if (share && dedupe >= kDedupeCheck) {
@@ -12949,10 +12952,11 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                         }
                     }
                     if (share) {
-                        info = VkDescriptorBufferInfo{scratch.buffer, 0, kScratch};
+                        info = whole_ring ? VkDescriptorBufferInfo{scratch.buffer, 0, kScratch} : VkDescriptorBufferInfo{scratch.buffer, memo->at, bytes};
                         params.cb_valid |= 1u << i;
-                        params.cb_bias_dw[i] = static_cast<std::uint32_t>(memo->at / 4);
+                        params.cb_bias_dw[i] = whole_ring ? static_cast<std::uint32_t>(memo->at / 4) : 0;
                         outcome = kBound;
+                        if (!whole_ring) note_copy_binding_locked(info, base);
                         if (host_tooling()) bump(g_cb_snapshots_shared);
                     }
                 }
@@ -13001,8 +13005,10 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                     params.cb_valid |= 1u << i;
                     params.cb_bias_dw[i] = whole ? static_cast<std::uint32_t>(at / 4) : 0;
                     outcome = kBound;
-                    // The guest bytes, unless a copy-back's copy laid over them.
-                    if (!whole && version == kCopyVersionNone && copy_version_lookup_locked(base, bytes, nullptr) == kCopyVersionNone)
+                    // The guest bytes, unless a copy-back's copy laid over them
+                    // (never a snapshot's: its range has no copy version, as
+                    // the lookup before it said).
+                    if (!whole && version == kCopyVersionNone && (snapshot || copy_version_lookup_locked(base, bytes, nullptr) == kCopyVersionNone))
                         note_copy_binding_locked(info, base);
                     // Not locked adds (bump): one right after the copy waited for
                     // its writes to the ring - write-combined memory - to drain,
