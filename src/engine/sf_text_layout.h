@@ -81,6 +81,7 @@ constexpr std::uint64_t kTableData = 0x28;      // SnapshotPage: the entries' da
 constexpr std::uint64_t kSnapshotContext = 0x10;  // Snapshot: its Context
 constexpr std::uint64_t kSnapshotPropagate = 0x40;  // Snapshot: its propagate list's head (next, prev)
 constexpr std::uint64_t kEntryPropagate = 0x28;     // Entry: its link in that list (next, prev)
+constexpr std::uint64_t kContextActive = 0xd0;      // Context: the snapshot being built
 constexpr std::uint64_t kContextCaptured = 0xd8;    // Context: the snapshot the capture just published
 constexpr std::uint64_t kMovieContext = 0x5350;     // MovieImpl: its Context
 
@@ -199,6 +200,58 @@ bool mark_for_update(std::uint64_t node, std::uint32_t flags, Readable readable)
     }
     wr32(node + kNodeFlags, f | flags | kNodePending);
     return true;
+}
+
+// Whether `link` is an entry's propagate link on a page whose snapshot being
+// built is `snap`: +0x28 of an entry slot of such a page.
+template <typename Readable>
+bool is_entry_link(std::uint64_t link, std::uint64_t snap, Readable readable) {
+    const std::uint64_t entry = link - kEntryPropagate;
+    const std::uint64_t page = entry & kPageMask;
+    if (entry < page + kPageEntries || (entry - (page + kPageEntries)) % kEntrySize != 0 ||
+        (entry - (page + kPageEntries)) / kEntrySize >= kEntriesPerPage)
+        return false;
+    return readable(page, kPageEntries) && rd(page + kPageSnapshot) == snap && readable(link, 16);
+}
+
+// An entry left on a propagate list that nothing drains any more - a list a
+// capture published after its propagate pass had run - is put back, with
+// every other entry on that list, on the list of the snapshot being built
+// (`snap`), linked as addToPropagate (0x482a40) links one. The old list's
+// head is neither read nor written: its snapshot may be gone. Returns how
+// many entries were moved; 0 when the entry is on the live list or on none,
+// or its list does not walk back to one head both ways (left as it is).
+template <typename Readable>
+int restrand(std::uint64_t entry, std::uint64_t snap, Readable readable) {
+    constexpr int kMax = 64;
+    const std::uint64_t link = entry + kEntryPropagate;
+    if (!snap || !readable(link, 16) || !readable(snap + kSnapshotPropagate, 16)) return 0;
+    const std::uint64_t live = snap + kSnapshotPropagate;
+    if (rd(link) == 0) return 0;  // on no list
+    std::uint64_t members[2 * kMax + 1];
+    int n = 0;
+    members[n++] = link;
+    std::uint64_t ends[2] = {0, 0};
+    for (int dir = 0; dir < 2; ++dir) {
+        std::uint64_t x = rd(link + 8 * dir);
+        for (int steps = 0;; ++steps) {
+            if (x == live) return 0;  // on the live list: the next pass has it
+            if (!is_entry_link(x, snap, readable)) break;
+            if (x == link || steps == kMax) return 0;  // a loop without a head
+            members[n++] = x;
+            x = rd(x + 8 * dir);
+        }
+        ends[dir] = x;
+    }
+    if (ends[0] != ends[1]) return 0;
+    for (int i = 0; i < n; ++i) {
+        const std::uint64_t m = members[i], first = rd(live);
+        wr(m, first);
+        wr(m + 8, live);
+        wr(first + 8, m);
+        wr(live, m);
+    }
+    return n;
 }
 
 }  // namespace sf_text_layout

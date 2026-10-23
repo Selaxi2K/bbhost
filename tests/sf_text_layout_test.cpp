@@ -274,6 +274,99 @@ void test_layout_arrives() {
     CHECK(!again.skipped && game_read(node, again.flags) == layout + 0x1c);
 }
 
+// A snapshot's propagate list head (next, prev at +0x40), empty.
+void list_init(std::uint64_t snap) {
+    wr(snap + kSnapshotPropagate, snap + kSnapshotPropagate);
+    wr(snap + kSnapshotPropagate + 8, snap + kSnapshotPropagate);
+}
+// addToPropagate's link (0x482a40): at the front of the snapshot's list.
+void list_add(std::uint64_t snap, std::uint64_t entry) {
+    const std::uint64_t head = snap + kSnapshotPropagate, link = entry + kEntryPropagate, first = rd(head);
+    wr(link, first);
+    wr(link + 8, head);
+    wr(first + 8, link);
+    wr(head, link);
+}
+// The entries on a snapshot's list in order, and whether every link is consistent.
+std::vector<std::uint64_t> list_members(std::uint64_t snap, bool* consistent) {
+    std::vector<std::uint64_t> out;
+    const std::uint64_t head = snap + kSnapshotPropagate;
+    std::uint64_t prev = head;
+    *consistent = true;
+    for (std::uint64_t n = rd(head); n != head && out.size() < 64; n = rd(n)) {
+        if (rd(n + 8) != prev) *consistent = false;
+        out.push_back(n - kEntryPropagate);
+        prev = n;
+    }
+    if (rd(head + 8) != prev) *consistent = false;
+    return out;
+}
+
+// A capture published with entries listed after its pass: they are on the
+// published snapshot's list, which nothing drains. restrand moves them, and
+// only them, to the live list without touching the old head.
+void test_restrand() {
+    Page p = make_page();
+    const std::uint64_t live = p.snapshot;  // the snapshot being built: the pages name it
+    const std::uint64_t dead = alloc(0xa0);
+    list_init(live);
+    list_init(dead);
+    const std::uint64_t a = p.entry(30), b = p.entry(31), c = p.entry(32), d = p.entry(33);
+    // One stranded alone, and a live list with one entry on it already.
+    list_add(dead, a);
+    list_add(live, d);
+    std::uint8_t head_before[16];
+    std::memcpy(head_before, reinterpret_cast<void*>(dead + kSnapshotPropagate), 16);
+    CHECK(restrand(a, live, kReadable) == 1);
+    bool ok = false;
+    auto m = list_members(live, &ok);
+    CHECK(ok && m.size() == 2 && m[0] == a && m[1] == d);
+    CHECK(std::memcmp(head_before, reinterpret_cast<void*>(dead + kSnapshotPropagate), 16) == 0);
+    // On the live list now: left alone.
+    CHECK(restrand(a, live, kReadable) == 0);
+    m = list_members(live, &ok);
+    CHECK(ok && m.size() == 2);
+    // Two stranded together, found from either: both move.
+    const std::uint64_t dead2 = alloc(0xa0);
+    list_init(dead2);
+    list_add(dead2, b);
+    list_add(dead2, c);  // dead2: c, b
+    CHECK(restrand(b, live, kReadable) == 2);
+    m = list_members(live, &ok);
+    CHECK(ok && m.size() == 4);
+    bool has_b = false, has_c = false;
+    for (const std::uint64_t e : m) {
+        has_b = has_b || e == b;
+        has_c = has_c || e == c;
+    }
+    CHECK(has_b && has_c);
+    // On no list: nothing.
+    const std::uint64_t e = p.entry(34);
+    CHECK(restrand(e, live, kReadable) == 0 && rd(e + kEntryPropagate) == 0);
+    // Ends that are not one head, or a loop with no head: left as they are.
+    const std::uint64_t f = p.entry(35), g = p.entry(36);
+    const std::uint64_t h1 = alloc(0x50), h2 = alloc(0x50);
+    wr(f + kEntryPropagate, h1 + kSnapshotPropagate);
+    wr(f + kEntryPropagate + 8, h2 + kSnapshotPropagate);
+    CHECK(restrand(f, live, kReadable) == 0);
+    CHECK(rd(f + kEntryPropagate) == h1 + kSnapshotPropagate);
+    wr(f + kEntryPropagate, g + kEntryPropagate);
+    wr(f + kEntryPropagate + 8, g + kEntryPropagate);
+    wr(g + kEntryPropagate, f + kEntryPropagate);
+    wr(g + kEntryPropagate + 8, f + kEntryPropagate);
+    CHECK(restrand(f, live, kReadable) == 0);
+    m = list_members(live, &ok);
+    CHECK(ok && m.size() == 4);
+    // An entry on another context's page (its pages name another snapshot)
+    // ends the walk like a head: the list is left alone.
+    Page q = make_page();
+    const std::uint64_t dead3 = alloc(0xa0);
+    list_init(dead3);
+    list_add(dead3, q.entry(0));
+    list_add(dead3, p.entry(40));
+    CHECK(restrand(p.entry(40), live, kReadable) == 0);
+}
+
 }  // namespace
 
 int main() {
@@ -283,6 +376,7 @@ int main() {
     test_left_alone();
     test_mark_for_update();
     test_layout_arrives();
+    test_restrand();
     if (g_failed) {
         std::printf("sf_text_layout_test: %d failure(s)\n", g_failed);
         return 1;

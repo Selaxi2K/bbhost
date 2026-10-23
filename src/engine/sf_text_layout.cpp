@@ -154,6 +154,63 @@ bool take_waiting(std::uint64_t node) {
     return false;
 }
 
+// The entries of texts the guard met without a layout, by context, for the
+// next capture of that context to check: one a capture published after its
+// propagate pass is on a list nothing drains, and stays without a layout for
+// good (an addToPropagate skips an entry already linked), unless it is put
+// back on the live list (restrand). Checked and repaired on the movie's
+// Advance thread, before its propagate pass.
+constexpr int kSuspects = 32;
+std::mutex g_suspects_mu;
+std::uint64_t g_suspect_entry[kSuspects], g_suspect_ctx[kSuspects];  // under g_suspects_mu
+std::atomic<int> g_suspects_n{0};
+std::atomic<std::uint64_t> g_restranded{0}, g_restrand_entries{0};
+
+void suspect(std::uint64_t entry, std::uint64_t ctx) {
+    if (!entry || !ctx) return;
+    std::lock_guard<std::mutex> lk(g_suspects_mu);
+    int free_slot = -1;
+    for (int i = 0; i < kSuspects; ++i) {
+        if (g_suspect_entry[i] == entry) return;
+        if (!g_suspect_entry[i] && free_slot < 0) free_slot = i;
+    }
+    if (free_slot < 0) return;  // full: the guard still keeps the game up
+    g_suspect_entry[free_slot] = entry;
+    g_suspect_ctx[free_slot] = ctx;
+    g_suspects_n.fetch_add(1, std::memory_order_relaxed);
+}
+
+// At the start of a capture of `ctx`, on its Advance thread.
+void repair_suspects(std::uint64_t ctx) {
+    if (g_suspects_n.load(std::memory_order_relaxed) == 0) return;
+    std::uint64_t mine[kSuspects];
+    int n = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_suspects_mu);
+        for (int i = 0; i < kSuspects; ++i) {
+            if (g_suspect_entry[i] && g_suspect_ctx[i] == ctx) {
+                mine[n++] = g_suspect_entry[i];
+                g_suspect_entry[i] = g_suspect_ctx[i] = 0;
+                g_suspects_n.fetch_sub(1, std::memory_order_relaxed);
+            }
+        }
+    }
+    if (!n || !readable(ctx + kContextActive, 8)) return;
+    const std::uint64_t snap = rd(ctx + kContextActive);
+    for (int i = 0; i < n; ++i) {
+        const int moved = restrand(mine[i], snap, readable);
+        if (moved <= 0) continue;
+        const std::uint64_t k = g_restranded.fetch_add(1, std::memory_order_relaxed) + 1;
+        g_restrand_entries.fetch_add(static_cast<std::uint64_t>(moved), std::memory_order_relaxed);
+        if (log_this(k)) {
+            host_log("sf text: entry %llx was on a propagate list nothing drains (published after its capture's pass) - "
+                     "it and %d other entr%s put back on the live list, so this capture lays the text out (%llu so far)",
+                     static_cast<unsigned long long>(mine[i]), moved - 1, moved == 2 ? "y" : "ies",
+                     static_cast<unsigned long long>(k));
+        }
+    }
+}
+
 GUEST_ABI std::int64_t update_transform_hook(std::uint64_t, std::uint64_t* saved) {
     const std::uint64_t node = saved[5];  // rdi
     const std::uint32_t flags = static_cast<std::uint32_t>(saved[1]);  // r8d
@@ -161,6 +218,10 @@ GUEST_ABI std::int64_t update_transform_hook(std::uint64_t, std::uint64_t* saved
     if (!d.skipped) return 0;
     saved[1] = (saved[1] & ~std::uint64_t{0xffffffff}) | d.flags;
     wait_for_layout(node);
+    {
+        const std::uint64_t entry = rd(node + kNodeEntry);
+        suspect(entry, entry_context(entry, readable));
+    }
     const std::uint64_t n = g_skipped.fetch_add(1, std::memory_order_relaxed) + 1;
     if (log_this(n)) {
         const std::uint64_t entry = rd(node + kNodeEntry);
@@ -256,9 +317,13 @@ GUEST_ABI std::int64_t display_job_hook(std::uint64_t, std::uint64_t* saved) {
 // The capture's window, from its propagate pass to its unlock.
 thread_local Wrapper* t_capturing = nullptr;
 GUEST_ABI std::int64_t capture_begin_hook(std::uint64_t, std::uint64_t* saved) {
-    Wrapper* e = find_movie(saved[5] - kMovieContext);  // rdi: the context
-    if (e) e->capturing.store(gsync::current_thread(), std::memory_order_release);
-    t_capturing = e;
+    const std::uint64_t ctx = saved[5];  // rdi: the context
+    if (g_guard) repair_suspects(ctx);
+    if (g_check) {
+        Wrapper* e = find_movie(ctx - kMovieContext);
+        if (e) e->capturing.store(gsync::current_thread(), std::memory_order_release);
+        t_capturing = e;
+    }
     return 0;  // on to the propagate pass
 }
 
@@ -432,6 +497,10 @@ void sf_text_layout_install(ElfImage* image) {
         ok = hook(image, kHandleChanges, kHandleChangesPrologue, sizeof(kHandleChangesPrologue),
                   reinterpret_cast<void*>(&handle_changes_hook), "TreeCacheText::HandleChanges") && ok;
     }
+    if (g_guard || g_check) {
+        ok = call_hook(image, kCapturePropagateCall, kPropagate, reinterpret_cast<void*>(&capture_begin_hook),
+                       "Context::Capture's propagate pass") && ok;
+    }
     if (g_check) {
         ok = hook(image, kAdvanceJob, kAdvanceJobPrologue, sizeof(kAdvanceJobPrologue),
                   reinterpret_cast<void*>(&advance_job_hook), "the movie's Advance job") && ok;
@@ -443,8 +512,6 @@ void sf_text_layout_install(ElfImage* image) {
                   reinterpret_cast<void*>(&create_entry_hook), "Context::CreateEntry") && ok;
         ok = hook(image, kAddToPropagate, kAddToPropagatePrologue, sizeof(kAddToPropagatePrologue),
                   reinterpret_cast<void*>(&add_to_propagate_hook), "Entry addToPropagate") && ok;
-        ok = call_hook(image, kCapturePropagateCall, kPropagate, reinterpret_cast<void*>(&capture_begin_hook),
-                       "Context::Capture's propagate pass") && ok;
         ok = call_hook(image, kCaptureUnlockCall, kPthreadMutexUnlockStub, reinterpret_cast<void*>(&capture_end_hook),
                        "Context::Capture's unlock") && ok;
     }
@@ -470,6 +537,9 @@ void sf_text_layout_report() {
                  "%llu not marked, %d still waiting",
                  static_cast<unsigned long long>(g_skipped.load()), static_cast<unsigned long long>(g_marked.load()),
                  static_cast<unsigned long long>(g_unmarked.load()), g_waiting_n.load());
+        host_log("sf text: %llu time(s) a text's entry was found on a propagate list nothing drains and put back on the "
+                 "live one, with %llu entries in all",
+                 static_cast<unsigned long long>(g_restranded.load()), static_cast<unsigned long long>(g_restrand_entries.load()));
     }
     if (g_capture_us) {
         host_log("sf text: %llu capture(s) waited %llu us after their propagate pass",
