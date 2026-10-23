@@ -262,8 +262,45 @@ GUEST_ABI std::int64_t capture_begin_hook(std::uint64_t, std::uint64_t* saved) {
     return 0;  // on to the propagate pass
 }
 
+// A snapshot published with entries on its propagate list - listed after its
+// propagate pass ran, so never propagated - and those entries' first data.
+std::atomic<std::uint64_t> g_stranded_captures{0}, g_stranded_entries{0}, g_stranded_texts{0};
+void check_stranded(std::uint64_t ctx) {
+    if (!readable(ctx + kContextCaptured, 8)) return;
+    const std::uint64_t snap = rd(ctx + kContextCaptured);
+    if (!snap || !readable(snap + kSnapshotPropagate, 16)) return;
+    const std::uint64_t head = snap + kSnapshotPropagate;
+    std::uint64_t node = rd(head);
+    if (node == head || node == 0) return;
+    std::uint64_t entries = 0, texts = 0, first = 0;
+    for (int i = 0; i < 64 && node && node != head && readable(node, 16); ++i, node = rd(node)) {
+        const std::uint64_t entry = node - kEntryPropagate;
+        const std::uint64_t data = entry_data(entry, kPageActive, readable);
+        ++entries;
+        if (data && readable(data, 8) && rd(data) == va(kTextDataVtable)) {
+            ++texts;
+            if (!first) first = entry;
+        }
+    }
+    const std::uint64_t n = g_stranded_captures.fetch_add(1, std::memory_order_relaxed) + 1;
+    g_stranded_entries.fetch_add(entries, std::memory_order_relaxed);
+    g_stranded_texts.fetch_add(texts, std::memory_order_relaxed);
+    if (log_this(n)) {
+        char tn[32];
+        thread_name(tn, sizeof(tn));
+        host_log("sf text: a capture published with %llu entr%s still on its propagate list (%llu a text's%s%llx) - "
+                 "listed after its propagate pass, never propagated; movie %llx, on %s (%llu such captures so far)",
+                 static_cast<unsigned long long>(entries), entries == 1 ? "y" : "ies", static_cast<unsigned long long>(texts),
+                 texts ? ", the first " : "", static_cast<unsigned long long>(first),
+                 static_cast<unsigned long long>(ctx - kMovieContext), tn, static_cast<unsigned long long>(n));
+    }
+}
+
 GUEST_ABI std::int64_t capture_end_hook(std::uint64_t, std::uint64_t*) {
-    if (t_capturing) t_capturing->capturing.store(nullptr, std::memory_order_release);
+    if (t_capturing) {
+        t_capturing->capturing.store(nullptr, std::memory_order_release);
+        check_stranded(t_capturing->movie.load(std::memory_order_relaxed) + kMovieContext);
+    }
     t_capturing = nullptr;
     return 0;  // on to pthread_mutex_unlock
 }
@@ -439,6 +476,10 @@ void sf_text_layout_report() {
                  static_cast<unsigned long long>(g_capture_sleeps.load()), static_cast<unsigned long long>(g_capture_us));
     }
     if (!g_check) return;
+    host_log("sf text: %llu capture(s) published entries still on their propagate list: %llu entries, %llu of them texts",
+             static_cast<unsigned long long>(g_stranded_captures.load()),
+             static_cast<unsigned long long>(g_stranded_entries.load()),
+             static_cast<unsigned long long>(g_stranded_texts.load()));
     for (int c = 0; c < kClasses; ++c) {
         host_log("sf text: render-tree changes %s: %llu", kClassText[c], static_cast<unsigned long long>(g_class[c].load()));
     }

@@ -79,7 +79,10 @@ constexpr std::uint64_t kEntrySize = 56;
 constexpr std::uint64_t kEntriesPerPage = 72;
 constexpr std::uint64_t kTableData = 0x28;      // SnapshotPage: the entries' data pointers, bit 0 a tag
 constexpr std::uint64_t kSnapshotContext = 0x10;  // Snapshot: its Context
-constexpr std::uint64_t kMovieContext = 0x5350;   // MovieImpl: its Context
+constexpr std::uint64_t kSnapshotPropagate = 0x40;  // Snapshot: its propagate list's head (next, prev)
+constexpr std::uint64_t kEntryPropagate = 0x28;     // Entry: its link in that list (next, prev)
+constexpr std::uint64_t kContextCaptured = 0xd8;    // Context: the snapshot the capture just published
+constexpr std::uint64_t kMovieContext = 0x5350;     // MovieImpl: its Context
 
 // TreeText::NodeData.
 constexpr std::uint64_t kTextDocView = 0x90;
