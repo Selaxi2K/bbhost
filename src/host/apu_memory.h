@@ -18,10 +18,16 @@
 
 namespace apu_memory {
 
-// The defaults on an integrated GPU under Windows, once each part has been
-// shown to cost no frame there. Off until then: every part is the
-// environment's or the config's to turn on.
-constexpr bool kWindowsApuDefaults = false;
+// The defaults on an integrated GPU under Windows: all three parts. On a
+// Radeon 680M (AMD's Windows driver, 960x540, 60 fps) each cost no frame:
+// - a 64 MiB staging chunk's vkFreeMemory took 0.4-3.7 ms (mean 1.1; 22-29 ms
+//   on NVIDIA's Linux driver, which is why a discrete GPU keeps its staging);
+// - the frames in the frees' half minute, the load times and the textures a
+//   bind made stayed within the default's own spread;
+// - Task Manager's shared GPU memory at the world went 5,880 -> 5,452 MiB
+//   (staging back) and 5,880 -> 5,628-5,724 (the budget and the lean heap).
+// Elsewhere every part is the environment's or the config's to turn on.
+constexpr bool kWindowsApuDefaults = true;
 
 // An integrated GPU under Windows (`integrated`: 1 yes, 0 no, -1 not chosen yet).
 inline bool windows_apu(int integrated, bool windows_host) { return integrated == 1 && windows_host; }

@@ -104,7 +104,8 @@ fps_cap = 30
 #   when first drawn rather than ahead, unused ones go and the image heap
 #   drains sooner (0: no budget).
 # - heap_lean: the image heap keeps no spare block in play and drains sooner.
-# All off by default; BBHOST_STAGING_RETURN, BBHOST_CACHE_BUDGET_MB and
+# All three on by default on an integrated GPU under Windows (a 2048 MB budget
+# there), off elsewhere; BBHOST_STAGING_RETURN, BBHOST_CACHE_BUDGET_MB and
 # BBHOST_HEAP_LEAN override them.
 # staging_return = false
 # cache_budget_mb = 0

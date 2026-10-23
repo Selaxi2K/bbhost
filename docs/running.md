@@ -256,8 +256,9 @@ windows at their first draw).
 An integrated GPU keeps no reserve, so nothing trims what bbhost keeps in
 play there: the textures made ahead of their first bind (most are never
 bound), textures not used for a while, free room in the image heap and the
-upload staging held from a load on. Three switches give them back, on any GPU
-and off by default for now:
+upload staging held from a load on. Three switches give them back, on any GPU;
+all three are on by default on an integrated GPU under Windows (a 2048 MiB
+budget there) and off elsewhere:
 - `BBHOST_STAGING_RETURN=1` (or `staging_return = true` under `[gpu]`): the
   upload staging goes back down to 256 MiB in play, 64 MiB every two seconds
   from 30 s after a load. The log gives each free's time and flip, and the
