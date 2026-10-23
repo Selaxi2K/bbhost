@@ -118,6 +118,7 @@ bool g_idle = false;       // under g_mu: the thread waits for a batch (only the
 std::atomic<std::uint64_t> g_landed{0};
 std::atomic<std::uint64_t> g_landing{0};  // landing(): raised before the writes are stored
 std::atomic<bool> g_started{false};
+std::atomic<void (*)(std::uint64_t)> g_before_land{nullptr};  // set_before_land
 bool g_on_thread = false;  // under g_mu: the thread is landing (for the counts)
 
 // Counts, under g_mu unless atomic.
@@ -162,6 +163,7 @@ void store(const Entry& w) {
 
 // Lands every batch of a submission before `completed`, in order.
 void land_locked(std::uint64_t completed) {
+    if (auto* f = g_before_land.load(std::memory_order_acquire); f && completed > g_landed.load(std::memory_order_relaxed)) f(completed);
     bool any = false;
     const std::uint64_t t = g_batches.empty() ? 0 : now_ns();
     if (completed > g_landing.load(std::memory_order_relaxed)) g_landing.store(completed, std::memory_order_release);
@@ -222,6 +224,7 @@ void thread_main() {
 }  // namespace
 
 bool on() { return g_on; }
+void set_before_land(void (*f)(std::uint64_t completed)) { g_before_land.store(f, std::memory_order_release); }
 
 void start(const Hooks& hooks) {
     if (g_started.exchange(true)) return;

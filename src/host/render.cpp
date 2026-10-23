@@ -10,6 +10,7 @@
 #include "engine/loading.h"
 #include "host/clip_control.h"
 #include "host/gpu_internal.h"
+#include "host/label_landing.h"
 #include "host/lvp_split.h"
 #include "host/masked_blend.h"
 #include "host/shader_bundles.h"
@@ -974,6 +975,8 @@ struct VbWatch {
     bool loading;            // recorded under a loading screen
     std::uint64_t holder;    // the GX buffer the draw bound it by (0: not known)
     std::uint64_t behind;    // submissions the GPU had still to finish when it was recorded
+    bool land_checked;       // hashed again just before its submission's labels landed (vb_race_before_land)
+    bool land_changed;       // and changed then
 };
 const int g_vb_race_level = [] {
     const char* e = std::getenv("BBHOST_VB_RACE");
@@ -992,6 +995,10 @@ std::uint64_t g_vb_class_checked[2][kPlaceClasses] = {}, g_vb_class_changed[2][k
 std::uint64_t g_vb_why_checked[kLocWhys] = {}, g_vb_why_changed[kLocWhys] = {};
 // And the changes by GX's hand-outs over them (shadow_hand_kinds_locked's bits), and under a loading screen.
 std::uint64_t g_vb_hands_changed[32] = {}, g_vb_loading_changed = 0, g_vb_loading_checked = 0;
+// Changes found after the draw's own labels were in memory (label_landing): GX
+// hands memory out again once a label behind its last use has landed, so such
+// a change may be a rightful reuse the check came too late to tell from a race.
+std::uint64_t g_vb_changed_late = 0;
 const char* const kLocWhyName[kLocWhys] = {"not asked", "a twin", "no mirror", "in place (told)", "across windows", "a mirror",
                                            "host memory", "no room", "no window", "no import", "a GPU write pending", "no copy"};
 // =2: the mirror pages (64 KiB, by guest address; a range by its first 256) a
@@ -1005,7 +1012,12 @@ void vb_mirror_pages_note(std::unordered_set<std::uint64_t>& set, std::uint64_t 
     const std::uint64_t p0 = va >> 16, p1 = (va + bytes - 1) >> 16;
     for (std::uint64_t p = p0; p <= p1 && p < p0 + 256; ++p) set.insert(p);
 }
+// The ranges watched, in submission order. Under g_vb_mu as well as g.mu: the
+// label landing looks at them too (vb_race_before_land), from whichever
+// thread lands. g_vb_popped and g_vb_land_at count entries from the first.
 std::deque<VbWatch> g_vb_watch;
+std::mutex g_vb_mu;
+std::uint64_t g_vb_popped = 0, g_vb_land_at = 0, g_vb_land_checked = 0;
 std::uint64_t g_vb_checked = 0, g_vb_changed = 0, g_vb_changed_bytes = 0;
 std::uint64_t g_vb_gpu_written = 0;  // changed by a GPU write recorded with or after the draw: not a race
 std::map<std::string, std::uint64_t> g_vb_changed_by_pipeline;
@@ -1094,6 +1106,24 @@ bool draw_last_vertex(std::int64_t& last) {
     return true;
 }
 
+// Before the labels of every submission before `completed` land - before GX
+// can be told those submissions have run and hand their memory out again -
+// each of their watched ranges is hashed again: a change then is the game
+// writing over bytes a queued draw read, never a rightful reuse the
+// command processor's own check, later, cannot tell from one.
+void vb_race_before_land(std::uint64_t completed) {
+    std::lock_guard<std::mutex> lk(g_vb_mu);
+    if (g_vb_land_at < g_vb_popped) g_vb_land_at = g_vb_popped;
+    while (g_vb_land_at < g_vb_popped + g_vb_watch.size()) {
+        VbWatch& w = g_vb_watch[static_cast<std::size_t>(g_vb_land_at - g_vb_popped)];
+        if (w.serial >= completed) break;
+        w.land_checked = true;
+        w.land_changed =
+            hle_kernel_va_mapped(w.va, w.bytes) && (w.mirrored ? vb_race_hash_ends(w.va, w.bytes) : vb_race_hash(w.va, w.bytes)) != w.hash;
+        ++g_vb_land_at;
+    }
+}
+
 bool vb_race_on() { return g_vb_race; }
 bool vb_race_mirrored_on() { return g_vb_race_level >= 2; }
 // =3: the census of every record and index range a mirror serves.
@@ -1101,15 +1131,25 @@ bool vb_race_wide_on() { return g_vb_race_level == 3; }
 
 void vb_race_note_locked(const char* name, std::uint64_t va, std::uint64_t bytes, bool mirrored, std::uint8_t why, std::uint64_t holder) {
     if (!g_vb_race) return;
+    static const bool hooked = [] {
+        if (label_landing::on()) label_landing::set_before_land(&vb_race_before_land);
+        return true;
+    }();
+    (void)hooked;
     // Checked as soon as the timeline says their submission ran, not when its
     // slot comes round again (16 submissions on), by when the game may have
     // rewritten a ring the GPU was long done with.
-    if (!g_vb_watch.empty()) {
+    std::size_t watched = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_vb_mu);
+        watched = g_vb_watch.size();
+    }
+    if (watched) {
         std::uint64_t done = 0;
         if (g.timeline && vkGetSemaphoreCounterValue(g.device, g.timeline, &done) == VK_SUCCESS && done)
             vb_race_retired_locked(done - 1);
     }
-    if (!bytes || bytes > (16u << 20) || g_vb_watch.size() > (1u << 20) || !hle_kernel_va_mapped(va, bytes)) return;
+    if (!bytes || bytes > (16u << 20) || watched > (1u << 20) || !hle_kernel_va_mapped(va, bytes)) return;
     // Once a submission: a mesh's records are read by many of its draws.
     static std::uint64_t seen_key[4096], seen_serial[4096];
     const std::uint64_t key = va ^ (bytes << 40);
@@ -1132,6 +1172,7 @@ void vb_race_note_locked(const char* name, std::uint64_t va, std::uint64_t bytes
     std::memcpy(w.head, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va)), std::min<std::uint64_t>(bytes, sizeof(w.head)));
     w.flip = hle_video_flip_count();
     std::snprintf(w.name, sizeof(w.name), "%s", name);
+    std::lock_guard<std::mutex> lk(g_vb_mu);
     g_vb_watch.push_back(w);
 }
 
@@ -1168,9 +1209,12 @@ void vb_race_class_report() {
             hands += k ? b : " none" + std::string(std::strchr(b, ':'));
         }
         host_log("vb race: read in place, changed/checked by why the mirrors left them there:%s; the changes by GX's hand-outs over them "
-                 "(M Map's renamed copies, P the pool, R the ring, Y YEBIS, +out a copy outstanding):%s; under a loading screen %llu/%llu",
+                 "(M Map's renamed copies, P the pool, R the ring, Y YEBIS, +out a copy outstanding):%s; under a loading screen %llu/%llu; "
+                 "found after the draw's labels had landed (a rightful reuse the check may have come too late for) %llu; ranges hashed "
+                 "again as their labels landed %llu of %llu",
                  why.c_str(), hands.c_str(), static_cast<unsigned long long>(g_vb_loading_changed),
-                 static_cast<unsigned long long>(g_vb_loading_checked));
+                 static_cast<unsigned long long>(g_vb_loading_checked), static_cast<unsigned long long>(g_vb_changed_late),
+                 static_cast<unsigned long long>(g_vb_land_checked), static_cast<unsigned long long>(g_vb_checked));
     }
     if (!g_vb_mirror_pages_read.empty())
         host_log("vb race: mirror pages (64 KiB) draws read from a mirror %zu, of them changed while such a draw was queued %zu (the changed "
@@ -1189,11 +1233,22 @@ void vb_race_exit_report_locked() {
 
 void vb_race_retired_locked(std::uint64_t serial) {
     if (!g_vb_race) return;
-    while (!g_vb_watch.empty() && g_vb_watch.front().serial <= serial) {
-        const VbWatch& w = g_vb_watch.front();
+    for (;;) {
+        VbWatch w;
+        {
+            std::lock_guard<std::mutex> lk(g_vb_mu);
+            if (g_vb_watch.empty() || g_vb_watch.front().serial > serial) break;
+            w = g_vb_watch.front();
+            g_vb_watch.pop_front();
+            ++g_vb_popped;
+        }
         ++g_vb_checked;
-        const bool changed =
-            hle_kernel_va_mapped(w.va, w.bytes) && (w.mirrored ? vb_race_hash_ends(w.va, w.bytes) : vb_race_hash(w.va, w.bytes)) != w.hash;
+        if (w.land_checked) ++g_vb_land_checked;
+        // As its labels landed when the landing looked; else hashed now, and
+        // then too late to tell when the draw's labels have landed meanwhile.
+        const bool changed = w.land_checked ? w.land_changed
+                                            : hle_kernel_va_mapped(w.va, w.bytes) &&
+                                                  (w.mirrored ? vb_race_hash_ends(w.va, w.bytes) : vb_race_hash(w.va, w.bytes)) != w.hash;
         ++g_vb_class_checked[w.mirrored][w.cls < kPlaceClasses ? w.cls : 0];
         if (w.mirrored) vb_mirror_pages_note(g_vb_mirror_pages_read, w.va, w.bytes);
         if (!w.mirrored) {
@@ -1218,6 +1273,8 @@ void vb_race_retired_locked(std::uint64_t serial) {
             ++g_vb_why_changed[w.why];
             ++g_vb_hands_changed[w.hands & 31];
             if (w.loading) ++g_vb_loading_changed;
+            const bool late = !w.land_checked && label_landing::on() && label_landing::landed() > w.serial;
+            if (late) ++g_vb_changed_late;
             if (g_vb_race_log_all && g_vb_changed <= 20000) {
                 // One line a change: what it was, how far behind the GPU ran,
                 // what the shadow made of its pages and the GX buffer it is.
@@ -1230,12 +1287,13 @@ void vb_race_retired_locked(std::uint64_t serial) {
                                   static_cast<unsigned long long>(gi.memory), static_cast<unsigned long long>(gi.created_flip));
                 else if (w.holder)
                     std::snprintf(buf, sizeof(buf), "holder 0x%llx not in the registry", static_cast<unsigned long long>(w.holder));
-                host_log("vb race: changed %s 0x%llx +%llu, flip %llu -> %llu, submission %llu (%llu on, the GPU %llu behind when recorded)%s; "
+                host_log("vb race: changed %s 0x%llx +%llu, flip %llu -> %llu, submission %llu (%llu on, the GPU %llu behind when recorded)%s%s; "
                          "%s, %s, hand-outs %s%s%s%s%s%s; %s",
                          w.name, static_cast<unsigned long long>(w.va), static_cast<unsigned long long>(w.bytes),
                          static_cast<unsigned long long>(w.flip), static_cast<unsigned long long>(hle_video_flip_count()),
                          static_cast<unsigned long long>(w.serial), static_cast<unsigned long long>(g.flushes - w.serial),
-                         static_cast<unsigned long long>(w.behind), w.loading ? ", loading" : "", kClass[w.cls < kPlaceClasses ? w.cls : 0],
+                         static_cast<unsigned long long>(w.behind), w.loading ? ", loading" : "", late ? ", its labels landed before the check" : "",
+                         kClass[w.cls < kPlaceClasses ? w.cls : 0],
                          kLocWhyName[w.why], w.hands ? "" : "none", w.hands & 1 ? "M" : "", w.hands & 2 ? "P" : "", w.hands & 4 ? "R" : "",
                          w.hands & 8 ? "Y" : "", w.hands & 16 ? " (a copy outstanding)" : "", buf);
             } else if (g_vb_changed <= 24 || (g_vb_changed & (g_vb_changed - 1)) == 0) {
@@ -1260,7 +1318,6 @@ void vb_race_retired_locked(std::uint64_t serial) {
                 host_log("vb race:   first 64 bytes:%s", diff.empty() ? " unchanged (past them)" : diff.c_str());
             }
         }
-        g_vb_watch.pop_front();
     }
     static std::uint64_t reported = 0;
     if (g_vb_checked - reported >= 2'000'000) {
