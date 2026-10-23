@@ -6231,6 +6231,14 @@ void defer_destroy(const DevBuffer& b) { g.slots[g.slot].garbage.push_back(b); }
 // own) that belong to the command buffer recording them; once it retired, its
 // chunks are free for reuse, and up to kStagingKeepBytes of them are kept.
 std::atomic<std::uint64_t> g_staging_created{0}, g_staging_placed{0};
+std::uint64_t staging_chunk_bytes() {
+    static const std::uint64_t bytes = [] {
+        const char* e = std::getenv("BBHOST_STAGING_CHUNK_MB");
+        const std::uint64_t mib = e && *e ? std::strtoull(e, nullptr, 10) : 64;
+        return std::clamp<std::uint64_t>(mib, 4, 64) << 20;
+    }();
+    return bytes;
+}
 // Chunks the memory keeper gave back in play (BBHOST_STAGING_RETURN), and their vkFreeMemory in microseconds.
 std::atomic<std::uint64_t> g_staging_returned{0}, g_staging_return_us{0}, g_staging_return_us_max{0};
 
@@ -6244,7 +6252,7 @@ bool acquire_staging_locked(DevBuffer& b, std::uint64_t size, VkDeviceSize& offs
     // No command buffer reads the current chunk any more: start it over.
     if (g.staging_cur.buffer && !g.staging_users.count(g.staging_cur.buffer)) g.staging_cur_used = 0;
     if (!g.staging_cur.buffer || g.staging_cur_used + need > g.staging_cur.size) {
-        const std::uint64_t want = std::max(need, kStagingChunkBytes);
+        const std::uint64_t want = std::max(need, staging_chunk_bytes());
         DevBuffer chunk;
         auto it = std::find_if(g.staging_free.begin(), g.staging_free.end(), [&](const DevBuffer& c) { return c.size >= want; });
         if (it != g.staging_free.end()) {
@@ -6740,6 +6748,23 @@ std::uint64_t cache_budget_bytes() { return g_cache_budget.load(std::memory_orde
 bool cache_over_budget(std::uint64_t more) {
     return apu_memory::over_budget(g_cache_budget.load(std::memory_order_relaxed), bb_memory_local_bytes(), more);
 }
+
+// The world settled: no loading screen, and BBHOST_CACHE_SETTLE_S (30) since
+// the last one ended - an area's arrival over, the textures it made ahead
+// bound or not. Before the first world load ends, never. What the budget and
+// the lean heap take before it is what the area being entered needs: on an
+// RTX 4070 they made 3,583 textures at their binds against 610 and turned a
+// 100 ms arrival stall into 272 ms, a 4.8 s load into 7.1.
+std::atomic<std::uint64_t> g_loading_ended_ms{0};
+bool world_settled() {
+    static const std::uint64_t settle_ms = [] {
+        const char* e = std::getenv("BBHOST_CACHE_SETTLE_S");
+        return (e && *e ? std::strtoull(e, nullptr, 10) : 30ull) * 1000;
+    }();
+    const std::uint64_t ended = g_loading_ended_ms.load(std::memory_order_relaxed);
+    return ended && !loading_screen_now() && static_cast<std::uint64_t>(steady_ms()) - ended >= settle_ms;
+}
+bool cache_budget_pressing(std::uint64_t more) { return world_settled() && cache_over_budget(more); }
 std::uint64_t cache_budget_excess() { return apu_memory::excess(g_cache_budget.load(std::memory_order_relaxed), bb_memory_local_bytes()); }
 bool heap_lean_on() { return g_heap_lean.load(std::memory_order_relaxed); }
 
@@ -7096,6 +7121,7 @@ std::string video_memory_report_locked(bool at_exit) {
                       static_cast<ull>(drained[3]));
         out += buf;
         out += target_drain_report();
+        out += textures_relocate_report();
         // The targets' blocks one by one: what each holds (MiB of colour,
         // depth, snapshots, GPU-written surfaces, textures, region copies)
         // and its free room - all of it, the largest hole, the holes.
@@ -7192,7 +7218,10 @@ void start_memory_reserve() {
     // Small video memory (small_vram) too: a spare block is 256 MiB of it
     // the targets cannot have.
     const bool few = g.tight || g.small_vram;
-    // A lean image heap (BBHOST_HEAP_LEAN; host/apu_memory.h) keeps none in play either.
+    // A lean image heap (BBHOST_HEAP_LEAN; host/apu_memory.h) keeps none in
+    // play either, once the world has settled (world_settled): until then the
+    // area being entered may want the block.
+    const std::uint64_t spare_play_full = apu_memory::spare_play_blocks(std::getenv("BBHOST_IMAGE_HEAP_SPARE"), few, false);
     const std::uint64_t spare_play = apu_memory::spare_play_blocks(std::getenv("BBHOST_IMAGE_HEAP_SPARE"), few, heap_lean_on());
     const std::uint64_t spare_load = std::max(env("BBHOST_IMAGE_HEAP_SPARE_LOADING", few ? 1 : 4), spare_play);
     g_spare_play_blocks.store(spare_play, std::memory_order_relaxed);
@@ -7216,11 +7245,11 @@ void start_memory_reserve() {
             for (;;) {
                 {
                     std::lock_guard<GpuMutex> lk(g.mu);
-                    if (g.staging_free_bytes + kStagingChunkBytes > std::min(upto, kStagingKeepBytes)) break;
+                    if (g.staging_free_bytes + staging_chunk_bytes() > std::min(upto, kStagingKeepBytes)) break;
                 }
                 DevBuffer chunk;
                 MemOwner own_mem("upload staging");
-                if (!create_dev_buffer(chunk, kStagingChunkBytes, true)) break;
+                if (!create_dev_buffer(chunk, staging_chunk_bytes(), true)) break;
                 std::lock_guard<GpuMutex> lk(g.mu);
                 g.staging_free.push_back(chunk);
                 g.staging_free_bytes += chunk.size;
@@ -7242,7 +7271,7 @@ void start_memory_reserve() {
                 // over the caches' budget (a load's spares are still made:
                 // the area's first frame would make them itself).
                 if (vram_within_reserve(kHeapBlock)) break;
-                if (!g_loading_screen.load(std::memory_order_relaxed) && cache_over_budget(kHeapBlock)) break;
+                if (!g_loading_screen.load(std::memory_order_relaxed) && cache_budget_pressing(kHeapBlock)) break;
                 VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
                 mai.allocationSize = kHeapBlock;
                 mai.memoryTypeIndex = type;
@@ -7300,6 +7329,12 @@ void start_memory_reserve() {
         // pinned, mapped memory) stalled the frames behind it ~100 ms in every
         // soak, the command processor's next driver calls waiting on it.
         auto last_given = std::chrono::steady_clock::time_point{};
+        // Upload staging over the floor goes back a chunk at a time, one 64
+        // MiB chunk every two seconds, a smaller one (BBHOST_STAGING_CHUNK_MB)
+        // as much sooner: each vkFreeMemory is a stall in the driver that the
+        // frame behind it can meet, and a smaller chunk's is shorter.
+        auto last_staging_given = std::chrono::steady_clock::time_point{};
+        const auto staging_pace = std::chrono::milliseconds(std::max<std::uint64_t>(250, 2000 * (staging_chunk_bytes() >> 20) / 64));
         bool was_loading = false;
         for (;;) {
             {
@@ -7322,7 +7357,10 @@ void start_memory_reserve() {
                     }
                 }
             }
-            make_blocks(loading ? spare_load : spare_play);
+            // The lean heap's spare: none once the world has settled, the full one until then.
+            const std::uint64_t spare_now = world_settled() ? spare_play : spare_play_full;
+            g_spare_play_blocks.store(loading ? spare_load : spare_now, std::memory_order_relaxed);
+            make_blocks(loading ? spare_load : spare_now);
             if (loading) {
                 // Staging over the reserve (chunks the command processor made
                 // in a burst, or one a large upload had to itself) goes back
@@ -7358,7 +7396,7 @@ void start_memory_reserve() {
             // blocks; upload staging and untile scratch still go back two
             // seconds apart (their frees are what stalls the frames).
             const bool reserve_short = vram_within_reserve();
-            const bool short_now = reserve_short || cache_over_budget();
+            const bool short_now = reserve_short || cache_budget_pressing();
             const bool may_give = short_now || now - last_given >= std::chrono::seconds(2);
             const bool may_give_paced = reserve_short || now - last_given >= std::chrono::seconds(2);
             {
@@ -7371,7 +7409,7 @@ void start_memory_reserve() {
                         // A block of host memory, made while video memory was
                         // full, goes back once empty; one of video memory only
                         // above the spare.
-                        if (b.type == type && !short_now && free < (spare_play + 1) * kHeapBlock) continue;
+                        if (b.type == type && !short_now && free < (spare_now + 1) * kHeapBlock) continue;
                         gone.push_back(b.memory);
                         b.memory = VK_NULL_HANDLE;
                         b.free.clear();
@@ -7392,7 +7430,8 @@ void start_memory_reserve() {
                 }
                 if (staging_return && g.staging_free_bytes > floor) {
                     if (over_floor_since == std::chrono::steady_clock::time_point{}) over_floor_since = now;
-                    if (now - over_floor_since >= std::chrono::seconds(30) && may_give_paced && gone.empty() && !g.staging_free.empty()) {
+                    if (now - over_floor_since >= std::chrono::seconds(30) && (reserve_short || now - last_staging_given >= staging_pace) &&
+                        gone.empty() && !g.staging_free.empty()) {
                         chunks.push_back(g.staging_free.back());
                         g.staging_free_bytes -= g.staging_free.back().size;
                         g.staging_free.pop_back();
@@ -7413,11 +7452,25 @@ void start_memory_reserve() {
             if (!gone.empty() || !chunks.empty()) {
                 const auto t0 = std::chrono::steady_clock::now();
                 for (VkDeviceMemory m : gone) vkFreeMemory(g.device, m, nullptr);
+                // Each step of a staging chunk's free timed apart (where the
+                // driver's stall is): its buffer, its mapping, its memory.
+                double ms_buffer = 0, ms_unmap = 0, ms_memory = 0;
+                std::uint64_t chunk_bytes = 0;
                 for (DevBuffer& c : chunks) {
+                    chunk_bytes += c.size;
+                    const auto a = std::chrono::steady_clock::now();
                     vkDestroyBuffer(g.device, c.buffer, nullptr);
+                    const auto b = std::chrono::steady_clock::now();
+                    if (c.map) vkUnmapMemory(g.device, c.memory);
+                    const auto d = std::chrono::steady_clock::now();
                     vkFreeMemory(g.device, c.memory, nullptr);
+                    const auto e = std::chrono::steady_clock::now();
+                    ms_buffer += std::chrono::duration<double, std::milli>(b - a).count();
+                    ms_unmap += std::chrono::duration<double, std::milli>(d - b).count();
+                    ms_memory += std::chrono::duration<double, std::milli>(e - d).count();
                 }
                 last_given = std::chrono::steady_clock::now();
+                if (!chunks.empty()) last_staging_given = last_given;
                 if (!chunks.empty()) {
                     // Counted for the exit report (staging_pool_stats): what
                     // the frees cost is the question giving it back answers.
@@ -7433,8 +7486,13 @@ void start_memory_reserve() {
                     std::lock_guard<GpuMutex> lk(g.mu);
                     live = heap_live_blocks_locked();
                 }
-                host_log("gpu: memory keeper: gave back %s in %.1f ms at flip %llu (%zu blocks live, %llu MiB of staging kept)",
-                         gone.empty() ? "64 MiB of upload staging" : "an image heap block",
+                char what[96];
+                if (gone.empty())
+                    std::snprintf(what, sizeof(what), "%llu MiB of upload staging (its buffer %.1f, mapping %.1f, memory %.1f ms)",
+                                  static_cast<unsigned long long>(chunk_bytes >> 20), ms_buffer, ms_unmap, ms_memory);
+                else
+                    std::snprintf(what, sizeof(what), "an image heap block");
+                host_log("gpu: memory keeper: gave back %s in %.1f ms at flip %llu (%zu blocks live, %llu MiB of staging kept)", what,
                          std::chrono::duration<double, std::milli>(last_given - t0).count(),
                          static_cast<unsigned long long>(hle_video_flip_count()), live, static_cast<unsigned long long>(g.staging_free_bytes >> 20));
             }
@@ -7686,6 +7744,7 @@ void submit_locked() {
     // second).
     render_return_targets_locked();
     drain_target_blocks_locked();  // a targets' block holding little, emptied into room elsewhere (one turn a second)
+    textures_relocate_pinned_locked();  // a textures' block's few GPU-written surfaces, moved so it can drain (lean thresholds)
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
@@ -10390,7 +10449,10 @@ VkDeviceAddress guest_device_address(std::uint64_t va, std::size_t bytes) {
 }  // namespace gpu
 
 void host_gpu_set_loading(bool loading) {
-    if (gpu::g_loading_screen.exchange(loading) != loading) gpu::g_keeper_cv.notify_one();
+    if (gpu::g_loading_screen.exchange(loading) != loading) {
+        if (!loading) gpu::g_loading_ended_ms.store(static_cast<std::uint64_t>(gpu::steady_ms()), std::memory_order_relaxed);
+        gpu::g_keeper_cv.notify_one();
+    }
     gpu::precompile_set_loading(loading);
 }
 
