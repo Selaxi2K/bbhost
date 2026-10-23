@@ -7,6 +7,7 @@
 #include "core/portable.h"
 #include "engine/gx_resources.h"
 #include "engine/gx_state.h"
+#include "engine/loading.h"
 #include "host/clip_control.h"
 #include "host/gpu_internal.h"
 #include "host/lvp_split.h"
@@ -968,14 +969,31 @@ struct VbWatch {
     std::uint32_t head[16];  // the first 64 bytes as recorded, for the change's report
     std::uint8_t cls;        // shadow_place_class_locked when recorded
     bool mirrored;           // a mirror served it (=2): a change is what in place would have raced
+    std::uint8_t why;        // why the mirrors left it in place (shadow_locate_why)
+    std::uint8_t hands;      // GX's hand-outs over its first page (shadow_hand_kinds_locked)
+    bool loading;            // recorded under a loading screen
+    std::uint64_t holder;    // the GX buffer the draw bound it by (0: not known)
+    std::uint64_t behind;    // submissions the GPU had still to finish when it was recorded
 };
 const int g_vb_race_level = [] {
     const char* e = std::getenv("BBHOST_VB_RACE");
-    return e && (e[0] == '1' || e[0] == '2') ? e[0] - '0' : 0;
+    return e && e[0] >= '1' && e[0] <= '3' ? e[0] - '0' : 0;
 }();
 const bool g_vb_race = g_vb_race_level != 0;
+// BBHOST_VB_RACE_LOG=all: every change gets its line (bounded), not only the
+// first 24 and then each power of two.
+const bool g_vb_race_log_all = [] {
+    const char* e = std::getenv("BBHOST_VB_RACE_LOG");
+    return e && (std::strcmp(e, "all") == 0 || e[0] == '1');
+}();
 // By [mirrored][class]: ranges checked and changed before their submission retired.
 std::uint64_t g_vb_class_checked[2][kPlaceClasses] = {}, g_vb_class_changed[2][kPlaceClasses] = {};
+// Ranges read in place by why the mirrors left them there, checked and changed.
+std::uint64_t g_vb_why_checked[kLocWhys] = {}, g_vb_why_changed[kLocWhys] = {};
+// And the changes by GX's hand-outs over them (shadow_hand_kinds_locked's bits), and under a loading screen.
+std::uint64_t g_vb_hands_changed[32] = {}, g_vb_loading_changed = 0, g_vb_loading_checked = 0;
+const char* const kLocWhyName[kLocWhys] = {"not asked", "a twin", "no mirror", "in place (told)", "across windows", "a mirror",
+                                           "host memory", "no room", "no window", "no import", "a GPU write pending", "no copy"};
 // =2: the mirror pages (64 KiB, by guest address; a range by its first 256) a
 // draw read from a mirror, and those that changed while the draw was queued -
 // what reading them in place, as an integrated GPU reads the meshes, would
@@ -1025,6 +1043,8 @@ std::uint64_t vb_race_hash_ends(std::uint64_t va, std::uint64_t bytes) {
 struct VbRaceRange {
     std::uint64_t va, bytes;
     bool mirrored;
+    std::uint8_t why;      // shadow_locate_why for the range
+    std::uint64_t holder;  // the GX buffer the draw bound it by
 };
 thread_local VbRaceRange t_vb_race_ranges[8];
 thread_local std::size_t t_vb_race_n = 0;
@@ -1075,9 +1095,11 @@ bool draw_last_vertex(std::int64_t& last) {
 }
 
 bool vb_race_on() { return g_vb_race; }
-bool vb_race_mirrored_on() { return g_vb_race_level == 2; }
+bool vb_race_mirrored_on() { return g_vb_race_level >= 2; }
+// =3: the census of every record and index range a mirror serves.
+bool vb_race_wide_on() { return g_vb_race_level == 3; }
 
-void vb_race_note_locked(const char* name, std::uint64_t va, std::uint64_t bytes, bool mirrored) {
+void vb_race_note_locked(const char* name, std::uint64_t va, std::uint64_t bytes, bool mirrored, std::uint8_t why, std::uint64_t holder) {
     if (!g_vb_race) return;
     // Checked as soon as the timeline says their submission ran, not when its
     // slot comes round again (16 submissions on), by when the game may have
@@ -1101,6 +1123,11 @@ void vb_race_note_locked(const char* name, std::uint64_t va, std::uint64_t bytes
     w.bytes = bytes;
     w.mirrored = mirrored;
     w.cls = static_cast<std::uint8_t>(shadow_place_class_locked(va, bytes));
+    w.why = why < kLocWhys ? why : 0;
+    w.holder = holder;
+    w.loading = loading_screen_up();
+    w.behind = g.flushes > g.completed_submits ? g.flushes - g.completed_submits : 0;
+    w.hands = mirrored ? 0 : static_cast<std::uint8_t>(shadow_hand_kinds_locked(va));
     w.hash = mirrored ? vb_race_hash_ends(va, bytes) : vb_race_hash(va, bytes);
     std::memcpy(w.head, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va)), std::min<std::uint64_t>(bytes, sizeof(w.head)));
     w.flip = hle_video_flip_count();
@@ -1123,6 +1150,28 @@ void vb_race_class_report() {
         }
     }
     if (!line.empty()) host_log("vb race: changed/checked by the pages' class:%s", line.c_str());
+    std::string why;
+    for (int k = 0; k < kLocWhys; ++k) {
+        if (!g_vb_why_checked[k]) continue;
+        char b[96];
+        std::snprintf(b, sizeof(b), "%s %s %llu/%llu", why.empty() ? "" : ",", kLocWhyName[k], static_cast<unsigned long long>(g_vb_why_changed[k]),
+                      static_cast<unsigned long long>(g_vb_why_checked[k]));
+        why += b;
+    }
+    if (!why.empty()) {
+        std::string hands;
+        for (int k = 0; k < 32; ++k) {
+            if (!g_vb_hands_changed[k]) continue;
+            char b[96];
+            std::snprintf(b, sizeof(b), " %s%s%s%s%s:%llu", k & 1 ? "M" : "", k & 2 ? "P" : "", k & 4 ? "R" : "", k & 8 ? "Y" : "", k & 16 ? "+out" : "",
+                          static_cast<unsigned long long>(g_vb_hands_changed[k]));
+            hands += k ? b : " none" + std::string(std::strchr(b, ':'));
+        }
+        host_log("vb race: read in place, changed/checked by why the mirrors left them there:%s; the changes by GX's hand-outs over them "
+                 "(M Map's renamed copies, P the pool, R the ring, Y YEBIS, +out a copy outstanding):%s; under a loading screen %llu/%llu",
+                 why.c_str(), hands.c_str(), static_cast<unsigned long long>(g_vb_loading_changed),
+                 static_cast<unsigned long long>(g_vb_loading_checked));
+    }
     if (!g_vb_mirror_pages_read.empty())
         host_log("vb race: mirror pages (64 KiB) draws read from a mirror %zu, of them changed while such a draw was queued %zu (the changed "
                  "ranges %llu MiB) - what reading them in place would have raced on",
@@ -1147,6 +1196,10 @@ void vb_race_retired_locked(std::uint64_t serial) {
             hle_kernel_va_mapped(w.va, w.bytes) && (w.mirrored ? vb_race_hash_ends(w.va, w.bytes) : vb_race_hash(w.va, w.bytes)) != w.hash;
         ++g_vb_class_checked[w.mirrored][w.cls < kPlaceClasses ? w.cls : 0];
         if (w.mirrored) vb_mirror_pages_note(g_vb_mirror_pages_read, w.va, w.bytes);
+        if (!w.mirrored) {
+            ++g_vb_why_checked[w.why];
+            if (w.loading) ++g_vb_loading_checked;
+        }
         // A GPU write recorded with or after the draw (a simulation dispatch
         // rewriting its ring): the draw read before it in the GPU's order.
         if (changed && gpu_wrote_since_locked(w.va, w.bytes, w.serial)) {
@@ -1162,7 +1215,30 @@ void vb_race_retired_locked(std::uint64_t serial) {
             g_vb_changed_bytes += w.bytes;
             ++g_vb_changed_by_pipeline[w.name];
             ++g_vb_class_changed[0][w.cls < kPlaceClasses ? w.cls : 0];
-            if (g_vb_changed <= 24 || (g_vb_changed & (g_vb_changed - 1)) == 0) {
+            ++g_vb_why_changed[w.why];
+            ++g_vb_hands_changed[w.hands & 31];
+            if (w.loading) ++g_vb_loading_changed;
+            if (g_vb_race_log_all && g_vb_changed <= 20000) {
+                // One line a change: what it was, how far behind the GPU ran,
+                // what the shadow made of its pages and the GX buffer it is.
+                static const char* const kClass[kPlaceClasses] = {"no mirror's", "in place", "told", "handed out", "watched", "rewritten", "untracked"};
+                GxResourceInfo gi;
+                char buf[160] = "no GX buffer known";
+                if (w.holder && gx_resource_by_holder(w.holder, &gi))
+                    std::snprintf(buf, sizeof(buf), "GX %s %u, usage %u, bind 0x%x, %u bytes at 0x%llx, made at flip %llu",
+                                  gi.type == 1 ? "buffer" : "resource", gi.id, gi.usage, gi.bind, gi.bytes,
+                                  static_cast<unsigned long long>(gi.memory), static_cast<unsigned long long>(gi.created_flip));
+                else if (w.holder)
+                    std::snprintf(buf, sizeof(buf), "holder 0x%llx not in the registry", static_cast<unsigned long long>(w.holder));
+                host_log("vb race: changed %s 0x%llx +%llu, flip %llu -> %llu, submission %llu (%llu on, the GPU %llu behind when recorded)%s; "
+                         "%s, %s, hand-outs %s%s%s%s%s%s; %s",
+                         w.name, static_cast<unsigned long long>(w.va), static_cast<unsigned long long>(w.bytes),
+                         static_cast<unsigned long long>(w.flip), static_cast<unsigned long long>(hle_video_flip_count()),
+                         static_cast<unsigned long long>(w.serial), static_cast<unsigned long long>(g.flushes - w.serial),
+                         static_cast<unsigned long long>(w.behind), w.loading ? ", loading" : "", kClass[w.cls < kPlaceClasses ? w.cls : 0],
+                         kLocWhyName[w.why], w.hands ? "" : "none", w.hands & 1 ? "M" : "", w.hands & 2 ? "P" : "", w.hands & 4 ? "R" : "",
+                         w.hands & 8 ? "Y" : "", w.hands & 16 ? " (a copy outstanding)" : "", buf);
+            } else if (g_vb_changed <= 24 || (g_vb_changed & (g_vb_changed - 1)) == 0) {
                 host_log("vb race: draw %s's vertices 0x%llx (%llu bytes), recorded at flip %llu in submission %llu, changed before it "
                          "retired (flip %llu, %llu submissions on; %llu of %llu checked so far)",
                          w.name, static_cast<unsigned long long>(w.va), static_cast<unsigned long long>(w.bytes),
@@ -13916,12 +13992,14 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
                 gxvk::census_binding(gxvk::kUseVertex, o.vtx_obj[fe.slot], record_va, draw_read_bytes(w, stride, record_bytes), o.call_seq, g.flushes);
             bool in_place = false;
             bool shadow_served = false;  // a mirror serves the record (BBHOST_VB_RACE=2)
+            std::uint8_t locate_why = kLocNotAsked;  // why the mirrors left it in place (BBHOST_VB_RACE)
             if (heap_record) {
                 // The heap's import, from the record's start, as far as it holds.
                 ns.whole = {loc.buffer, loc.offset - fe.offset, std::min<std::uint64_t>(record_bytes, loc.avail + fe.offset)};
                 in_place = true;
             } else if (mirrored) {
                 ns.whole = {loc.buffer, loc.offset - fe.offset, record_bytes};  // the mirror already (window imports)
+                shadow_served = vb_race_wide_on();  // =3: counted as the mirrors' too
             } else if (snapped) {
                 ns.whole = snap;  // the snapshot already (window imports)
                 ns.snapped = true;
@@ -13931,6 +14009,7 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
             } else if (loc.offset >= fe.offset && loc.avail + fe.offset >= record_bytes) {
                 ns.whole = {loc.buffer, loc.offset - fe.offset, record_bytes};
                 shadow_locate_locked(record_va, record_bytes, ns.whole);
+                locate_why = shadow_locate_why();
                 // A record whose V# counts on past the end of the GX buffer it
                 // starts in - its records counted from the buffer's start
                 // though the base is an offset into it (five 582 KB records of
@@ -13953,6 +14032,7 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
                         bump(g_vertex_records_clamped);
                         ns.whole = {loc.buffer, loc.offset - fe.offset, record_bytes};
                         shadow_locate_locked(record_va, record_bytes, ns.whole);
+                        locate_why = shadow_locate_why();
                         if (ns.whole.buffer != loc.buffer) bump(g_vertex_clamped_mirrored);
                     }
                 }
@@ -13992,11 +14072,11 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
             // order covers that).
             if (vb_race_on() && in_place && version == kCopyVersionNone && t_vb_race_n < 8 &&
                 !gpu_writes_pending_locked(record_va, read_bytes()))
-                t_vb_race_ranges[t_vb_race_n++] = {record_va, read_bytes(), false};
+                t_vb_race_ranges[t_vb_race_n++] = {record_va, read_bytes(), false, locate_why, o.vtx_obj[fe.slot]};
             // =2: a record a mirror serves, at its whole extent (no index scan).
             else if (vb_race_mirrored_on() && shadow_served && version == kCopyVersionNone && t_vb_race_n < 8 &&
                      !gpu_writes_pending_locked(record_va, record_bytes))
-                t_vb_race_ranges[t_vb_race_n++] = {record_va, record_bytes, true};
+                t_vb_race_ranges[t_vb_race_n++] = {record_va, record_bytes, true, kLocServed, o.vtx_obj[fe.slot]};
             rs = &ns;
         }
         if (rs->whole.buffer) {
@@ -20273,6 +20353,7 @@ static bool draw_impl(const GpuDraw& d) {
         if ((vlogs.load(std::memory_order_relaxed) < 16 && vlogs.fetch_add(1) < 16))
             host_log("render: draw %s base_vertex=%d (VGT_INDX_OFFSET) count=%u", pl.name.c_str(), vtx_off, d.index_count);
     }
+    std::uint8_t index_why = kLocNotAsked;  // why the mirrors left the indices where they are (BBHOST_VB_RACE)
     if (d.index_va) {
         if (g_import_audit && d.indirect_va) audit_range(d.index_va, static_cast<std::uint64_t>(d.index_count) * (d.index_type == 1 ? 4 : 2), kUseIndex);
         const std::uint64_t index_bytes = static_cast<std::uint64_t>(d.index_count) * (d.index_type == 1 ? 4 : 2);
@@ -20301,11 +20382,18 @@ static bool draw_impl(const GpuDraw& d) {
         const int version = by_handle ? kCopyVersionNone : copy_version_lookup_locked(d.index_va, index_bytes, &loc);  // a straddle ended the pass above
         if (index_handle && !by_handle && version == kCopyVersionInside) gxvk_disagree_locked(gxvk_kCopyVersion, index_handle);
         // (Window imports: the mirror first, so the indices need no import.)
-        if (!by_handle && version != kCopyVersionInside &&
-            (imports_whole() || d.indirect_va || !shadow_mirror_locked(d.index_va, index_bytes, loc))) {
-            const ImportSite site("an index buffer");
-            loc = locate(d.index_va, index_bytes);
-            if (!d.indirect_va) shadow_locate_locked(d.index_va, index_bytes, loc);
+        // index_why: whether a mirror serves them, for the race census.
+        if (!by_handle && version != kCopyVersionInside) {
+            if (!imports_whole() && !d.indirect_va && shadow_mirror_locked(d.index_va, index_bytes, loc)) {
+                index_why = kLocServed;
+            } else {
+                const ImportSite site("an index buffer");
+                loc = locate(d.index_va, index_bytes);
+                if (!d.indirect_va) {
+                    shadow_locate_locked(d.index_va, index_bytes, loc);
+                    index_why = shadow_locate_why();
+                }
+            }
         }
         if (!loc.buffer) {
             static std::atomic<int> logs{0};
@@ -20680,13 +20768,16 @@ static bool draw_impl(const GpuDraw& d) {
             if (use_vertex_input) {
                 std::snprintf(tag, sizeof(tag), "v:%s", r.name);
                 for (std::size_t k = 0; k < t_vb_race_n; ++k)
-                    vb_race_note_locked(tag, t_vb_race_ranges[k].va, t_vb_race_ranges[k].bytes, t_vb_race_ranges[k].mirrored);
+                    vb_race_note_locked(tag, t_vb_race_ranges[k].va, t_vb_race_ranges[k].bytes, t_vb_race_ranges[k].mirrored,
+                                        t_vb_race_ranges[k].why, t_vb_race_ranges[k].holder);
             }
+            // Indices a mirror serves only with =3 (as served).
             const std::uint64_t ibytes = static_cast<std::uint64_t>(d.index_count) * (d.index_type ? 4u : 2u);
-            if (r.indexed && !r.indirect_va && !gpu_writes_pending_locked(d.index_va, ibytes) &&
+            const bool imirrored = index_why == kLocServed;
+            if (r.indexed && !r.indirect_va && (!imirrored || vb_race_wide_on()) && !gpu_writes_pending_locked(d.index_va, ibytes) &&
                 copy_version_lookup_locked(d.index_va, ibytes, nullptr) == kCopyVersionNone) {
                 std::snprintf(tag, sizeof(tag), "i:%s", r.name);
-                vb_race_note_locked(tag, d.index_va, ibytes);
+                vb_race_note_locked(tag, d.index_va, ibytes, imirrored, index_why, d.gx_objects ? d.gx_objects->ib_obj : 0);
             }
         }
         t_vb_race_n = 0;

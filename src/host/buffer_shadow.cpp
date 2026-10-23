@@ -1281,6 +1281,9 @@ bool buffer_shadow_on() {
 bool shadow_in_place_on() { return buffer_shadow_on() && in_place_on(); }
 
 namespace {
+// Why the last shadow_locate_locked on this thread left its range where it
+// was, or that a mirror serves it (shadow_locate_why).
+thread_local std::uint8_t t_locate_why = kLocNotAsked;
 // In place (in_place_on): true when [p0, p1] binds the import - each page
 // placed already, checked once a recording for a told write since (which
 // counts as a rewrite, as a copy did, and places it again), or placed now.
@@ -1347,26 +1350,27 @@ bool place_range_locked(Mirror& m, std::uint32_t chunk, std::uint64_t va, std::u
 }  // namespace
 
 void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
-    if (!buffer_shadow_on() || !bytes || !loc.buffer) return;
-    if (twin_covers_locked(va, bytes)) return;  // a GX buffer's device-local twin: already device memory, its guest bytes stale
+    if (!buffer_shadow_on() || !bytes || !loc.buffer) { t_locate_why = kLocNotAsked; return; }
+    if (twin_covers_locked(va, bytes)) { t_locate_why = kLocTwin; return; }  // a GX buffer's device-local twin: already device memory, its guest bytes stale
     std::uint32_t chunk = 0;
     std::uint64_t off = 0, map_lo = 0, map_hi = 0;
-    if (!phys_of(va, bytes, chunk, off, &map_lo, &map_hi)) return;
+    if (!phys_of(va, bytes, chunk, off, &map_lo, &map_hi)) { t_locate_why = kLocNoMirror; return; }
     Mirror* m = mirror_for(chunk);
-    if (!m) return;
+    if (!m) { t_locate_why = kLocNoMirror; return; }
     drain_gx_writes_locked();
     const std::uint64_t stamp = g.record_serial + 1;
     const std::uint32_t p0 = static_cast<std::uint32_t>(off >> kPageShift);
     const std::uint32_t p1 = static_cast<std::uint32_t>((off + bytes - 1) >> kPageShift);
     // (Never past the mirror's pages: a copy or a sparse bind there runs past
     // the end of its buffer.)
-    if (p1 >= m->pages.size()) return;
+    if (p1 >= m->pages.size()) { t_locate_why = kLocNoMirror; return; }
     // In place: the import is the binding, and `loc` already holds it - or,
     // with window imports, holds the stand-in of shadow_mirror_locked's
     // question, whose caller then binds the import locate() finds or makes
     // (and asks again, which counts the bind).
     if (in_place_on() && place_range_locked(*m, chunk, va, off, p0, p1, map_lo, map_hi, stamp)) {
         if (loc.buffer != g.sink.buffer) bump(g_placed_binds);
+        t_locate_why = kLocInPlace;
         return;
     }
     // A windowed mirror serves a range from one window's buffer.
@@ -1374,6 +1378,7 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
     if (m->windowed && p1 / window_pages() != win) {
         ++g_window_crossings;
         bump(g_imports);
+        t_locate_why = kLocCrossing;
         return;
     }
     const VkDeviceSize win_base = static_cast<VkDeviceSize>(win) * window_bytes();
@@ -1398,6 +1403,7 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
         loc.buffer = mirror_buffer();
         loc.offset = off - win_base;
         loc.avail = bytes;
+        t_locate_why = kLocServed;
         return;
     }
     // A page bound from host memory for good, or one a GPU write in this
@@ -1405,6 +1411,7 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
     // walk below would stop at it, having looked at every page before it.
     if (any_set(m->dyn, p0, p1) || any_set(m->gpu, p0, p1)) {
         bump(g_imports);
+        t_locate_why = kLocHost;
         return;
     }
     // The live share refused a block less than 250 ms ago, this mirror's
@@ -1418,6 +1425,7 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
         now_ms() < g_room_retry_ms) {
         ++g_room_skips;
         bump(g_imports);
+        t_locate_why = kLocRoom;
         return;
     }
     // A windowed mirror's window is made before any page's write watch is
@@ -1429,6 +1437,7 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
         if (retry_wait || !window_ready(*m, win)) {
             if (g_live) ++(retry_wait ? g_room_skips : g_room_refusals);
             bump(g_imports);
+            t_locate_why = kLocWindow;
             return;
         }
     }
@@ -1512,6 +1521,7 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
                                                static_cast<std::uint64_t>(p1 - p0 + 1) << kPageShift);
     if (!staged && !source) {
         bump(g_imports);
+        t_locate_why = kLocNoImport;
         return;
     }
     VkBuffer src_buffer = source ? source->buffer : VK_NULL_HANDLE;
@@ -1528,6 +1538,7 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
         if (pg.dynamic) {
             flush();
             bump(g_imports);
+            t_locate_why = kLocHost;
             return;
         }
         // Written by the GPU in this recording: a copy now would run before
@@ -1535,6 +1546,7 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
         if (!pg.valid && pg.gpu_written == stamp) {
             flush();
             bump(g_imports);
+            t_locate_why = kLocHost;
             return;
         }
         // With window imports the page's copy is the CPU's, taken now: a GPU
@@ -1547,6 +1559,7 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
             bump(g_staged_pending);
             flush();
             bump(g_imports);
+            t_locate_why = kLocGpuPending;
             return;
         }
         if (pg.valid) {
@@ -1575,12 +1588,14 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
                 ++g_handed_dynamic;
                 flush();
                 bump(g_imports);
+                t_locate_why = kLocHost;
                 return;
             }
         } else if (++pg.window_uploads > (g_shadow_handed && page_handed(chunk, p) ? kMaxUploadsHanded : kMaxUploads)) {
             go_dynamic(*m, p, page_va, "keeps being rewritten");
             flush();
             bump(g_imports);
+            t_locate_why = kLocHost;
             return;
         }
         // Watched from before the copy reads it: a write after that marks it
@@ -1608,6 +1623,7 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
                 go_dynamic(*m, p, page_va, "cannot be write-watched");
                 flush();
                 bump(g_imports);
+                t_locate_why = kLocHost;
                 return;
             }
             if (!(prearmed[p - p0] & 2)) pg.alias_va = hle_kernel_write_watch_alias(lo, hi - lo, pg.alias_watch);
@@ -1622,6 +1638,7 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
             pg.watch = WriteWatch{};
             pg.alias_watch = WriteWatch{};
             pg.alias_va = 0;
+            t_locate_why = kLocNoCopy;
             return;
         }
         VkDeviceSize staged_at = 0;  // the page's copy in staging (window imports)
@@ -1634,6 +1651,7 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
                 if (pg.window_uploads) --pg.window_uploads;
                 flush();
                 bump(g_imports);
+                t_locate_why = kLocNoCopy;
                 return;
             }
             // The placement's own map (staged_at is its offset in the buffer, for the copy).
@@ -1689,6 +1707,7 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
                     ++g_room_refusals;
                     flush();
                     bump(g_imports);
+                    t_locate_why = kLocRoom;
                     return;
                 }
                 MemOwner own_mem("mirror blocks");
@@ -1697,6 +1716,7 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
                                                      : "has no device memory for its mirror page");
                     flush();
                     bump(g_imports);
+                    t_locate_why = kLocHost;
                     return;
                 }
                 g_mirror_bytes += bai.allocationSize;
@@ -1734,6 +1754,23 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
     loc.buffer = mirror_buffer();
     loc.offset = off - win_base;
     loc.avail = bytes;
+    t_locate_why = kLocServed;
+}
+
+std::uint8_t shadow_locate_why() { return t_locate_why; }
+
+unsigned shadow_hand_kinds_locked(std::uint64_t va) {
+    std::uint32_t chunk = 0;
+    std::uint64_t off = 0;
+    if (!va || !phys_of(va, 1, chunk, off)) return 0;
+    drain_gx_writes_locked();
+    const std::uint64_t phys = (std::uint64_t{chunk} << gcn::kDmemChunkShift) | off;
+    unsigned bits = 0;
+    for (unsigned k = 0; k < kHandKinds; ++k) {
+        if (handed(k, phys)) bits |= 1u << k;
+    }
+    if (page_unsettled(chunk, static_cast<std::uint32_t>(off >> kPageShift))) bits |= 1u << kHandKinds;
+    return bits;
 }
 
 // For a diagnostic: what the mirror would do with this range right now, and -
