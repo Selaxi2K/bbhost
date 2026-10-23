@@ -117,9 +117,31 @@ bool bb_memory_test_limited(std::uint64_t* limit, std::uint64_t* used) {
     return g_limit_bytes != 0;
 }
 
+namespace {
+// Guest memory imported (a host pointer, a dma-buf, a Win32 handle): RAM the
+// GPU reads, never a card's video memory, whatever memory type a driver gives
+// it - on lavapipe every type is "device-local", and counted against
+// BBHOST_TEST_VRAM_MB the game's own memory filled the acted-out card.
+bool imported(const VkMemoryAllocateInfo* info) {
+    for (const auto* p = static_cast<const VkBaseInStructure*>(info->pNext); p; p = p->pNext) {
+        switch (p->sType) {
+        case VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT:
+        case VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR:
+#if defined(_WIN32)
+        case VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR:
+#endif
+            return true;
+        default:
+            break;
+        }
+    }
+    return false;
+}
+}  // namespace
+
 VkResult bb_alloc_memory(VkDevice device, const VkMemoryAllocateInfo* info, const VkAllocationCallbacks* cb,
                          VkDeviceMemory* out, const char* file, int line) {
-    const bool limited = g_limit_bytes && ((g_limit_types >> info->memoryTypeIndex) & 1);
+    const bool limited = g_limit_bytes && ((g_limit_types >> info->memoryTypeIndex) & 1) && !imported(info);
     if (limited) {
         std::lock_guard<std::mutex> lk(g_mu);
         if (g_limited_bytes + info->allocationSize > g_limit_bytes) return VK_ERROR_OUT_OF_DEVICE_MEMORY;

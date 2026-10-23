@@ -767,6 +767,50 @@ std::atomic<std::uint64_t> g_import_who_us[kImportWhos], g_import_wait_max_us{0}
 std::atomic<std::uint64_t> g_imports_retired{0}, g_import_retired_bytes{0};
 std::atomic<std::uint64_t> g_dispatch_read_imports{0}, g_dispatch_untraced{0};  // window imports of what dispatches read
 
+// An import can fail on a player's machine as well as from a full card: the
+// driver's own limit on imported memory, the address space, a udmabuf size
+// limit on Linux. Every path that asks for one takes its failure: a binding
+// is bound from the sink or walks the page table, a draw that needs one is
+// skipped, a mirror's copy is left for a later draw. These are counted by the
+// path that asked (the exit report), and a window whose import failed is not
+// asked of the driver again for a second (import_backoff_ms) - a draw a frame
+// asked again for the same window, 73,300 times in one lavapipe run.
+//
+// BBHOST_TEST_IMPORT_FAIL (a test switch) fails imports on purpose, so these
+// paths can be run on any device: "all" every one; a number N every N-th; or
+// "after:M" every one once M MiB have been imported in all.
+struct ImportFailTest {
+    int mode = 0;  // 0 off, 1 all, 2 every N-th, 3 after M MiB
+    std::uint64_t every = 0, after_bytes = 0;
+};
+const ImportFailTest g_import_fail_test = [] {
+    ImportFailTest t;
+    const char* e = std::getenv("BBHOST_TEST_IMPORT_FAIL");
+    if (!e || !*e || std::strcmp(e, "0") == 0) return t;
+    if (std::strcmp(e, "all") == 0) {
+        t.mode = 1;
+    } else if (std::strncmp(e, "after:", 6) == 0) {
+        t.mode = 3;
+        t.after_bytes = std::strtoull(e + 6, nullptr, 10) << 20;
+    } else if (const std::uint64_t n = std::strtoull(e, nullptr, 10); n) {
+        t.mode = n == 1 ? 1 : 2;
+        t.every = n;
+    }
+    return t;
+}();
+std::atomic<std::uint64_t> g_import_tries{0}, g_import_failed{0}, g_import_failed_bytes{0}, g_import_forced{0}, g_import_backed_off{0};
+std::atomic<std::uint64_t> g_import_failed_who[kImportWhos];
+constexpr std::uint64_t kImportBackoffMs = 1000;
+bool import_fail_forced(std::uint64_t size) {
+    const std::uint64_t n = g_import_tries.fetch_add(1, std::memory_order_relaxed) + 1;
+    switch (g_import_fail_test.mode) {
+    case 1: return true;
+    case 2: return n % g_import_fail_test.every == 0;
+    case 3: return g_import_bytes.load(std::memory_order_relaxed) + size > g_import_fail_test.after_bytes;
+    default: return false;
+    }
+}
+
 // [lo, hi) of direct-memory chunk `index` (offsets in the chunk; hi may run
 // past its end, into the next chunk's memory) as a new import, not yet in the
 // chunk's list: the driver's slow part, which needs no lock of ours.
@@ -785,15 +829,24 @@ std::unique_ptr<Chunk> make_import(std::uint32_t index, std::uint64_t lo, std::u
     }
     auto c = std::make_unique<Chunk>();
     const auto t0 = std::chrono::steady_clock::now();
+    const bool forced = import_fail_forced(size);
 #if defined(_WIN32)
-    const VkResult r = host_span(*c, ptr, size);
+    const VkResult r = forced ? VK_ERROR_OUT_OF_DEVICE_MEMORY : host_span(*c, ptr, size);
 #else
-    const VkResult r = g.dmem_dmabuf ? dmabuf_span(*c, offset, size) : host_span(*c, ptr, size);
+    const VkResult r = forced ? VK_ERROR_OUT_OF_DEVICE_MEMORY : g.dmem_dmabuf ? dmabuf_span(*c, offset, size) : host_span(*c, ptr, size);
 #endif
     const auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
     if (r != VK_SUCCESS) {
-        host_log("gpu: importing dmem chunk %u (%llu MiB from +%llu MiB) failed after %lld us: %d", index,
-                 static_cast<unsigned long long>(size >> 20), static_cast<unsigned long long>(lo >> 20), static_cast<long long>(us), r);
+        const std::uint64_t failed = g_import_failed.fetch_add(1, std::memory_order_relaxed) + 1;
+        g_import_failed_bytes.fetch_add(size, std::memory_order_relaxed);
+        if (forced) g_import_forced.fetch_add(1, std::memory_order_relaxed);
+        const int who = t_import_who >= 0 && t_import_who < kImportWhos ? t_import_who : kIwBinding;
+        g_import_failed_who[who].fetch_add(1, std::memory_order_relaxed);
+        if (failed <= 8 || failed % 10000 == 0)
+            host_log("gpu: importing dmem chunk %u (%llu MiB from +%llu MiB) failed after %lld us: %d%s (%llu so far; its draws read the sink or "
+                     "walk the page table)",
+                     index, static_cast<unsigned long long>(size >> 20), static_cast<unsigned long long>(lo >> 20), static_cast<long long>(us), r,
+                     forced ? ", BBHOST_TEST_IMPORT_FAIL" : "", static_cast<unsigned long long>(failed));
         free_import(*c);
         return nullptr;
     }
@@ -1153,6 +1206,23 @@ std::string import_idle_report_locked() {
     return buf;
 }
 
+// A window whose import failed less than kImportBackoffMs ago is not asked of
+// the driver again (counted); and a failure's time, over its windows.
+bool import_backing_off(const DmemChunk& d, std::uint32_t w0, std::uint32_t w1) {
+    const std::uint64_t now = static_cast<std::uint64_t>(steady_ms());
+    for (std::uint32_t w = w0; w <= w1 && w < kImportWindows; ++w) {
+        if (d.failed_ms[w] && now - d.failed_ms[w] < kImportBackoffMs) {
+            g_import_backed_off.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+    }
+    return false;
+}
+void import_failed_at(DmemChunk& d, std::uint32_t w0, std::uint32_t w1) {
+    const std::uint64_t now = std::max<std::uint64_t>(static_cast<std::uint64_t>(steady_ms()), 1);
+    for (std::uint32_t w = w0; w <= w1 && w < kImportWindows; ++w) d.failed_ms[w] = now;
+}
+
 const Chunk* dmem_import(std::uint32_t index, std::uint64_t in, std::uint64_t bytes, bool past_end) {
     if (index >= gcn::kDmemChunks) return nullptr;
     DmemChunk& d = g.dmem[index];
@@ -1169,8 +1239,12 @@ const Chunk* dmem_import(std::uint32_t index, std::uint64_t in, std::uint64_t by
         const std::uint64_t hi = std::min(d.span_hi, static_cast<std::uint64_t>(w1 + 1) << kImportWindowShift);
         bool merged = false;
         for (std::uint32_t w = w0; w <= w1; ++w) merged |= d.window[w] != nullptr;
+        if (import_backing_off(d, w0, w1)) return nullptr;
         Chunk* c = import_span(index, lo, hi);
-        if (!c) return nullptr;
+        if (!c) {
+            import_failed_at(d, w0, w1);
+            return nullptr;
+        }
         if (merged) g_imports_merged.fetch_add(1, std::memory_order_relaxed);
         for (std::uint32_t w = w0; w <= w1; ++w) {
             // A window another import already held keeps its pages' entries.
@@ -1214,8 +1288,14 @@ const Chunk* dmem_import(std::uint32_t index, std::uint64_t in, std::uint64_t by
             if (o->lo + o->size > hi) hi = o->lo + o->size, grew = true;
         }
     }
+    const std::uint32_t wa = static_cast<std::uint32_t>(lo >> kImportWindowShift);
+    const std::uint32_t wb = static_cast<std::uint32_t>((std::min(hi, kChunkBytes) - 1) >> kImportWindowShift);
+    if (import_backing_off(d, wa, wb)) return nullptr;
     Chunk* c = import_span(index, lo, hi);
-    if (!c) return nullptr;
+    if (!c) {
+        import_failed_at(d, wa, wb);
+        return nullptr;
+    }
     note_import_asker_locked(c->size);
     install_import_locked(index, c);
     if (g_idle_census) c->made_ms = static_cast<std::uint64_t>(steady_ms());
@@ -11491,6 +11571,15 @@ void host_gpu_report() {
                  static_cast<ull>(g_import_who_n[kIwSpan].load()), mib(g_import_who_bytes[kIwSpan]), static_cast<ull>(g_imports_merged.load()),
                  static_cast<ull>(g_imports_retired.load()), mib(g_import_retired_bytes), static_cast<ull>(live >> 20), nlive,
                  static_cast<ull>(flex >> 20));
+        if (g_import_failed.load() || g_import_fail_test.mode)
+            host_log("gpu: guest memory imports failed %llu (%llu MiB asked%s) - bindings %llu, device addresses %llu, walks %llu, prefetch %llu, "
+                     "whole spans %llu; a window asked again within %llu ms of a failure, read through the page table instead %llu",
+                     static_cast<ull>(g_import_failed.load()), mib(g_import_failed_bytes),
+                     g_import_fail_test.mode ? (", " + std::to_string(g_import_forced.load()) + " of them by BBHOST_TEST_IMPORT_FAIL").c_str() : "",
+                     static_cast<ull>(g_import_failed_who[kIwBinding].load()), static_cast<ull>(g_import_failed_who[kIwAddress].load()),
+                     static_cast<ull>(g_import_failed_who[kIwWalk].load()), static_cast<ull>(g_import_failed_who[kIwPrefetch].load()),
+                     static_cast<ull>(g_import_failed_who[kIwSpan].load()), static_cast<ull>(kImportBackoffMs),
+                     static_cast<ull>(g_import_backed_off.load()));
         // Who waited for the driver: the import thread's imports keep nobody waiting.
         const auto ms = [](const std::atomic<std::uint64_t>& us) { return static_cast<double>(us.load()) / 1e3; };
         host_log("gpu: guest memory imports waited for (the driver's time of the thread that asked): by the paths that needed them %llu in %.0f ms "

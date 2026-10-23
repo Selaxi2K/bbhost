@@ -141,6 +141,10 @@ struct DmemChunk {
     std::uint64_t span_lo = 0, span_hi = 0;      // what may be imported (gpu_span); empty: nothing
     std::vector<std::unique_ptr<Chunk>> imports;  // the live imports (retired ones go to a slot's dead_imports)
     Chunk* window[kImportWindows] = {};           // the import that covers each window
+    // When an import over each window last failed (steady ms; 0: never): the
+    // window is not asked of the driver again for a while (import_backoff_ms),
+    // its draws read through the page table and the sink meanwhile.
+    std::uint64_t failed_ms[kImportWindows] = {};
 };
 // A plain device-addressable buffer (page tables, sink page).
 struct DevBuffer {
