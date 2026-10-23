@@ -908,7 +908,13 @@ GUEST_ABI std::int64_t tsharp_hook(std::uint64_t, const std::uint64_t* saved) {
 // The upload pool's block source: rdi = the pool, rsi = bytes, the block
 // comes back in rax. The pool's aligned hand-out (0x2aa9fa0) has the same
 // first two arguments, and so do the top end's two. `top`: 1 for those.
+// Once the arena's proof has failed and no census counts, the hand-out runs
+// as if not hooked.
 GUEST_ABI std::int64_t pool_hook(std::uint64_t top, const std::uint64_t* saved) {
+    if (!gxvk::arena_recording() && (top || !(g_census || gxvk::census()))) {
+        gxvk::arena_unrecorded();
+        return 0;
+    }
     Pending p{saved[6], kPoolCall, 0, saved[5], saved[4]};
     p.extra = top;
     t_pending.push_back(p);
@@ -1424,7 +1430,7 @@ extern "C" GUEST_ABI std::uint64_t gx_res_after(std::uint64_t result) {
         }
         if (result && p.type) {
             if (!p.extra) gxvk::census_handout(p.holder, result, p.type);
-            gxvk::arena_handout(p.holder, result);
+            gxvk::arena_handout(p.holder, result, p.extra != 0);
         }
     } else if (p.kind == kObject) {
         std::uint64_t object = 0;
