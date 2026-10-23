@@ -373,7 +373,17 @@ for it; the rest run as at 30. `effect_steps = 30` runs them all on whole
 updates a second above 60); `frame` steps them by the frame's time. A
 bbhost.toml that sets `effect_steps` keeps its value; one without it gets
 smooth. `BBHOST_SFX_STEP=30|smooth|60|frame` overrides the setting, and
-`BBHOST_SFX_SMOOTH=0|1` turns the smooth steps off or on for a test run. The wakes
+`BBHOST_SFX_SMOOTH=0|1` turns the smooth steps off or on for a test run. An
+effect's emissions - the particles and children its nodes make - follow a
+clock of their own (`[video] effect_emission`, `BBHOST_SFX_EMISSION`): with
+`60`, the default, they come as the game's effects make them at 60 updates a
+second, every 1/60 s of the node's time at every frame rate, 30 included -
+with the smooth steps each on the frame its time falls in (a node's children
+on its whole steps' frames), otherwise on the whole step's frame; the rest of
+what the effects count keeps 30's steps. Most of the game's emitters (8,421 of its 15,330 CPU particle
+records) ask for an emission every 1/60 s, and an update makes at most one,
+so at 30 updates a second the game makes half of them - the PS4's look,
+which `effect_emission = 30` keeps (`decomp/sfx/node_emit.cpp`). The wakes
 characters leave in water (GX's water interaction, one wave step a frame) step
 at 30 a second of game time above 30 too, on the effects' whole steps, so they
 spread as fast as at 30; each step takes the latest frame's wakes, as at 30,
