@@ -139,8 +139,12 @@ std::atomic<std::uint64_t> g_fell[kWhys] = {};
 std::atomic<std::uint64_t> g_violations_order{0}, g_violations_bytes{0}, g_samples_checked{0}, g_samples_skipped{0};
 std::atomic<std::uint64_t> g_noted[kArenaNotes] = {}, g_noted_bytes[kArenaNotes] = {};
 
+// The submissions whose work is done: the landing's count or the retirements',
+// whichever is further. The landing's count raised before their labels are in
+// memory (landing(), not landed()): GX hands a range out again as soon as it
+// reads its release label, which can be before landed() counts the submission.
 std::uint64_t done_submissions() {
-    return std::max<std::uint64_t>(label_landing::landed(), host_gpu_completed_submits_seen());
+    return std::max<std::uint64_t>(MUTANT(7) ? label_landing::landed() : label_landing::landing(), host_gpu_completed_submits_seen());
 }
 
 std::uint64_t hash_of(std::uint64_t va, std::uint64_t bytes) {

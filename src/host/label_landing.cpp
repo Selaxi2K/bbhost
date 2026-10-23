@@ -116,6 +116,7 @@ Ring<Entry>& g_writes = g_st.writes;
 int g_landed_waiters = 0;  // under g_mu: wait_landed_past's (the arena acquire's) threads
 bool g_idle = false;       // under g_mu: the thread waits for a batch (only then does add() wake it)
 std::atomic<std::uint64_t> g_landed{0};
+std::atomic<std::uint64_t> g_landing{0};  // landing(): raised before the writes are stored
 std::atomic<bool> g_started{false};
 bool g_on_thread = false;  // under g_mu: the thread is landing (for the counts)
 
@@ -163,6 +164,7 @@ void store(const Entry& w) {
 void land_locked(std::uint64_t completed) {
     bool any = false;
     const std::uint64_t t = g_batches.empty() ? 0 : now_ns();
+    if (completed > g_landing.load(std::memory_order_relaxed)) g_landing.store(completed, std::memory_order_release);
     while (!g_batches.empty() && g_batches.front().serial < completed) {
         const Batch b = g_batches.front();
         g_batches.pop_front();
@@ -278,6 +280,7 @@ std::uint64_t land_through(std::uint64_t completed) {
 }
 
 std::uint64_t landed() { return g_landed.load(std::memory_order_acquire); }
+std::uint64_t landing() { return g_landing.load(std::memory_order_acquire); }
 
 bool wait_landed_past(std::uint64_t seen, std::chrono::microseconds timeout) {
     std::unique_lock<std::mutex> lk(g_mu);

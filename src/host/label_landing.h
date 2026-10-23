@@ -62,6 +62,13 @@ void add_copy(std::uint64_t serial, std::uint64_t va, const void* src, std::uint
 // Lands the writes of every submission before `completed` (submissions are
 // counted from 0: `completed` of them have run); returns landed().
 std::uint64_t land_through(std::uint64_t completed);
+// Every submission before this count has run and has its writes in memory or
+// on their way: raised before they are stored, where landed() is raised after.
+// So a thread that has seen one of a submission's writes in memory - the game
+// reading a label - finds this count past that submission (x86 keeps the
+// landing thread's stores in order, and the reader's later load after its
+// earlier one).
+std::uint64_t landing();
 // Every submission before this count has its writes in memory.
 std::uint64_t landed();
 // Until landed() > seen or the timeout; true when it is.

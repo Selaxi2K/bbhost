@@ -737,6 +737,10 @@ sends every binding of the heap back to today's path for the rest of the run,
 and the exit report says so. Both ends' hand-outs are records: while only the
 start's were, memory the top end took back after the load into Old Yharnam
 read as a stale record's, and the proof stopped in two of four runs.
+A submission counts as completed for the proof from just before its labels
+land, not after: GX hands a range out again the moment it reads the label,
+which can come before bbhost has counted the labels in memory, and counted
+after, such a reuse read as early in one of four runs at Old Yharnam.
 `BBHOST_GXVK_ARENA=compare` keeps today's path
 and checks every binding of the heap as in place would bind it.
 Moving the heap into video memory the CPU writes was tried and dropped
