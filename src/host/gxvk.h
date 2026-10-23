@@ -246,9 +246,9 @@ void arena_report();
 // unmapped (heap_written). The first such event is said once and counted, and
 // from it on every binding of the heap asks again - in the command processor's
 // order, so before any binding that could see what it did.
-// BBHOST_GXVK_HEAP_SNAP: 0 (the default) today's path; 1 the answers known;
-// compare: today's path, with each binding's lookups checked against the
-// known answers (counted by kind, the first few said).
+// BBHOST_GXVK_HEAP_SNAP: unset or 1 (the default) the answers known; 0
+// today's path; compare: today's path, with each binding's lookups checked
+// against the known answers (counted by kind, the first few said).
 enum class HeapSnap : int { kOff = 0, kOn = 1, kCompare = 2 };
 HeapSnap heap_snap_mode();
 inline bool heap_snap_wanted() { return heap_snap_mode() != HeapSnap::kOff; }

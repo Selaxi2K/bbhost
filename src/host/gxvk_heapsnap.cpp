@@ -20,9 +20,9 @@
 // answers off for the rest of the run before it matters: said once, counted,
 // and every binding of the heap takes the lookups again.
 //
-// BBHOST_GXVK_HEAP_SNAP=1 takes the answers as known; =compare keeps today's
-// path and checks each binding's lookups against them. Unset or 0 (the
-// default), nothing here runs.
+// BBHOST_GXVK_HEAP_SNAP unset or 1 (the default) takes the answers as known;
+// =compare keeps today's path and checks each binding's lookups against them;
+// =0 is today's path, and nothing here runs.
 #include "host/gxvk.h"
 
 #include "log.h"
@@ -51,9 +51,9 @@ HeapSnap g_mode = HeapSnap::kOff;  // tests/gxvk_heapsnap_test.cpp sets it (heap
 #else
 const HeapSnap g_mode = [] {
     const char* e = std::getenv("BBHOST_GXVK_HEAP_SNAP");
-    if (!e || !*e) return HeapSnap::kOff;
+    if (!e || !*e) return HeapSnap::kOn;  // the default
     if (std::strcmp(e, "compare") == 0) return HeapSnap::kCompare;
-    return e[0] == '1' ? HeapSnap::kOn : HeapSnap::kOff;
+    return e[0] == '0' ? HeapSnap::kOff : HeapSnap::kOn;
 }();
 #endif
 
