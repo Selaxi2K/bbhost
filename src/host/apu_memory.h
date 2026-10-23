@@ -10,8 +10,10 @@
 // from Vulkan so a test can drive it.
 //
 // Three parts, each with its switch: the environment first (any device, for
-// tests and comparisons), then the config, then the default - off everywhere
-// for now (kWindowsApuDefaults).
+// tests and comparisons), then the config, then the default - on for an
+// integrated GPU under Windows (kWindowsApuDefaults), off elsewhere. Two
+// sizes follow the same defaults: the upload staging's floor and the buffer
+// shadow's mirror windows.
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -69,6 +71,43 @@ inline bool settled(std::uint64_t latest_end_ms, std::uint64_t now_ms, bool load
 inline bool staging_give_now(bool on, std::uint64_t free_bytes, std::uint64_t floor, bool settled_now, bool reserve_short,
                              std::uint64_t now_ms, std::uint64_t last_given_ms, std::uint64_t pace_ms) {
     return on && free_bytes > floor && settled_now && (reserve_short || now_ms - last_given_ms >= pace_ms);
+}
+
+// The upload staging's floor in MiB: made at the start, and what part 1 gives
+// staging back down to (BBHOST_STAGING_FLOOR_MB, a number of MiB on any
+// device). 128 on an integrated GPU under Windows, 256 elsewhere: on a Radeon
+// 680M at a lamp, at 1080p, 128 held 128 MiB less of the shared GPU memory at
+// the same frame rate and load times, with two to four more 64 MiB chunks
+// given back a run (each free 1.4 ms at most).
+constexpr std::uint64_t kStagingFloorMiB = 256, kWindowsApuStagingFloorMiB = 128;
+
+inline std::uint64_t staging_floor_mib(const char* env, int integrated, bool windows_host) {
+    if (env && *env) return std::strtoull(env, nullptr, 10);
+    return apu_defaults(integrated, windows_host) ? kWindowsApuStagingFloorMiB : kStagingFloorMiB;
+}
+
+// The buffer shadow's mirror windows in MiB (buffer_shadow.cpp window_pages):
+// 64 on a discrete GPU, 4 on an integrated one, 1 on an integrated GPU under
+// Windows; BBHOST_SHADOW_WINDOW_MB, a power of two from 1 to 512, on any
+// device (anything else keeps the default). On the Radeon 680M at a lamp,
+// 1 MiB windows held 199-223 MiB less than 4 MiB ones at 1080p and at
+// 960x540, at the same frame rate, with about 4 M more ranges a run read
+// from host memory across a window's edge. The command processor's time a
+// flip stayed the same at 60 fps (960x540); at 1080p, where the GPU held the
+// frame rate to 27 fps, it was 0.4 ms longer in its draw phase with none of
+// its counted waits changing, while the same reads at 60 fps cost nothing -
+// a cost only while the GPU is the limit, not work per window.
+constexpr std::uint64_t kShadowWindowMiB = 64, kIntegratedShadowWindowMiB = 4, kWindowsApuShadowWindowMiB = 1;
+
+inline std::uint64_t shadow_window_mib(const char* env, int integrated, bool windows_host) {
+    std::uint64_t mb = integrated != 1                            ? kShadowWindowMiB
+                       : apu_defaults(integrated, windows_host) ? kWindowsApuShadowWindowMiB
+                                                                : kIntegratedShadowWindowMiB;
+    if (env && *env) {
+        const std::uint64_t v = std::strtoull(env, nullptr, 10);
+        if (v >= 1 && v <= 512 && (v & (v - 1)) == 0) mb = v;
+    }
+    return mb;
 }
 
 // Part 2: the caches' budget, in MiB of the device-local memory we hold; 0

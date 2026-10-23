@@ -45,6 +45,7 @@
 
 #include "core/write_watch.h"
 #include "engine/gx_resources.h"
+#include "host/apu_memory.h"
 #include "host/import_fallback.h"
 #include "host/copy_runs.h"
 #include "host/gpu_internal.h"
@@ -183,7 +184,8 @@ struct Mirror {
 };
 constexpr std::uint32_t kBlockPages = 1024;  // 64 MiB blocks
 // A window's pages (BBHOST_SHADOW_WINDOWS): 64 MiB on a discrete GPU, 4 on an
-// integrated one, or BBHOST_SHADOW_WINDOW_MB (a power of two from 1 to 512).
+// integrated one, 1 on an integrated GPU under Windows, or
+// BBHOST_SHADOW_WINDOW_MB (a power of two from 1 to 512; host/apu_memory.h).
 // Larger windows hold more pages no draw reads, smaller ones send more ranges
 // across a window's edge to host memory - on an integrated GPU the same RAM:
 // on the Radeon 680M at a lamp 16 MiB windows held 1,248 MiB where 64 MiB ones
@@ -195,11 +197,12 @@ constexpr std::uint32_t kBlockPages = 1024;  // 64 MiB blocks
 // mirror is made, after the device is known.
 std::uint32_t window_pages() {
     static const std::uint32_t pages = [] {
-        std::uint64_t mb = g.integrated ? 4 : 64;
-        if (const char* e = std::getenv("BBHOST_SHADOW_WINDOW_MB"); e && *e) {
-            const std::uint64_t v = std::strtoull(e, nullptr, 10);
-            if (v >= 1 && v <= 512 && (v & (v - 1)) == 0) mb = v;
-        }
+#if defined(_WIN32)
+        constexpr bool kWindowsHost = true;
+#else
+        constexpr bool kWindowsHost = false;
+#endif
+        const std::uint64_t mb = apu_memory::shadow_window_mib(std::getenv("BBHOST_SHADOW_WINDOW_MB"), g.integrated ? 1 : 0, kWindowsHost);
         return static_cast<std::uint32_t>((mb << 20) / kPageBytes);
     }();
     return pages;

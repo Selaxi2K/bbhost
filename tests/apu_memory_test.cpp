@@ -1,9 +1,10 @@
 // What an integrated GPU gives back of the memory it holds in play
 // (host/apu_memory.h): the three parts' switches - the environment, then the
-// config, then the device's default, off everywhere until
-// kWindowsApuDefaults - the budget, drain and spare arithmetic the memory
-// keeper and the textures' eviction and drain use, and when the keeper gives
-// staging back (the world settled, counted from the latest load's end).
+// config, then the device's default, on for an integrated GPU under Windows
+// (kWindowsApuDefaults) - the staging floor and the mirror windows' size by
+// device, the budget, drain and spare arithmetic the memory keeper and the
+// textures' eviction and drain use, and when the keeper gives staging back
+// (the world settled, counted from the latest load's end).
 #include "host/apu_memory.h"
 
 #include <cstdio>
@@ -117,6 +118,44 @@ void test_drain_and_spare() {
     CHECK(spare_play_blocks("0", false, false) == 0);
 }
 
+void test_sizes() {
+    // The staging floor: 128 MiB on an integrated GPU under Windows once the defaults are on, 256 elsewhere.
+    CHECK(kWindowsApuStagingFloorMiB == 128 && kStagingFloorMiB == 256);
+    CHECK(staging_floor_mib(nullptr, 1, true) == (kWindowsApuDefaults ? kWindowsApuStagingFloorMiB : kStagingFloorMiB));
+    for (int integrated = -1; integrated <= 1; ++integrated) {
+        for (int host = 0; host < 2; ++host) {
+            if (!(integrated == 1 && host)) CHECK(staging_floor_mib(nullptr, integrated, host) == 256);
+            CHECK(staging_floor_mib("", integrated, host) == staging_floor_mib(nullptr, integrated, host));  // empty: the default
+            CHECK(staging_floor_mib("512", integrated, host) == 512);  // the environment, on any device
+            CHECK(staging_floor_mib("0", integrated, host) == 0);      // none kept
+        }
+    }
+    // The mirror windows: 64 MiB on a discrete GPU or before the device is chosen, 4 on an integrated one, 1 on an
+    // integrated GPU under Windows once the defaults are on.
+    CHECK(kWindowsApuShadowWindowMiB == 1 && kIntegratedShadowWindowMiB == 4 && kShadowWindowMiB == 64);
+    CHECK(shadow_window_mib(nullptr, 1, true) == (kWindowsApuDefaults ? 1u : 4u));
+    CHECK(shadow_window_mib(nullptr, 1, false) == 4);
+    CHECK(shadow_window_mib(nullptr, 0, true) == 64);
+    CHECK(shadow_window_mib(nullptr, 0, false) == 64);
+    CHECK(shadow_window_mib(nullptr, -1, true) == 64);
+    CHECK(shadow_window_mib(nullptr, -1, false) == 64);
+    for (int integrated = -1; integrated <= 1; ++integrated) {
+        for (int host = 0; host < 2; ++host) {
+            const std::uint64_t def = shadow_window_mib(nullptr, integrated, host);
+            CHECK(shadow_window_mib("", integrated, host) == def);
+            CHECK(shadow_window_mib("1", integrated, host) == 1);
+            CHECK(shadow_window_mib("2", integrated, host) == 2);
+            CHECK(shadow_window_mib("16", integrated, host) == 16);
+            CHECK(shadow_window_mib("512", integrated, host) == 512);
+            // Not a power of two, none, over 512 or not a number: the default stays.
+            CHECK(shadow_window_mib("3", integrated, host) == def);
+            CHECK(shadow_window_mib("0", integrated, host) == def);
+            CHECK(shadow_window_mib("1024", integrated, host) == def);
+            CHECK(shadow_window_mib("x", integrated, host) == def);
+        }
+    }
+}
+
 void test_staging_settle() {
     // The world settles 30 s after the latest load's end, with no loading screen up.
     constexpr std::uint64_t kSettle = 30000;
@@ -169,6 +208,7 @@ int main() {
     test_flag();
     test_budget();
     test_drain_and_spare();
+    test_sizes();
     test_staging_settle();
     if (g_fail) {
         std::printf("apu_memory_test: %d failed\n", g_fail);

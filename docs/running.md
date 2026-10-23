@@ -239,8 +239,9 @@ and `BBHOST_HEAP_DRAIN=0` turn the split and the draining off);
 ring and the texture upload scratch at their largest from the start. On a GPU
 without sparse binding (AMD, integrated GPUs) the vertex data's mirrors are
 made 64 MiB at a time as the game's meshes need them (4 MiB on an
-integrated GPU; `BBHOST_SHADOW_WINDOW_MB` sets it), rather than a whole
-gigabyte each (`BBHOST_SHADOW_WINDOWS=0` goes back to whole ones). On an
+integrated GPU, 1 MiB on one under Windows; `BBHOST_SHADOW_WINDOW_MB` sets
+it), rather than a whole gigabyte each (`BBHOST_SHADOW_WINDOWS=0` goes back
+to whole ones). On an
 integrated GPU, where those mirrors would be the same memory again, the
 meshes in the game's own vertex and index buffers are read where they are,
 with no copy (`BBHOST_SHADOW_IN_PLACE=0` copies them as before; `=1` reads
@@ -260,8 +261,10 @@ upload staging held from a load on. Three switches give them back, on any GPU;
 all three are on by default on an integrated GPU under Windows (a 2048 MiB
 budget there) and off elsewhere:
 - `BBHOST_STAGING_RETURN=1` (or `staging_return = true` under `[gpu]`): the
-  upload staging goes back down to 256 MiB in play, 64 MiB every two seconds
-  from 30 s after the latest load (a death or a lamp starts the count again).
+  upload staging goes back down to its floor in play (256 MiB, 128 on an
+  integrated GPU under Windows; `BBHOST_STAGING_FLOOR_MB=<n>` sets it), 64 MiB
+  every two seconds from 30 s after the latest load (a death or a lamp starts
+  the count again).
   The log gives each free's time and flip, and the exit line `given back in
   play` their total.
 - `BBHOST_CACHE_BUDGET_MB=<n>` (or `cache_budget_mb = <n>` under `[gpu]`): a

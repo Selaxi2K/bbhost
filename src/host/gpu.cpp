@@ -7365,7 +7365,8 @@ std::string video_memory_report_locked(bool at_exit) {
 //                     tight memory) in play, BBHOST_IMAGE_HEAP_SPARE_LOADING
 //                     (4; 1) during a load; an empty block above that goes
 //                     back after 10 s in play
-//   upload staging    BBHOST_STAGING_FLOOR_MB (256) made at the start;
+//   upload staging    BBHOST_STAGING_FLOOR_MB (256; 128 on an integrated GPU
+//                     under Windows, host/apu_memory.h) made at the start;
 //                     BBHOST_STAGING_RESERVE_MB (768; 256) made ready during
 //                     a load and kept in play for the next one, what is over
 //                     it given back while a loading screen is up
@@ -7391,10 +7392,16 @@ void start_memory_reserve() {
         const char* e = std::getenv(name);
         return e && *e ? static_cast<std::uint64_t>(std::strtoull(e, nullptr, 10)) : fallback;
     };
+#if defined(_WIN32)
+    constexpr bool kWindowsHost = true;
+#else
+    constexpr bool kWindowsHost = false;
+#endif
     // With tight memory (memory_tight) only what is needed: the spares are
     // what a Steam Deck's world ran out of.
     const std::uint64_t reserve = env("BBHOST_STAGING_RESERVE_MB", g.tight ? 256 : 768) << 20;
-    const std::uint64_t floor = std::min(env("BBHOST_STAGING_FLOOR_MB", 256) << 20, reserve);
+    const std::uint64_t floor =
+        std::min(apu_memory::staging_floor_mib(std::getenv("BBHOST_STAGING_FLOOR_MB"), g.integrated ? 1 : 0, kWindowsHost) << 20, reserve);
     // Small video memory (small_vram) too: a spare block is 256 MiB of it
     // the targets cannot have.
     const bool few = g.tight || g.small_vram;
@@ -7406,11 +7413,6 @@ void start_memory_reserve() {
     const std::uint64_t spare_load = std::max(env("BBHOST_IMAGE_HEAP_SPARE_LOADING", few ? 1 : 4), spare_play);
     g_spare_play_blocks.store(spare_play, std::memory_order_relaxed);
     const bool keeper = env("BBHOST_MEMORY_KEEPER", 1) != 0;
-#if defined(_WIN32)
-    constexpr bool kWindowsHost = true;
-#else
-    constexpr bool kWindowsHost = false;
-#endif
     // BBHOST_STAGING_RETURN, else gpu.staging_return, else the device's default (host/apu_memory.h).
     const std::string staging_return_cfg = config_value("gpu.staging_return");
     const bool staging_return =
