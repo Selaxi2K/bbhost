@@ -752,6 +752,10 @@ void textures_drain_counts(std::uint64_t out[4]);
 // flush, while its recording is open. And what it has done, for the census.
 void textures_relocate_pinned_locked();
 std::string textures_relocate_report();
+// The targets' drain (render.cpp) asking for block `block`'s pinned surfaces
+// to move at the next flush, as the textures' drain does: true when they will
+// (BBHOST_HEAP_RELOCATE on, none failed, 32 MiB at most, no other block named).
+bool textures_relocate_block_locked(int block);
 // The video memory this process may still take, in bytes (negative: over
 // budget): BBHOST_TEST_VRAM_MB's limit less what our allocations hold against
 // it, else the driver's budget for the heap less its usage

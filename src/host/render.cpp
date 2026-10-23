@@ -10613,9 +10613,16 @@ bool rt_return_one_locked(RtImage& r) { return rt_remake_locked(r, false); }
 // nothing. Once a second while no load is on, 32 MiB of targets a turn; a
 // block not empty 30 s after its drain began is left as it is, and no other
 // drain begins for 30 s after one ends (a target the game makes again and
-// again would move each time).
+// again would move each time). A block that holds surfaces the GPU wrote, up
+// to 32 MiB of them, has them moved too (textures_relocate_block_locked, the
+// textures' drain's relocation; BBHOST_HEAP_RELOCATE=0 leaves such a block):
+// on an RTX 4070 held to a 4 GB card's budget (BBHOST_TEST_VRAM_MB=2950) the
+// Nightmare of Mensis's drain found its block so held four times, no block
+// went back, the mirrors stayed at 512 MiB while the draws asked for more,
+// and 16.8 million draws read their vertices across the bus: 53 fps
+// uncapped, the GPU at 18.5 ms a flip, against 90 when a block went back.
 std::uint64_t g_td_blocks = 0, g_td_emptied = 0, g_td_targets = 0, g_td_bytes = 0, g_td_dropped = 0, g_td_refused = 0,
-              g_td_pinned = 0, g_td_gave_up = 0;
+              g_td_pinned = 0, g_td_gave_up = 0, g_td_relocating = 0;
 }  // namespace
 
 void drain_target_blocks_locked() {
@@ -10649,9 +10656,12 @@ void drain_target_blocks_locked() {
         constexpr std::uint64_t kMostUsed = 64ull << 20, kSpare = 32ull << 20;
         if (c < 0 || used > kMostUsed || room < used + kSpare) return;
         if (textures_block_pinned_locked(c)) {
-            ++g_td_pinned;
-            quiet_until_ms = now + 30000;
-            return;
+            if (!textures_relocate_block_locked(c)) {
+                ++g_td_pinned;
+                quiet_until_ms = now + 30000;
+                return;
+            }
+            ++g_td_relocating;  // its GPU-written surfaces move at this flush
         }
         block = c;
         image_heap_avoid_block_locked(block);
@@ -10664,6 +10674,9 @@ void drain_target_blocks_locked() {
                      block, static_cast<unsigned long long>(used >> 20), static_cast<unsigned long long>(room >> 20));
     }
     g_td_dropped += textures_drop_block_locked(block);
+    // (Surfaces the GPU wrote that are still there - one busy at the last
+    // flush - are asked to move again.)
+    if (textures_block_pinned_locked(block)) textures_relocate_block_locked(block);
     std::uint64_t moved = 0;
     for (std::map<std::uint64_t, RtImage>* m : {&g_rts, &g_snapshots}) {
         for (auto& [base, r] : *m) {
@@ -10685,14 +10698,15 @@ void drain_target_blocks_locked() {
 
 std::string target_drain_report() {
     if (!g_td_blocks && !g_td_pinned) return {};
-    char buf[256];
+    char buf[320];
     std::snprintf(buf, sizeof(buf),
-                  "; targets' blocks drained %llu (emptied %llu, given up %llu, no room for a target %llu, a GPU-written surface in it %llu): "
-                  "targets moved %llu (%llu MiB), textures and copies let go %llu MiB",
+                  "; targets' blocks drained %llu (emptied %llu, given up %llu, no room for a target %llu, a GPU-written surface in it %llu, "
+                  "its GPU-written surfaces moved too %llu): targets moved %llu (%llu MiB), textures and copies let go %llu MiB",
                   static_cast<unsigned long long>(g_td_blocks), static_cast<unsigned long long>(g_td_emptied),
                   static_cast<unsigned long long>(g_td_gave_up), static_cast<unsigned long long>(g_td_refused),
-                  static_cast<unsigned long long>(g_td_pinned), static_cast<unsigned long long>(g_td_targets),
-                  static_cast<unsigned long long>(g_td_bytes >> 20), static_cast<unsigned long long>(g_td_dropped >> 20));
+                  static_cast<unsigned long long>(g_td_pinned), static_cast<unsigned long long>(g_td_relocating),
+                  static_cast<unsigned long long>(g_td_targets), static_cast<unsigned long long>(g_td_bytes >> 20),
+                  static_cast<unsigned long long>(g_td_dropped >> 20));
     return buf;
 }
 
