@@ -10082,6 +10082,7 @@ bool twin_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& out, VkD
         g_twin_made.fetch_add(1, std::memory_order_relaxed);
         g_twin_made_bytes.fetch_add(nt.size, std::memory_order_relaxed);
         g_twin_live_bytes += nt.size;
+        gxvk::heap_written(gxvk::kHeapGuardTwin, memory, cbytes);  // GX's upload heap is no GX buffer's own memory (stage 1d.1)
         t = g_twin_live.emplace(memory, nt).first;
     }
     out.buffer = t->second.buffer;
@@ -11294,6 +11295,7 @@ bool copy_version_make_locked(std::uint64_t dst, std::uint64_t src, std::uint64_
     if (!acquire_staging_locked(v.copy, bytes, v.offset)) return refuse(kCvOther);
     std::memcpy(v.copy.map, from, bytes);
     note_gpu_write_over_marker("guest copy", dst, src, bytes);
+    gxvk::heap_written(gxvk::kHeapGuardCopyVersion, dst, bytes);  // a copy-back's destination is never GX's upload heap (stage 1d.1)
     copy_version_add(v);
     bump(g_cv_made);  // not a locked add: that waits for the copy to leave the write-combining buffers
     return true;

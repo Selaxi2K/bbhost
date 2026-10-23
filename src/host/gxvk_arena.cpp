@@ -239,10 +239,11 @@ void arena_region(std::uint64_t pool, std::uint64_t region, std::uint64_t bytes)
     if (const char* e = std::getenv("BBHOST_GXVK_ARENA"); e && e[0] == '2')
         host_log("gxvk arena: BBHOST_GXVK_ARENA=2 is gone - the heap in video memory the CPU writes was measured slower "
                  "(docs/rendering.md); today's path");
-    if (g_mode == Arena::kOff && !census()) return;  // the census counts today's path over the heap
     // The pool's bounds as its init sets them: 16-byte aligned.
     const std::uint64_t pad = (0u - static_cast<std::uint32_t>(region)) & 0xfu;
     const std::uint64_t lo = region + pad, hi = lo + ((bytes - pad) & ~std::uint64_t{0xf});
+    heap_snap_region(lo, hi);  // stage 1d.1's snapshots with the lookups' answers known (host/gxvk_heapsnap.cpp), when on
+    if (g_mode == Arena::kOff && !census()) return;  // the census counts today's path over the heap
     {
         std::lock_guard<std::mutex> lk(g_mu);
         if (g_lo.load(std::memory_order_relaxed)) {

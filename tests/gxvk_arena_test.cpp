@@ -45,6 +45,7 @@ std::uint64_t landed() { return trailing(); }
 }  // namespace label_landing
 namespace gxvk {
 bool census() { return false; }
+void heap_snap_region(std::uint64_t, std::uint64_t) {}  // stage 1d.1's (tests/gxvk_heapsnap_test.cpp)
 }  // namespace gxvk
 
 namespace {

@@ -1609,6 +1609,7 @@ void keep_params(const std::string& name, const gcn::StageParams& params, int st
 }
 std::atomic<std::uint64_t> g_cb_realigned{0}, g_cb_realigned_bytes{0};
 std::atomic<std::uint64_t> g_cb_snapshots{0};  // of them, memory the game writes on the CPU (BBHOST_CB_SNAPSHOT)
+bool g_cb_ring_made = false;  // the constant-buffer copies' ring is made (resolve_stage_buffers), under g.mu
 std::atomic<std::uint64_t> g_cb_snapshots_shared{0};  // bindings that took an earlier snapshot of the recording (BBHOST_CB_SNAPSHOT_DEDUPE)
 // BBHOST_CB_SNAPSHOT_DEDUPE=check / =compare: the bindings that found an
 // earlier snapshot of the recording and compared its bytes with the guest's,
@@ -12982,11 +12983,31 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
         bool in_heap = false;
         if (outcome == kUnmapped && gxvk::arena_wanted() && gxvk::arena_bind(base, bytes, g.flushes, gxvk::kUseConstant, b.written))
             in_heap = heap_located_locked(base, bytes, loc);  // (one it does not bind is counted there)
+        // The rest of GX's upload heap (stage 1d.1, BBHOST_GXVK_HEAP_SNAP=1): a
+        // renamed copy is snapshotted below with the lookups' answers known - no
+        // copy version (the heap is a copy-back's source, never its
+        // destination), no twin, no GPU write still to land, mapped - which
+        // host/gxvk_heapsnap.cpp watches at the writers instead. `known`: those
+        // answers taken; `check` (=compare): the lookups asked, and checked
+        // against them.
+        static const bool snapshots_on = [] {
+            const char* e = std::getenv("BBHOST_CB_SNAPSHOT");
+            return !(e && e[0] == '0');
+        }();
+        static const bool heap_snap = gxvk::heap_snap_wanted();
+        bool known = false, check = false;
+        if (!in_heap && outcome == kUnmapped && heap_snap &&
+            gxvk::heap_snap_binding(base, bytes, b.written, !t_draw_windows.empty(), snapshots_on, cb_proof::g_on || glitch_watching_draw(),
+                                    g_cb_ring_made)) {
+            known = gxvk::heap_snap_mode() == gxvk::HeapSnap::kOn;
+            check = !known;
+        }
         if (!in_heap && outcome == kUnmapped && b.written) {
             if (copy_version_lookup_locked(base, bytes, &loc) != kCopyVersionNone) copy_versions_put_in_place_locked(kCvWalks);
             loc = Located{};
-        } else if (!in_heap && outcome == kUnmapped) {
+        } else if (!in_heap && outcome == kUnmapped && !known) {
             version = copy_version_lookup_locked(base, bytes, &loc);
+            if (check && version != kCopyVersionNone) gxvk::heap_snap_disagree(gxvk::kHeapDiffCopyVersion, base, bytes);
         }
         if (version == kCopyVersionStraddles) {
             copy_versions_put_in_place_locked(kCvStraddle);
@@ -13000,20 +13021,21 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
         // command processor at the Nightmare of Mensis on a Steam Deck, for a
         // binding the snapshot then replaced. (Whether a GPU write is still to
         // land on the range is asked once, for both.)
-        static const bool snapshots_on = [] {
-            const char* e = std::getenv("BBHOST_CB_SNAPSHOT");
-            return !(e && e[0] == '0');
-        }();
-        int pending_known = -1;
+        int pending_known = known ? 0 : -1;  // (the heap's answer: none)
         const auto gpu_pending = [&]() {
             if (pending_known < 0) pending_known = gpu_writes_pending_locked(base, bytes) ? 1 : 0;
             return pending_known == 1;
         };
+        if (check) {  // =compare: today's lookups, against the heap's answers
+            if (gpu_pending()) gxvk::heap_snap_disagree(gxvk::kHeapDiffGpuWrite, base, bytes);
+            if (!hle_kernel_va_mapped(base, bytes)) gxvk::heap_snap_disagree(gxvk::kHeapDiffUnmapped, base, bytes);
+            if (twin_covers_locked(base, bytes)) gxvk::heap_snap_disagree(gxvk::kHeapDiffTwin, base, bytes);
+        }
         bool copy_only = false;
         if (!in_heap && outcome == kUnmapped && version == kCopyVersionNone &&
             (b.written || t_draw_windows.empty() || !(in_window = draw_window_locked(base, bytes, loc)))) {
-            copy_only = snapshots_on && !b.written && bytes && bytes <= (1u << 20) && !gpu_pending() && hle_kernel_va_mapped(base, bytes) &&
-                        !twin_covers_locked(base, bytes);
+            copy_only = snapshots_on && !b.written && bytes && bytes <= (1u << 20) && !gpu_pending() &&
+                        (known || (hle_kernel_va_mapped(base, bytes) && !twin_covers_locked(base, bytes)));
             if (!copy_only) {
                 // (The reason is worked out only for the census, BBHOST_IMPORT_CENSUS=1.)
                 const ImportSite site(b.written                         ? "a shader's buffer, stored to"
@@ -13072,7 +13094,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
             bool realign = realign_mode == 1 ? (bias % 16) != 0 : realign_mode == 2 ? (bias % 16) == 0 : realign_mode == 3;
             // A GX buffer kept as a device-local twin (BBHOST_GX_TWINS=1): bound
             // in place, the twin; its guest bytes are stale, so no copy of them.
-            const bool twin = !in_heap && twin_covers_locked(base, bytes);
+            const bool twin = !in_heap && !known && twin_covers_locked(base, bytes);
             if (t_snapshot_cbs && !realign) {
                 realign = true;  // BBHOST_SF_SNAPSHOT: the bytes as recorded
                 bump(g_sf_cb_snapshots);
@@ -13145,10 +13167,11 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
             static std::uint64_t segment_lap[kScratch / kScratchSegment] = {};
             std::uint64_t& scratch_lap = g_scratch_lap;
             // (A snapshot's range was located in imported memory: mapped.)
-            if (realign && bytes && bytes <= (1u << 20) && (snapshot || hle_kernel_va_mapped(base, bytes))) {
+            if (realign && bytes && bytes <= (1u << 20) && (snapshot || known || hle_kernel_va_mapped(base, bytes))) {
                 if (!scratch.buffer) {
                     MemOwner own_mem("constant-buffer copies ring");
                     create_upload_buffer(scratch, kScratch, "the constant-buffer copies' ring");
+                    g_cb_ring_made = scratch.map != nullptr;  // (stage 1d.1 takes the heap's answers only once there is a ring to copy into)
                 }
                 // The same buffer snapshotted again within one recording - a
                 // command buffer, the walk of one submission of the game's -
@@ -13239,7 +13262,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                     std::memcpy(static_cast<std::uint8_t*>(scratch.map) + at,
                                 reinterpret_cast<const void*>(static_cast<std::uintptr_t>(base)), copy_bytes);
                     // (A snapshot's range holds no copy-back: the lookup above said so.)
-                    if (!snapshot) copy_versions_overlay_locked(base, bytes, static_cast<std::uint8_t*>(scratch.map) + at);
+                    if (!snapshot && !known) copy_versions_overlay_locked(base, bytes, static_cast<std::uint8_t*>(scratch.map) + at);
                     scratch_next = at + copy_bytes;
                     // A snapshot binds the whole ring and is found by its
                     // dword bias: one descriptor for all of them. Bound at its
@@ -13255,7 +13278,8 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                     // The guest bytes, unless a copy-back's copy laid over them
                     // (never a snapshot's: its range has no copy version, as
                     // the lookup before it said).
-                    if (!whole && version == kCopyVersionNone && (snapshot || copy_version_lookup_locked(base, bytes, nullptr) == kCopyVersionNone))
+                    if (!whole && version == kCopyVersionNone &&
+                        (snapshot || known || copy_version_lookup_locked(base, bytes, nullptr) == kCopyVersionNone))
                         note_copy_binding_locked(info, base);
                     // Not locked adds (bump): one right after the copy waited for
                     // its writes to the ring - write-combined memory - to drain,

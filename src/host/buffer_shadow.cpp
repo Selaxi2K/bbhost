@@ -47,6 +47,7 @@
 #include "engine/gx_resources.h"
 #include "host/copy_runs.h"
 #include "host/gpu_internal.h"
+#include "host/gxvk.h"
 #include "host/shadow_place.h"
 #include "log.h"
 
@@ -2192,6 +2193,7 @@ PageSerials g_gpu_write_pages{21 - kPageShift}, g_gpu_write_small{21 - kSmallShi
 
 void gpu_writes_note_locked(std::uint64_t va, std::uint64_t bytes) {
     if (!bytes) return;
+    gxvk::heap_written(gxvk::kHeapGuardGpuWrite, va, bytes);  // GX's upload heap holds none (stage 1d.1 rests on it)
     const std::uint64_t serial = g.flushes;  // the recording under way
     if (bytes <= kSmallWrite) {
         for (std::uint64_t p = va >> kSmallShift; p <= (va + bytes - 1) >> kSmallShift; ++p) g_gpu_write_small.note(p, serial);
