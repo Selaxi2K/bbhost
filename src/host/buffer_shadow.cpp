@@ -2094,10 +2094,24 @@ namespace {
 constexpr unsigned kSmallShift = 12;
 constexpr std::uint64_t kSmallWrite = 256;
 
+// BBHOST_GPU_WRITE_FILTER (on unless 0): the region filter below.
+const bool g_gpu_write_filter = [] {
+    const char* e = std::getenv("BBHOST_GPU_WRITE_FILTER");
+    return !(e && e[0] == '0');
+}();
+
 // Page number -> the newest recording a GPU write to it went into. Rebuilt
-// with only the writes still to land when it is half full.
+// with only the writes still to land when it is half full. In front of the
+// table, a filter of the 2 MiB regions its writes lie in: a bit of 4,096 (a
+// hash of the region, 512 bytes that stay in the L1 cache) set as a write is
+// noted and set again from the kept ones at a rebuild, so a clear bit says no
+// write in the table lies there and the table is not probed. Constant buffers
+// lie where GPU writes do not (GX's upload heap) and are asked about at every
+// binding - ~10,400 a frame at the Nightmare of Mensis on a Steam Deck, where
+// the probes were among the command processor's cache misses.
 class PageSerials {
 public:
+    explicit PageSerials(unsigned region_shift) : region_shift_(region_shift) {}
     void note(std::uint64_t page, std::uint64_t serial) {
         if ((used_ + 1) * 2 > slots_.size()) rebuild();
         Slot& s = slots_[find(page + 1)];
@@ -2106,9 +2120,11 @@ public:
             ++used_;
         }
         if (serial > s.serial) s.serial = serial;
+        mark(page);
     }
     bool pending(std::uint64_t page) const {
         if (!used_) return false;
+        if (g_gpu_write_filter && !maybe(page)) return false;
         const Slot& s = slots_[find(page + 1)];
         return s.key && s.serial >= g.completed_submits;
     }
@@ -2126,6 +2142,19 @@ private:
     struct Slot {
         std::uint64_t key = 0, serial = 0;
     };
+    unsigned filter_bit(std::uint64_t page) const {
+        return static_cast<unsigned>(((page >> region_shift_) * 0x9e3779b97f4a7c15ull) >> 52);
+    }
+    void mark(std::uint64_t page) {
+        const unsigned b = filter_bit(page);
+        filter_[b >> 6] |= std::uint64_t{1} << (b & 63);
+    }
+    bool maybe(std::uint64_t page) const {
+        const unsigned b = filter_bit(page);
+        return (filter_[b >> 6] >> (b & 63)) & 1;
+    }
+    std::uint64_t filter_[64] = {};
+    unsigned region_shift_;
     std::vector<Slot> slots_;
     std::size_t used_ = 0;
     std::uint64_t dropped_ = 0;
@@ -2144,6 +2173,7 @@ private:
         while ((keep + 1) * 4 > (std::size_t{1} << bits_)) ++bits_;
         slots_.assign(std::size_t{1} << bits_, Slot{});
         used_ = 0;
+        std::fill(std::begin(filter_), std::end(filter_), std::uint64_t{0});
         for (const Slot& s : old) {
             if (!s.key) continue;
             if (s.serial < g.completed_submits) {
@@ -2152,10 +2182,12 @@ private:
             }
             slots_[find(s.key)] = s;
             ++used_;
+            mark(s.key - 1);
         }
     }
 };
-PageSerials g_gpu_write_pages, g_gpu_write_small;
+// (The region filter by 2 MiB: 64 KiB pages 5 bits under it, 4 KiB pages 9.)
+PageSerials g_gpu_write_pages{21 - kPageShift}, g_gpu_write_small{21 - kSmallShift};
 }  // namespace
 
 void gpu_writes_note_locked(std::uint64_t va, std::uint64_t bytes) {
