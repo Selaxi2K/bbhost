@@ -604,6 +604,10 @@ if(UNIX)
   add_executable(import_fallback_test tests/import_fallback_test.cpp)
   target_include_directories(import_fallback_test PRIVATE src)
   add_test(NAME import_fallback_test COMMAND import_fallback_test)
+  # The image heap's placement in its blocks and its compaction's policy: the block chosen, the room kept, the pace, the stop.
+  add_executable(heap_compact_test tests/heap_compact_test.cpp)
+  target_include_directories(heap_compact_test PRIVATE src)
+  add_test(NAME heap_compact_test COMMAND heap_compact_test)
   # Where a plugin's read() reads: the image by Binary Ninja address, the rest at runtime - the slid Windows layout too.
   add_executable(plugin_address_test tests/plugin_address_test.cpp)
   target_include_directories(plugin_address_test PRIVATE src)

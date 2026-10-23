@@ -275,6 +275,16 @@ budget there) and off elsewhere:
 - `BBHOST_HEAP_LEAN=1` (or `heap_lean = true` under `[gpu]`): the image heap
   keeps no spare block in play and drains the textures' blocks sooner.
 
+Where the image heap is lean, it is also compacted once the world has settled
+(`BBHOST_HEAP_COMPACT=0` turns that off, `=1` turns it on anywhere): the
+emptiest of its 256 MiB blocks is emptied into the others' free room and given
+back. Render targets, surfaces the GPU wrote and textures bound in the last 20 s
+are copied, the rest let go to be made again if the game asks; only when the
+copies fit and still leave room for the largest render target the game makes,
+one block at a time, 32 MiB a second, stopped by a load. It takes the place of
+the textures' and the targets' drains. The exit line `made in play` counts the
+image heap blocks that had to be made while the game played.
+
 On other GPUs, unless memory is tight or video memory small, the game's own
 immutable vertex and index buffers are bound from copies of their own, made
 in video memory as they are first drawn, so the command processor does not

@@ -52,6 +52,8 @@ bool bb_memory_test_limited(std::uint64_t* limit, std::uint64_t* used);
 #include <type_traits>
 #include <vector>
 
+#include "host/heap_compact.h"  // the compaction's blocks and items (global namespace)
+
 namespace gpu {
 
 // A statistics counter only ever written under g.mu: incremented without a
@@ -748,6 +750,25 @@ std::uint64_t textures_drop_block_locked(int block);
 void drain_target_blocks_locked();  // render.cpp, once a second from the submission
 std::uint64_t image_heap_spare_in_play();  // the memory keeper's spare blocks in play (gpu.cpp)
 std::string target_drain_report();  // render.cpp: what the targets' blocks drain did
+// The image heap's compaction (render.cpp compact_image_heap_locked,
+// host/heap_compact.h; BBHOST_HEAP_COMPACT, on where the image heap is lean,
+// in place of the two drains): its switch (gpu.cpp); the heap's blocks as it
+// sees them, the memory type of its images and the placement's switches
+// (gpu.cpp); the surfaces of each block it would copy and whether a block
+// holds one that can neither move nor go (textures.cpp); a turn's textures -
+// those that need no copy let go, then copies while `credit` lasts, false
+// when one found no room (textures.cpp); the turn, once a second from the
+// submission, and what it has done for the census (render.cpp).
+bool heap_compact_on();
+bool world_reached();  // render.cpp: the first in-game frame has come (a block made before it is the boot's, not the play's)
+void image_heap_blocks_locked(std::vector<heap_compact::Block>& out, std::uint32_t* type, bool* classes, bool* overflow, bool* fullest);
+void textures_compact_items_locked(std::vector<std::vector<heap_compact::Item>>& items, std::vector<bool>& pinned, std::uint64_t hot_ms);
+struct CompactTextureTurn {
+    std::uint64_t let_go = 0, let_go_bytes = 0, copied = 0, copied_bytes = 0, busy = 0;
+};
+bool textures_compact_turn_locked(int block, std::uint64_t hot_ms, std::int64_t& credit, std::size_t& copied_this_turn, CompactTextureTurn& out);
+void compact_image_heap_locked();
+std::string heap_compact_report();
 // The drain so far: blocks emptied, textures and MiB taken out, blocks left
 // because a surface the GPU wrote sits in them.
 void textures_drain_counts(std::uint64_t out[4]);

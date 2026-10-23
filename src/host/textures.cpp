@@ -3,6 +3,7 @@
 // Render targets sampled as textures alias the render target image.
 #include "host/apu_memory.h"
 #include "host/gpu_internal.h"
+#include "host/heap_compact.h"
 
 #if !defined(_WIN32)
 #include <dlfcn.h>
@@ -4110,10 +4111,12 @@ bool relocate_on() {
     return on;
 }
 
-// `sf`'s image made again, as it was made, in room a targets' block has, and
-// its pixels copied there in the open recording; the old image and views go
-// behind the submissions that may still read them.
-bool relocate_surface_locked(Surface& sf) {
+// `sf`'s image made again, as it was made, in room the blocks of class `cls`
+// have (a GPU-written surface the targets' blocks; a texture the compaction
+// copies its own blocks, then the targets' holes), and its pixels copied there
+// in the open recording; the old image and views go behind the submissions
+// that may still read them.
+bool relocate_surface_locked(Surface& sf, int cls = kHeapTargets) {
     VkImageCreateInfo ici = sf.info;
     ici.pNext = nullptr;
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -4122,7 +4125,7 @@ bool relocate_surface_locked(Surface& sf) {
     VkMemoryRequirements req{};
     vkGetImageMemoryRequirements(g.device, img, &req);
     ImageMemory mem;
-    if (!image_memory_place_existing_locked(req, mem, kHeapTargets)) {
+    if (!image_memory_place_existing_locked(req, mem, cls)) {
         vkDestroyImage(g.device, img, nullptr);
         return false;
     }
@@ -4208,7 +4211,7 @@ void drain_texture_blocks_locked() {
         const char* e = std::getenv("BBHOST_HEAP_DRAIN");
         return !(e && e[0] == '0');
     }();
-    if (!on || !image_heap_classes_on() || loading_screen_now()) return;
+    if (!on || !image_heap_classes_on() || loading_screen_now() || heap_compact_on()) return;  // the compaction empties these blocks where on
     static std::uint64_t last_ms = 0;
     const std::uint64_t now = now_ms();
     if (now - last_ms < 1000) return;
@@ -4369,6 +4372,110 @@ std::uint64_t textures_drop_block_locked(int block) {
     }
     if (bytes) bump_view_epoch();
     return bytes;
+}
+
+namespace {
+bool format_is_depth(VkFormat f) { return f >= VK_FORMAT_D16_UNORM && f <= VK_FORMAT_D32_SFLOAT_S8_UINT; }
+// Its image holds what guest memory does not: a shader or a copy wrote it.
+bool gpu_content(const Surface& sf) { return sf.gpu_written || sf.copied_mips; }
+// A surface the compaction copies rather than lets go: one with GPU content,
+// or a texture a bind looked up in the last `hot_ms` (not one made ahead and
+// never bound). A depth-format one is not copied (relocate_surface_locked
+// copies colour): one a bind looked up is let go, one with GPU content pins
+// its block.
+bool compact_copies(const Surface& sf, std::uint64_t now, std::uint64_t hot_ms) {
+    if (gpu_content(sf)) return true;
+    if (sf.ahead && !sf.ahead_used) return false;
+    return sf.used_ms && now - sf.used_ms < hot_ms && !format_is_depth(sf.info.format);
+}
+bool compact_pins(const Surface& sf) { return sf.failed || (gpu_content(sf) && format_is_depth(sf.info.format)); }
+}  // namespace
+
+void textures_compact_items_locked(std::vector<std::vector<heap_compact::Item>>& items, std::vector<bool>& pinned, std::uint64_t hot_ms) {
+    const std::uint64_t now = now_ms();
+    for (const auto& [base, sf] : g_surfaces) {
+        if (!sf.image || sf.memory.block < 0 || surface_in_host(sf)) continue;
+        const std::size_t k = static_cast<std::size_t>(sf.memory.block);
+        if (k >= items.size()) continue;
+        if (compact_pins(sf)) {
+            pinned[k] = true;
+            continue;
+        }
+        if (compact_copies(sf, now, hot_ms))
+            items[k].push_back({sf.memory.size, gpu_content(sf) ? heap_place::kTargets : heap_place::kTextures});
+    }
+}
+
+bool textures_compact_turn_locked(int block, std::uint64_t hot_ms, std::int64_t& credit, std::size_t& copied_this_turn, CompactTextureTurn& out) {
+    const std::uint64_t now = now_ms();
+    // What needs no copy goes, as the textures' drain lets it go: made again
+    // at its next bind, if one comes.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> copy;  // (bytes, base)
+    bool gone = false;
+    for (auto it = g_surfaces.begin(); it != g_surfaces.end();) {
+        Surface& sf = it->second;
+        if (!sf.image || sf.memory.block != block || surface_in_host(sf) || compact_pins(sf)) {
+            ++it;
+            continue;
+        }
+        if (compact_copies(sf, now, hot_ms)) {
+            copy.push_back({sf.memory.size, it->first});
+            ++it;
+            continue;
+        }
+        ++out.let_go;
+        out.let_go_bytes += sf.memory.size;
+        note_bind_reason_locked(it->first, kBindGone);
+        for (auto& v : sf.views) defer_destroy_view(v.second);
+        defer_destroy_image(sf.image, sf.memory);
+        if (g_last_view_surface == &sf) g_last_view_surface = nullptr;
+        note_surface_erased(sf);
+        it = g_surfaces.erase(it);
+        gone = true;
+    }
+    for (auto it = g_rt_regions.begin(); it != g_rt_regions.end();) {
+        if (it->second.img.image && it->second.img.memory.block == block) {
+            ++out.let_go;
+            out.let_go_bytes += it->second.img.memory.size;
+            drop_rt_region(it->second);
+            it = g_rt_regions.erase(it);
+            gone = true;
+        } else {
+            ++it;
+        }
+    }
+    for (auto it = g_level_aliases.begin(); it != g_level_aliases.end();) {
+        if (it->second.img.image && it->second.img.memory.block == block) {
+            ++out.let_go;
+            out.let_go_bytes += it->second.img.memory.size;
+            invalidate_rt_views(it->second.img.base);
+            defer_destroy_view(it->second.img.view);
+            defer_destroy_image(it->second.img.image, it->second.img.memory);
+            it = g_level_aliases.erase(it);
+            gone = true;
+        } else {
+            ++it;
+        }
+    }
+    if (gone) bump_view_epoch();
+    // Then the copies, largest first, while the turn's credit lasts.
+    std::stable_sort(copy.begin(), copy.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    for (const auto& [bytes, base] : copy) {
+        if (!heap_compact::may_copy(credit, copied_this_turn)) break;
+        auto it = g_surfaces.find(base);
+        if (it == g_surfaces.end()) continue;
+        Surface& sf = it->second;
+        if (sf.prep && !prep_done(*sf.prep)) {  // still uploading: the next turn
+            ++out.busy;
+            continue;
+        }
+        if (!relocate_surface_locked(sf, gpu_content(sf) ? kHeapTargets : kHeapTextures)) return false;
+        credit -= static_cast<std::int64_t>(bytes);
+        ++copied_this_turn;
+        ++out.copied;
+        out.copied_bytes += bytes;
+    }
+    return true;
 }
 
 void textures_drain_counts(std::uint64_t out[4]) {

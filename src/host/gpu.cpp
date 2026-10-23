@@ -5,6 +5,8 @@
 #include "engine/gx_resources.h"
 #include "engine/live_resolution.h"
 #include "host/apu_memory.h"
+#include "host/heap_compact.h"
+#include "host/heap_place.h"
 #include "host/foreign_hooks.h"
 #include "host/draw_capture.h"
 #include "host/gpu_internal.h"
@@ -6549,6 +6551,16 @@ struct HeapBlock {
 };
 std::vector<HeapBlock> g_heap;  // under g.mu; an image's ImageMemory::block indexes it
 std::uint64_t g_heap_allocs = 0, g_heap_own = 0, g_heap_released = 0, g_heap_cp_blocks = 0;
+// Blocks made on the command processor while the game played (in the world,
+// no loading screen up): what a compaction must not cause - each a driver
+// allocation in the middle of a frame (~190 ms on a Radeon 680M).
+std::uint64_t g_heap_cp_play = 0, g_heap_cp_play_us = 0, g_heap_cp_play_max_us = 0;
+
+// A block being emptied (drain_target_blocks_locked or, in its place,
+// compact_image_heap_locked, render.cpp): no image goes in it while it is, so
+// what moves out of it and whatever comes next fill room elsewhere, and it can
+// empty for the keeper to give back.
+int g_heap_avoid = -1;
 
 // A new block's slot: a released one if any, so the indices live images
 // hold never move.
@@ -6558,9 +6570,13 @@ void heap_add_block_locked(VkDeviceMemory memory, std::uint32_t type) {
     nb.type = type;
     nb.free[0] = kHeapBlock;
     nb.empty_since = std::chrono::steady_clock::now();
-    for (HeapBlock& b : g_heap) {
+    for (std::size_t k = 0; k < g_heap.size(); ++k) {
+        HeapBlock& b = g_heap[k];
         if (b.memory == VK_NULL_HANDLE) {
             b = std::move(nb);
+            // A new block in the slot of one being emptied (given back since)
+            // is not that block: images may go in it.
+            if (g_heap_avoid == static_cast<int>(k)) g_heap_avoid = -1;
             return;
         }
     }
@@ -6596,10 +6612,7 @@ const bool g_heap_overflow = [] {
 
 // Whether an image of class `cls` may go in a block of class `block_cls`
 // (-1: empty).
-bool heap_class_fits(int block_cls, int cls) {
-    if (!g_heap_classes || block_cls < 0 || block_cls == cls) return true;
-    return g_heap_overflow && cls == kHeapTextures && block_cls == kHeapTargets;
-}
+bool heap_class_fits(int block_cls, int cls) { return heap_place::class_fits(g_heap_classes, g_heap_overflow, block_cls, cls); }
 
 VkDeviceSize heap_free_locked(std::uint32_t type, std::size_t* live) {
     VkDeviceSize free = 0;
@@ -6681,11 +6694,6 @@ const bool g_heap_fullest = [] {
     return !(e && e[0] == '0');
 }();
 
-// A targets' block being emptied (drain_target_blocks_locked, render.cpp): no
-// image goes in it while it is, so what moves out of it and whatever comes
-// next fill room elsewhere, and it can empty for the keeper to give back.
-int g_heap_avoid = -1;
-
 bool heap_place_locked(const VkMemoryRequirements& req, std::uint32_t type, bool grow, ImageMemory& out, int cls) {
     const VkDeviceSize align = std::max<VkDeviceSize>(req.alignment, 256);
     if (!g_heap_classes) cls = kHeapTargets;
@@ -6699,30 +6707,20 @@ bool heap_place_locked(const VkMemoryRequirements& req, std::uint32_t type, bool
                     static_cast<int>(k) != g_heap_avoid)
                     order.push_back(k);
             }
-            if (g_heap_fullest) {
-                // Its own class's blocks, then (a texture) the targets' holes,
-                // then an empty block; fullest first in each.
-                const auto rank = [cls](const HeapBlock& b) { return b.cls == cls ? 0 : b.cls >= 0 ? 1 : 2; };
-                std::stable_sort(order.begin(), order.end(), [&rank](std::size_t a, std::size_t c) {
-                    const int ra = rank(g_heap[a]), rc = rank(g_heap[c]);
-                    return ra != rc ? ra < rc : g_heap[a].used > g_heap[c].used;
-                });
-            }
+            // Its own class's blocks, then (a texture) the targets' holes, then
+            // an empty block; fullest first in each (host/heap_place.h, which
+            // the compaction's trial placement shares).
+            heap_place::order(g_heap, order, cls, g_heap_fullest);
             for (const std::size_t k : order) {
                 HeapBlock& b = g_heap[k];
-                for (auto it = b.free.begin(); it != b.free.end(); ++it) {
-                    const VkDeviceSize at = (it->first + align - 1) & ~(align - 1);
-                    if (at + req.size > it->first + it->second) continue;
-                    const VkDeviceSize lo = it->first, hi = it->first + it->second;
-                    b.free.erase(it);
-                    if (at > lo) b.free[lo] = at - lo;
-                    if (at + req.size < hi) b.free[at + req.size] = hi - (at + req.size);
-                    b.used += req.size;
-                    if (b.cls < 0) b.cls = static_cast<std::int8_t>(cls);
-                    out = {b.memory, at, req.size, static_cast<std::int32_t>(k), type};
-                    ++g_heap_allocs;
-                    return true;
-                }
+                std::uint64_t at = 0;
+                if (!heap_place::first_fit(b.free, req.size, align, at)) continue;
+                heap_place::take(b.free, at, req.size);
+                b.used += req.size;
+                if (b.cls < 0) b.cls = static_cast<std::int8_t>(cls);
+                out = {b.memory, at, req.size, static_cast<std::int32_t>(k), type};
+                ++g_heap_allocs;
+                return true;
             }
             if (pass || !grow) break;
             // No room: another block, made here on the command processor
@@ -6732,11 +6730,21 @@ bool heap_place_locked(const VkMemoryRequirements& req, std::uint32_t type, bool
             mai.memoryTypeIndex = type;
             VkDeviceMemory mem = VK_NULL_HANDLE;
             MemOwner own_mem("image heap blocks");
+            const auto t0 = std::chrono::steady_clock::now();
             if (vkAllocateMemory(g.device, &mai, nullptr, &mem) != VK_SUCCESS) break;
+            const std::uint64_t us = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
             heap_add_block_locked(mem, type);
             ++g_heap_cp_blocks;
-            host_log("gpu: image heap block made on the command processor (%zu live, %llu MiB each)%s", heap_live_blocks_locked(),
-                     static_cast<unsigned long long>(kHeapBlock >> 20),
+            const bool loading = loading_screen_now(), in_play = !loading && world_reached();
+            if (in_play) {
+                ++g_heap_cp_play;
+                g_heap_cp_play_us += us;
+                g_heap_cp_play_max_us = std::max(g_heap_cp_play_max_us, us);
+            }
+            host_log("gpu: image heap block made on the command processor (%zu live, %llu MiB each, %.1f ms, %s)%s", heap_live_blocks_locked(),
+                     static_cast<unsigned long long>(kHeapBlock >> 20), us / 1000.0,
+                     in_play ? "in play" : loading ? "during a load" : "before the world",
                      g.mem_props.memoryTypes[type].heapIndex == g.local_heap ? "" : " in host memory");
         }
     }
@@ -6817,6 +6825,26 @@ int image_heap_avoided_block_locked() { return g_heap_avoid; }
 std::uint64_t image_heap_block_used_locked(int block) {
     if (block < 0 || static_cast<std::size_t>(block) >= g_heap.size() || g_heap[static_cast<std::size_t>(block)].memory == VK_NULL_HANDLE) return 0;
     return g_heap[static_cast<std::size_t>(block)].used;
+}
+
+void image_heap_blocks_locked(std::vector<heap_compact::Block>& out, std::uint32_t* type, bool* classes, bool* overflow, bool* fullest) {
+    out.assign(g_heap.size(), heap_compact::Block{});
+    std::uint32_t t = UINT32_MAX;
+    for (std::size_t k = 0; k < g_heap.size(); ++k) {
+        const HeapBlock& b = g_heap[k];
+        heap_compact::Block& o = out[k];
+        o.live = b.memory != VK_NULL_HANDLE && g.mem_props.memoryTypes[b.type].heapIndex == g.local_heap;
+        if (!o.live) continue;
+        o.cls = b.cls;
+        o.used = b.used;
+        o.type = b.type;
+        o.free = b.free;
+        if (t == UINT32_MAX) t = b.type;
+    }
+    if (type) *type = t == UINT32_MAX ? 0 : t;
+    if (classes) *classes = g_heap_classes;
+    if (overflow) *overflow = g_heap_overflow;
+    if (fullest) *fullest = g_heap_fullest;
 }
 
 bool image_memory_place_existing_locked(const VkMemoryRequirements& req, ImageMemory& out, int cls) {
@@ -6945,6 +6973,20 @@ bool cache_budget_pressing(std::uint64_t more) { return world_settled() && cache
 std::uint64_t cache_budget_excess() { return apu_memory::excess(g_cache_budget.load(std::memory_order_relaxed), bb_memory_local_bytes()); }
 bool heap_lean_on() { return g_heap_lean.load(std::memory_order_relaxed); }
 
+// The image heap's compaction (render.cpp compact_image_heap_locked,
+// host/heap_compact.h): BBHOST_HEAP_COMPACT=1 on any device, =0 off; unset,
+// on where the image heap is lean (an integrated GPU under Windows,
+// host/apu_memory.h) and off elsewhere until measured there. Read once the
+// device is chosen (the submissions ask, never before).
+bool heap_compact_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_HEAP_COMPACT");
+        if (e && *e) return e[0] != '0';
+        return heap_lean_on();
+    }();
+    return on;
+}
+
 std::uint64_t vram_reserve_bytes() { return g_vram_reserve; }
 
 bool vram_within_reserve(std::uint64_t more) {
@@ -7072,13 +7114,15 @@ bool copy_by_resource_on() { return g_copy_by_resource > 0 && res_identity_on();
 std::string image_heap_report() {
     VkDeviceSize used = 0;
     for (const HeapBlock& b : g_heap) used += b.used;
-    char buf[384];
+    char buf[512];
     std::snprintf(buf, sizeof(buf),
                   "image heap: %zu blocks, %llu MiB in use; %llu textures placed in it, %llu with memory of their own, %llu in host memory "
-                  "for want of video memory; blocks made on the command processor %llu, released %llu; upload staging free %llu MiB; view epoch %llu",
+                  "for want of video memory; blocks made on the command processor %llu, released %llu (made in play %llu, %.1f ms in all, the "
+                  "longest %.1f ms); upload staging free %llu MiB; view epoch %llu",
                   heap_live_blocks_locked(), static_cast<unsigned long long>(used >> 20), static_cast<unsigned long long>(g_heap_allocs),
                   static_cast<unsigned long long>(g_heap_own), static_cast<unsigned long long>(g_heap_host),
                   static_cast<unsigned long long>(g_heap_cp_blocks), static_cast<unsigned long long>(g_heap_released),
+                  static_cast<unsigned long long>(g_heap_cp_play), g_heap_cp_play_us / 1000.0, g_heap_cp_play_max_us / 1000.0,
                   static_cast<unsigned long long>(g.staging_free_bytes >> 20), static_cast<unsigned long long>(view_epoch()));
     if (const std::string sites = view_epoch_sites_report(); !sites.empty()) host_log("  %s", sites.c_str());
     host_log("  %s", image_reuse_report_locked().c_str());
@@ -7298,6 +7342,7 @@ std::string video_memory_report_locked(bool at_exit) {
                       static_cast<ull>(drained[3]));
         out += buf;
         out += target_drain_report();
+        out += heap_compact_report();
         out += textures_relocate_report();
         // The targets' blocks one by one: what each holds (MiB of colour,
         // depth, snapshots, GPU-written surfaces, textures, region copies)
@@ -7932,6 +7977,7 @@ void submit_locked() {
     // second).
     render_return_targets_locked();
     drain_target_blocks_locked();  // a targets' block holding little, emptied into room elsewhere (one turn a second)
+    compact_image_heap_locked();  // in place of the drains where on: the emptiest block of either class, copies a turn a second
     textures_relocate_pinned_locked();  // a textures' block's few GPU-written surfaces, moved so it can drain (lean thresholds)
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;

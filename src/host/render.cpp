@@ -10,6 +10,7 @@
 #include "engine/loading.h"
 #include "host/clip_control.h"
 #include "host/gpu_internal.h"
+#include "host/heap_compact.h"
 #include "host/import_fallback.h"
 #include "host/label_landing.h"
 #include "host/lvp_split.h"
@@ -1671,6 +1672,7 @@ void destroy_rt_image(RtImage& r) {
 // ~300 a soak - and a driver allocation each was ~37 ms of the command
 // processor in the frame the world first draws. BBHOST_RT_HEAP=0 gives each
 // its own allocation again.
+std::uint64_t g_rt_largest_play = 0;  // under g.mu: the largest render target or snapshot the heap placed in play (bytes)
 bool rt_image_memory(VkImage image, ImageMemory& out) {
     static const bool heap = [] {
         const char* e = std::getenv("BBHOST_RT_HEAP");
@@ -1680,6 +1682,9 @@ bool rt_image_memory(VkImage image, ImageMemory& out) {
     vkGetImageMemoryRequirements(g.device, image, &req);
     if (heap) {
         if (!image_memory_alloc(req, out)) return false;
+        // The largest the game makes while it plays: room the heap's
+        // compaction keeps (compact_image_heap_locked).
+        if (out.block >= 0 && !loading_screen_now()) g_rt_largest_play = std::max<std::uint64_t>(g_rt_largest_play, out.size);
     } else {
         out = ImageMemory{};
         VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
@@ -10638,7 +10643,7 @@ void drain_target_blocks_locked() {
         const char* e = std::getenv("BBHOST_HEAP_TARGET_DRAIN");
         return !(e && e[0] == '0');
     }();
-    if (!on || !image_heap_classes_on() || loading_screen_now()) return;
+    if (!on || !image_heap_classes_on() || loading_screen_now() || heap_compact_on()) return;  // the compaction does it where on
     if (image_heap_spare_in_play() && image_heap_avoided_block_locked() < 0) return;
     static std::uint64_t last_ms = 0, began_ms = 0, quiet_until_ms = 0;
     const std::uint64_t now = steady_ms();
@@ -10726,6 +10731,184 @@ std::string target_drain_report() {
                   static_cast<unsigned long long>(g_td_pressed),
                   static_cast<unsigned long long>(g_td_targets), static_cast<unsigned long long>(g_td_bytes >> 20),
                   static_cast<unsigned long long>(g_td_dropped >> 20));
+    return buf;
+}
+
+// The image heap's compaction (BBHOST_HEAP_COMPACT, gpu.cpp heap_compact_on;
+// the policy and its reasons in host/heap_compact.h). In place of the targets'
+// and textures' drains where on: once the world has settled, the emptiest
+// block of either class that its copies leave room for is emptied into the
+// others' holes and the keeper gives it back. No image goes in it meanwhile
+// (image_heap_avoid_block_locked). A turn a second: first what needs no copy
+// goes (textures not bound for heap_compact::kHotMs, made ahead and never
+// bound, copies of targets' regions), then the copies, largest first, while
+// the turn's credit lasts (kTurnBytes a second) - textures a bind looked up
+// lately and surfaces the GPU wrote (textures.cpp), then render targets and
+// snapshots, made again in room the other blocks have and copied in the open
+// recording. It stops at a load, when a copy finds no room, when the others'
+// largest free range falls under the largest target the game makes in play
+// (a new block on the command processor would cost more than the block
+// saves), or kGiveUpMs on; a block it gave up on is left until the next load.
+namespace {
+int g_hc_block = -1;
+std::vector<int> g_hc_skip;  // blocks given up on since the last load
+std::uint64_t g_hc_begun = 0, g_hc_emptied = 0, g_hc_load = 0, g_hc_gave_up = 0, g_hc_no_room = 0, g_hc_keep = 0;
+std::uint64_t g_hc_targets = 0, g_hc_target_bytes = 0, g_hc_surfaces = 0, g_hc_surface_bytes = 0, g_hc_let_go = 0, g_hc_let_go_bytes = 0;
+std::uint64_t g_hc_why[heap_compact::kWhyCount] = {};  // turns no block was chosen, by the emptiest block's reason
+
+// The room the compaction keeps: the largest render target in the heap, or
+// the largest one it placed while the game played.
+std::uint64_t compact_keep_locked() {
+    std::uint64_t m = g_rt_largest_play;
+    for (const auto& [base, r] : g_rts)
+        if (r.image && r.memory.block >= 0 && image_memory_in_vram(r.memory)) m = std::max<std::uint64_t>(m, r.memory.size);
+    return m;
+}
+
+// The largest free range in the live blocks that hold anything, `skip` not.
+std::uint64_t compact_largest_elsewhere_locked(int skip) {
+    std::vector<heap_compact::Block> blocks;
+    std::uint32_t type = 0;
+    image_heap_blocks_locked(blocks, &type, nullptr, nullptr, nullptr);
+    std::uint64_t m = 0;
+    for (std::size_t k = 0; k < blocks.size(); ++k)
+        if (blocks[k].live && blocks[k].type == type && blocks[k].used && static_cast<int>(k) != skip)
+            m = std::max(m, heap_place::largest(blocks[k].free));
+    return m;
+}
+
+void compact_end_locked(std::uint64_t& counter, std::uint64_t now, std::uint64_t& quiet_until_ms, bool skip_block) {
+    ++counter;
+    if (skip_block && g_hc_block >= 0) g_hc_skip.push_back(g_hc_block);
+    if (image_heap_avoided_block_locked() == g_hc_block) image_heap_avoid_block_locked(-1);
+    g_hc_block = -1;
+    quiet_until_ms = now + heap_compact::kQuietMs;
+}
+}  // namespace
+
+void compact_image_heap_locked() {
+    if (!heap_compact_on() || !image_heap_classes_on()) return;
+    static std::uint64_t last_ms = 0, began_ms = 0, quiet_until_ms = 0;
+    static std::int64_t credit = 0;
+    const std::uint64_t now = steady_ms();
+    const bool loading = loading_screen_now(), settled = world_settled();
+    if (loading) g_hc_skip.clear();  // a load changes what the blocks hold
+    // A load stops one under way at once, so the area being entered has the
+    // block's room.
+    if (g_hc_block >= 0 && heap_compact::must_stop(loading, settled, now, began_ms)) {
+        if (loading || !settled)
+            compact_end_locked(g_hc_load, now, quiet_until_ms, false);
+        else
+            compact_end_locked(g_hc_gave_up, now, quiet_until_ms, true);
+        return;
+    }
+    if (!heap_compact::turn_due(now, last_ms)) return;
+    last_ms = now;
+    if (g_hc_block >= 0) {
+        const int block = g_hc_block;
+        // Emptied, or given back already (a new block in its slot is not
+        // avoided, gpu.cpp heap_add_block_locked): the keeper's.
+        if (image_heap_block_used_locked(block) == 0 || image_heap_avoided_block_locked() != block) {
+            compact_end_locked(g_hc_emptied, now, quiet_until_ms, false);
+            return;
+        }
+        credit = heap_compact::turn_credit(credit);
+        std::size_t copied = 0;
+        CompactTextureTurn t;
+        const bool room = textures_compact_turn_locked(block, heap_compact::kHotMs, credit, copied, t);
+        g_hc_let_go += t.let_go;
+        g_hc_let_go_bytes += t.let_go_bytes;
+        g_hc_surfaces += t.copied;
+        g_hc_surface_bytes += t.copied_bytes;
+        if (!room) {
+            compact_end_locked(g_hc_no_room, now, quiet_until_ms, true);
+            return;
+        }
+        // Render targets and snapshots, largest first, while the credit lasts.
+        std::vector<std::pair<std::uint64_t, RtImage*>> moves;
+        for (std::map<std::uint64_t, RtImage>* m : {&g_rts, &g_snapshots})
+            for (auto& [base, r] : *m)
+                if (r.image && r.memory.block == block && image_memory_in_vram(r.memory)) moves.push_back({r.memory.size, &r});
+        std::stable_sort(moves.begin(), moves.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+        for (const auto& [bytes, r] : moves) {
+            if (!heap_compact::may_copy(credit, copied)) break;
+            if (!rt_remake_locked(*r, true)) {
+                compact_end_locked(g_hc_no_room, now, quiet_until_ms, true);
+                return;
+            }
+            credit -= static_cast<std::int64_t>(bytes);
+            ++copied;
+            ++g_hc_targets;
+            g_hc_target_bytes += bytes;
+        }
+        // The room kept for the largest target the game makes in play.
+        if (compact_largest_elsewhere_locked(block) < compact_keep_locked()) compact_end_locked(g_hc_keep, now, quiet_until_ms, true);
+        return;
+    }
+    if (!settled || loading || now < quiet_until_ms) return;  // (may_begin's cheap part, before the heap's census)
+    std::vector<heap_compact::Block> blocks;
+    std::uint32_t type = 0;
+    bool classes = true, overflow = true, fullest = true, empty_block = false;
+    image_heap_blocks_locked(blocks, &type, &classes, &overflow, &fullest);
+    const std::uint64_t free_room = heap_compact::room(blocks, type, &empty_block);
+    if (!heap_compact::may_begin(true, settled, loading, image_heap_avoided_block_locked() >= 0, empty_block, now, quiet_until_ms)) return;
+    if (free_room < heap_compact::kBlock + heap_compact::kRoomOver) {  // (before the census of what each block holds)
+        ++g_hc_why[heap_compact::kRoom];
+        return;
+    }
+    std::vector<std::vector<heap_compact::Item>> items(blocks.size());
+    std::vector<bool> pinned(blocks.size(), false);
+    for (std::map<std::uint64_t, RtImage>* m : {&g_rts, &g_snapshots})
+        for (const auto& [base, r] : *m)
+            if (r.image && r.memory.block >= 0 && static_cast<std::size_t>(r.memory.block) < items.size() && image_memory_in_vram(r.memory))
+                items[static_cast<std::size_t>(r.memory.block)].push_back({r.memory.size, heap_place::kTargets});
+    textures_compact_items_locked(items, pinned, heap_compact::kHotMs);
+    for (const int k : g_hc_skip)
+        if (k >= 0 && static_cast<std::size_t>(k) < pinned.size()) pinned[static_cast<std::size_t>(k)] = true;
+    heap_compact::Why why = heap_compact::kNone;
+    const std::uint64_t keep = compact_keep_locked();
+    const int c = heap_compact::choose(blocks, type, items, pinned, keep, classes, overflow, fullest, &why);
+    if (c < 0) {
+        ++g_hc_why[why];
+        return;
+    }
+    g_hc_block = c;
+    image_heap_avoid_block_locked(c);
+    began_ms = now;
+    credit = 0;
+    ++g_hc_begun;
+    ++g_hc_why[heap_compact::kChosen];
+    static int logs = 0;
+    if (logs++ < 8) {
+        std::uint64_t copies = 0;
+        for (const heap_compact::Item& it : items[static_cast<std::size_t>(c)]) copies += it.size;
+        host_log("render: the image heap's block %d holds %llu MiB, %llu MiB of it to copy, the heap %llu MiB of free room: emptied into "
+                 "the other blocks' holes, keeping %llu MiB for the largest target (BBHOST_HEAP_COMPACT=0 leaves it)",
+                 c, static_cast<unsigned long long>(blocks[static_cast<std::size_t>(c)].used >> 20), static_cast<unsigned long long>(copies >> 20),
+                 static_cast<unsigned long long>(free_room >> 20), static_cast<unsigned long long>(keep >> 20));
+    }
+}
+
+std::string heap_compact_report() {
+    if (!heap_compact_on()) return {};
+    char buf[640];
+    std::snprintf(buf, sizeof(buf),
+                  "; the heap's compaction (BBHOST_HEAP_COMPACT): blocks begun %llu (emptied %llu, stopped by a load %llu, given up %llu, no "
+                  "room for a copy %llu, under the room kept %llu); copied %llu targets and snapshots (%llu MiB) and %llu surfaces (%llu MiB), "
+                  "let go %llu textures and copies (%llu MiB); turns with no block, by the emptiest's reason: the heap's room short %llu, too "
+                  "full %llu, holds what cannot move %llu, too many copies %llu, the others' room short %llu, a copy finds no hole %llu, under "
+                  "the room kept %llu, none %llu; the room kept %llu MiB",
+                  static_cast<unsigned long long>(g_hc_begun), static_cast<unsigned long long>(g_hc_emptied),
+                  static_cast<unsigned long long>(g_hc_load), static_cast<unsigned long long>(g_hc_gave_up),
+                  static_cast<unsigned long long>(g_hc_no_room), static_cast<unsigned long long>(g_hc_keep),
+                  static_cast<unsigned long long>(g_hc_targets), static_cast<unsigned long long>(g_hc_target_bytes >> 20),
+                  static_cast<unsigned long long>(g_hc_surfaces), static_cast<unsigned long long>(g_hc_surface_bytes >> 20),
+                  static_cast<unsigned long long>(g_hc_let_go), static_cast<unsigned long long>(g_hc_let_go_bytes >> 20),
+                  static_cast<unsigned long long>(g_hc_why[heap_compact::kRoom]), static_cast<unsigned long long>(g_hc_why[heap_compact::kFull]),
+                  static_cast<unsigned long long>(g_hc_why[heap_compact::kPinned]), static_cast<unsigned long long>(g_hc_why[heap_compact::kMany]),
+                  static_cast<unsigned long long>(g_hc_why[heap_compact::kSpareShort]),
+                  static_cast<unsigned long long>(g_hc_why[heap_compact::kNoFit]), static_cast<unsigned long long>(g_hc_why[heap_compact::kKeep]),
+                  static_cast<unsigned long long>(g_hc_why[heap_compact::kNone]), static_cast<unsigned long long>(compact_keep_locked() >> 20));
     return buf;
 }
 
@@ -22373,6 +22556,7 @@ void precompile_set_world_reached() {
     g_world_seen.store(true);
     precompile_boost_update("the first in-game frame");
 }
+bool world_reached() { return g_world_seen.load(std::memory_order_relaxed); }
 
 std::size_t precompile_backlog() {
     Precompiler* w = g_precompiler.load();
