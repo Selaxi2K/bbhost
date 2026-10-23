@@ -12833,6 +12833,24 @@ void cb_proof_binding(const GxStageRecords* gx, const GxStagePlan* plan, std::si
     cb_proof::note_result(diff, o, path, t_draw_pipeline, hle_video_flip_count(), since_call, dropped_since, any, base, bytes);
 }
 
+namespace {
+// The constant-buffer snapshots' memo (resolve_stage_buffers, the copy of a
+// recording a buffer snapshotted again binds) and the copies' ring's lap,
+// here so the prefetch before the copy can ask them too.
+struct SnapMemo {
+    std::uint64_t base = 0, bytes = 0, at = 0, serial = ~0ull, lap = 0;
+};
+SnapMemo g_snap_memo[1024];
+std::uint64_t g_scratch_lap = 1;
+inline SnapMemo& snap_memo_for(std::uint64_t base) { return g_snap_memo[((base >> 4) ^ (base >> 14)) & 1023]; }
+// BBHOST_CB_PREFETCH (on unless 0): a constant buffer the draw will copy as it
+// records has its lines asked for as soon as its base is known (below).
+const bool g_cb_prefetch = [] {
+    const char* e = std::getenv("BBHOST_CB_PREFETCH");
+    return !(e && e[0] == '0');
+}();
+}  // namespace
+
 // TranslateOptions::cb_ssbo: bind each constant buffer the shader reads
 // through a storage buffer over the V#'s imported memory. The range starts at
 // the V# base aligned down to minStorageBufferOffsetAlignment and the shader
@@ -12893,6 +12911,29 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
         // A V# keeps memory-type bits above its 40-bit address; a pointer pair is the address.
         const std::uint64_t hi = b.pointer ? words[1] : (words[1] & 0xff);
         const std::uint64_t base = resolved ? static_cast<std::uint64_t>(words[0]) | (hi << 32) : 0;
+        // A buffer the game writes on the CPU is copied as the draw records
+        // (BBHOST_CB_SNAPSHOT, below), from memory a game thread has just
+        // written - its lines in that core's cache. Asked for here, ahead of
+        // the lookups the copy comes after, they arrive while those run: with
+        // the snapshots, bb-cp0 at the Nightmare of Mensis on a Steam Deck took
+        // 11 thousand more lines a frame from other cores' caches and 5
+        // thousand more from DRAM, and stalled on them - 2.5 million more
+        // cycles a frame for 0.6 million more instructions. Not for a buffer
+        // whose recording's first copy will serve it (the memo), the first
+        // 2 KiB at most (the hardware prefetcher takes a longer run on).
+        // BBHOST_CB_PREFETCH=0: no prefetch.
+        static const bool cb_snapshot_on = [] {
+            const char* e = std::getenv("BBHOST_CB_SNAPSHOT");
+            return !(e && e[0] == '0');
+        }();
+        if (g_cb_prefetch && cb_snapshot_on && base && !b.written && bytes) {
+            const SnapMemo& m = snap_memo_for(base);
+            if (!(m.base == base && m.serial == g.record_serial && m.lap == g_scratch_lap && m.bytes >= bytes)) {
+                const std::uint64_t end = base + std::min<VkDeviceSize>(bytes, 2048);
+                for (std::uint64_t p = base & ~std::uint64_t{63}; p < end; p += 64)
+                    __builtin_prefetch(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(p)), 0, 3);
+            }
+        }
         if (gxvk::census() && base) gxvk::census_constant_bound(base, bytes, t_gxvk_call_seq, g.flushes, gx != nullptr);
         int outcome = !base ? kNoBase : (base & 3) || !shape ? kUnaligned : kUnmapped;
         // Past the longest binding the range takes the page table: no one buffer need hold it.
@@ -13071,7 +13112,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
             // in which lap round it.
             static std::uint64_t segment_serial[kScratch / kScratchSegment] = {};
             static std::uint64_t segment_lap[kScratch / kScratchSegment] = {};
-            static std::uint64_t scratch_lap = 1;
+            std::uint64_t& scratch_lap = g_scratch_lap;
             // (A snapshot's range was located in imported memory: mapped.)
             if (realign && bytes && bytes <= (1u << 20) && (snapshot || hle_kernel_va_mapped(base, bytes))) {
                 if (!scratch.buffer) {
@@ -13105,16 +13146,12 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                     if (std::strcmp(e, "compare") == 0) return int{kDedupeCompare};
                     return e[0] == '0' ? int{kDedupeOff} : int{kDedupeOn};
                 }();
-                struct SnapMemo {
-                    std::uint64_t base = 0, bytes = 0, at = 0, serial = ~0ull, lap = 0;
-                };
-                static SnapMemo snap_memo[1024];
                 SnapMemo* memo = nullptr;
                 // Pushed (`exact`), each draw's ranges go into the command
                 // buffer anyway: the snapshot is bound where it is.
                 const bool whole_ring = !exact && snapshot && g.ssbo_max_range >= kScratch;
                 if (dedupe && snapshot && (whole_ring || exact) && scratch.map) {
-                    memo = &snap_memo[((base >> 4) ^ (base >> 14)) & 1023];
+                    memo = &snap_memo_for(base);
                     bool share = memo->base == base && memo->serial == g.record_serial && memo->lap == scratch_lap && memo->bytes >= bytes;
                     if (share && dedupe >= kDedupeCheck) {
                         const bool same = std::memcmp(static_cast<const std::uint8_t*>(scratch.map) + memo->at,
