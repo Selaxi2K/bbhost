@@ -11571,15 +11571,15 @@ void host_gpu_report() {
                  static_cast<ull>(g_import_who_n[kIwSpan].load()), mib(g_import_who_bytes[kIwSpan]), static_cast<ull>(g_imports_merged.load()),
                  static_cast<ull>(g_imports_retired.load()), mib(g_import_retired_bytes), static_cast<ull>(live >> 20), nlive,
                  static_cast<ull>(flex >> 20));
-        if (g_import_failed.load() || g_import_fail_test.mode)
+        if (const std::string fb = shadow_import_fallback_report(); g_import_failed.load() || g_import_fail_test.mode || !fb.empty())
             host_log("gpu: guest memory imports failed %llu (%llu MiB asked%s) - bindings %llu, device addresses %llu, walks %llu, prefetch %llu, "
-                     "whole spans %llu; a window asked again within %llu ms of a failure, read through the page table instead %llu",
+                     "whole spans %llu; a window asked again within %llu ms of a failure, read through the page table instead %llu%s",
                      static_cast<ull>(g_import_failed.load()), mib(g_import_failed_bytes),
                      g_import_fail_test.mode ? (", " + std::to_string(g_import_forced.load()) + " of them by BBHOST_TEST_IMPORT_FAIL").c_str() : "",
                      static_cast<ull>(g_import_failed_who[kIwBinding].load()), static_cast<ull>(g_import_failed_who[kIwAddress].load()),
                      static_cast<ull>(g_import_failed_who[kIwWalk].load()), static_cast<ull>(g_import_failed_who[kIwPrefetch].load()),
                      static_cast<ull>(g_import_failed_who[kIwSpan].load()), static_cast<ull>(kImportBackoffMs),
-                     static_cast<ull>(g_import_backed_off.load()));
+                     static_cast<ull>(g_import_backed_off.load()), fb.c_str());
         // Who waited for the driver: the import thread's imports keep nobody waiting.
         const auto ms = [](const std::atomic<std::uint64_t>& us) { return static_cast<double>(us.load()) / 1e3; };
         host_log("gpu: guest memory imports waited for (the driver's time of the thread that asked): by the paths that needed them %llu in %.0f ms "

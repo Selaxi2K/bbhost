@@ -1154,6 +1154,15 @@ bool shadow_snapshot_locked(std::uint64_t va, std::uint64_t bytes, Located& loc)
 // the game rewrites, or a range this cannot tell cheaply - before the caller
 // works out how much of it a draw reads.
 bool shadow_snapshot_maybe_locked(std::uint64_t va, std::uint64_t bytes);
+// A vertex record's or an index range's bytes in no guest-memory import (its
+// import failed, or none holds it whole): `out` a copy of them - the mirrors'
+// pages copied through staging, else the `read_bytes` the draw reads copied as
+// it records into the snapshot ring - so a failed import costs speed, not the
+// picture (host/import_fallback.h; BBHOST_IMPORT_COPY=0 leaves such a range).
+// Returns the import_fallback::Choice made; import_fallback::served says
+// whether `out` holds the range. And its counts, for the imports' exit line.
+int shadow_import_fallback_locked(std::uint64_t va, std::uint64_t bytes, std::uint64_t read_bytes, Located& out);
+std::string shadow_import_fallback_report();
 // What the pages of [va, va+bytes) are to the buffer shadow now, the least
 // placeable page deciding (BBHOST_VB_RACE=2's census): read in place, told
 // and never handed out (what in place reads; mirrored), under renamed copies

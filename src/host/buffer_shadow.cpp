@@ -45,6 +45,7 @@
 
 #include "core/write_watch.h"
 #include "engine/gx_resources.h"
+#include "host/import_fallback.h"
 #include "host/copy_runs.h"
 #include "host/gpu_internal.h"
 #include "host/gxvk.h"
@@ -411,6 +412,10 @@ std::uint64_t now_ms() {
 
 // Guest VA -> (chunk, offset) through the snapshot of direct-memory mappings,
 // with the mapping's bounds; false outside one mapping and one chunk.
+// Set by shadow_import_fallback_locked: the mirror's pages copied through
+// upload staging even with whole imports, since the range's import failed.
+thread_local bool t_force_staged = false;
+
 bool phys_of(std::uint64_t va, std::uint64_t bytes, std::uint32_t& chunk, std::uint64_t& off, std::uint64_t* map_lo = nullptr,
              std::uint64_t* map_hi = nullptr) {
     // The last hit first, with no walk: draws come in runs, and nearly all
@@ -439,8 +444,9 @@ bool phys_of(std::uint64_t va, std::uint64_t bytes, std::uint32_t& chunk, std::u
     // chunk's end is no mirror's (its pages would index past the mirror's).
     if (chunk >= gcn::kDmemChunks || off + bytes > kChunkBytes) return false;
     // Window imports: the mirrors' copies come from upload staging (below), so
-    // the range needs no import, only to lie in a GPU-visible span.
-    if (!imports_whole()) return off >= g.dmem[chunk].span_lo && off + bytes <= g.dmem[chunk].span_hi;
+    // the range needs no import, only to lie in a GPU-visible span - and the
+    // same with whole imports for a range whose import failed (t_force_staged).
+    if (!imports_whole() || t_force_staged) return off >= g.dmem[chunk].span_lo && off + bytes <= g.dmem[chunk].span_hi;
     return dmem_import(chunk, off, bytes) != nullptr;
 }
 
@@ -1516,7 +1522,7 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
     // Pages to copy, as runs, from the import that holds them all - or, with
     // window imports, each page copied into upload staging here (after its
     // write watch is armed) and from there into the mirror: no import of it.
-    const bool staged = !imports_whole();
+    const bool staged = !imports_whole() || t_force_staged;
     const Chunk* source = staged ? nullptr
                                  : dmem_import(chunk, static_cast<std::uint64_t>(p0) << kPageShift,
                                                static_cast<std::uint64_t>(p1 - p0 + 1) << kPageShift);
@@ -1921,6 +1927,8 @@ struct SnapRing {
 SnapRing g_snap;
 std::atomic<std::uint64_t> g_snapshots{0}, g_snapshot_bytes{0}, g_snapshot_staged{0}, g_snapshot_pending{0};
 
+bool snap_copy_locked(std::uint64_t va, std::uint64_t bytes, Located& loc);  // below
+
 bool snap_ring_make() {
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bci.size = kSnapRing;
@@ -1994,11 +2002,34 @@ bool shadow_snapshot_locked(std::uint64_t va, std::uint64_t bytes, Located& loc)
         g_snap.failed = true;
         return false;
     }
-    if (g_snap.next + bytes + 256 > kSnapRing) {
-        g_snap.next = 0;
-        ++g_snap.lap;
+    return snap_copy_locked(va, bytes, loc);
+}
+
+namespace {
+// [va, va+bytes) copied into the snapshot ring now, `loc` the copy (the ring
+// made already).
+std::uint64_t g_snap_full = 0;  // copies refused: the ring's next segment held the open recording's copies
+bool snap_copy_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
+    VkDeviceSize next = g_snap.next;
+    std::uint64_t lap = g_snap.lap;
+    if (next + bytes + 256 > kSnapRing) {
+        next = 0;
+        ++lap;
     }
-    const VkDeviceSize at = (g_snap.next + 255) & ~VkDeviceSize{255};
+    const VkDeviceSize at = (next + 255) & ~VkDeviceSize{255};
+    // A segment the open recording's own draws read in the lap before cannot
+    // be written until that recording has run, which it has not: one
+    // recording that copies a whole ring's worth - every mesh of an area
+    // copied as it records, its import failed - would write over the bytes
+    // its earlier draws read. Such a copy is refused.
+    for (VkDeviceSize s = at / kSnapSegment; s <= (at + bytes - 1) / kSnapSegment; ++s) {
+        if (g_snap.segment_lap[s] && g_snap.segment_lap[s] != lap && g_snap.segment_serial[s] >= g.flushes) {
+            ++g_snap_full;
+            return false;
+        }
+    }
+    g_snap.next = next;
+    g_snap.lap = lap;
     // A lap round the ring: the draws that read a segment in the lap before
     // have run before it is written again (nearly always long since).
     for (VkDeviceSize s = at / kSnapSegment; s <= (at + bytes - 1) / kSnapSegment; ++s) {
@@ -2019,6 +2050,69 @@ bool shadow_snapshot_locked(std::uint64_t va, std::uint64_t bytes, Located& loc)
     // from the ring - what the draw read when it recorded.
     if (!g_snap.device_local && shadow_stage_locked(va, bytes, loc)) bump(g_snapshot_staged);
     return true;
+}
+
+std::atomic<std::uint64_t> g_fallback[import_fallback::kChoices], g_fallback_bytes{0};
+std::atomic<std::uint64_t> g_fallback_mirror_why[kLocWhys];  // why the mirrors did not serve a range in no import
+}  // namespace
+
+int shadow_import_fallback_locked(std::uint64_t va, std::uint64_t bytes, std::uint64_t read_bytes, Located& out) {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_IMPORT_COPY");
+        return !(e && e[0] == '0');
+    }();
+    bool mirror = false;
+    if (on && buffer_shadow_on() && g.sink.buffer && bytes && !twin_covers_locked(va, bytes)) {
+        // The mirrors, their pages copied through staging (no import needed).
+        Located probe{g.sink.buffer, 0, bytes};
+        t_force_staged = true;
+        shadow_locate_locked(va, bytes, probe);
+        t_force_staged = false;
+        if (probe.buffer != g.sink.buffer) {
+            out = probe;
+            mirror = true;
+        } else {
+            g_fallback_mirror_why[t_locate_why < kLocWhys ? t_locate_why : 0].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    const std::uint64_t n = read_bytes ? std::min(read_bytes, bytes ? bytes : read_bytes) : bytes;
+    const bool pending = on && !mirror && n && gpu_writes_pending_locked(va, n);
+    const bool need_ring = on && !mirror && !pending && n && n <= kSnapMaxBytes;
+    const bool ring_ok = need_ring && !g_snap.failed && (g_snap.buffer || snap_ring_make());
+    if (need_ring && !ring_ok) g_snap.failed = true;
+    import_fallback::Choice c = import_fallback::choose(on, mirror, n, kSnapMaxBytes, pending, ring_ok);
+    if (c == import_fallback::kCopy) {
+        if (snap_copy_locked(va, n, out))
+            bump(g_fallback_bytes, n);
+        else
+            c = import_fallback::kNoRing;  // full with the open recording's copies (g_snap_full)
+    }
+    bump(g_fallback[c]);
+    return c;
+}
+
+std::string shadow_import_fallback_report() {
+    using import_fallback::Choice;
+    std::uint64_t any = 0;
+    for (const auto& v : g_fallback) any += v.load();
+    if (!any) return {};
+    static const char* const kWhy[kLocWhys] = {"not asked", "a twin", "no mirror", "in place", "across windows", "served", "host memory",
+                                               "no room", "no window", "no import", "a GPU write pending", "no copy"};
+    std::string why;
+    for (int k = 0; k < kLocWhys; ++k) {
+        if (const std::uint64_t n = g_fallback_mirror_why[k].load()) why += std::string(why.empty() ? "" : ", ") + kWhy[k] + " " + std::to_string(n);
+    }
+    char b[480];
+    std::snprintf(b, sizeof(b),
+                  "; draws' ranges in no import (the mirrors refused: %s): served by the mirrors through staging %llu, copied as recorded %llu (%.1f MiB), not copied: "
+                  "BBHOST_IMPORT_COPY=0 %llu, past the ring's 1 MiB %llu, a GPU write still to land %llu, no ring or the ring full %llu",
+                  why.empty() ? "none" : why.c_str(), static_cast<unsigned long long>(g_fallback[import_fallback::kMirror].load()),
+                  static_cast<unsigned long long>(g_fallback[import_fallback::kCopy].load()), g_fallback_bytes.load() / 1048576.0,
+                  static_cast<unsigned long long>(g_fallback[import_fallback::kOff].load()),
+                  static_cast<unsigned long long>(g_fallback[import_fallback::kTooBig].load()),
+                  static_cast<unsigned long long>(g_fallback[import_fallback::kGpuPending].load()),
+                  static_cast<unsigned long long>(g_fallback[import_fallback::kNoRing].load()));
+    return b;
 }
 
 int shadow_place_class_locked(std::uint64_t va, std::uint64_t bytes) {
@@ -2780,12 +2874,13 @@ std::string shadow_report() {
                   static_cast<unsigned long long>(g_stage_inside.load()),
                   static_cast<unsigned long long>(g_stage_refused.load()), g_stage_chunks,
                   static_cast<std::size_t>((g_stage_chunks * kStageChunkBytes) >> 20));
-    char sn[192];
+    char sn[256];
     std::snprintf(sn, sizeof(sn),
                   "; rewritten vertex ranges copied as recorded %llu (%.1f MiB, %llu staged from host memory), left for a GPU write "
-                  "still to land %llu",
+                  "still to land %llu, refused with the ring full of the open recording's copies %llu",
                   static_cast<unsigned long long>(g_snapshots.load()), static_cast<double>(g_snapshot_bytes.load()) / (1 << 20),
-                  static_cast<unsigned long long>(g_snapshot_staged.load()), static_cast<unsigned long long>(g_snapshot_pending.load()));
+                  static_cast<unsigned long long>(g_snapshot_staged.load()), static_cast<unsigned long long>(g_snapshot_pending.load()),
+                  static_cast<unsigned long long>(g_snap_full));
     out += st;
     out += sn;
     if (g_stage_census && !g_stage_stats.empty()) {

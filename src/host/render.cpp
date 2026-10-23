@@ -10,6 +10,7 @@
 #include "engine/loading.h"
 #include "host/clip_control.h"
 #include "host/gpu_internal.h"
+#include "host/import_fallback.h"
 #include "host/label_landing.h"
 #include "host/lvp_split.h"
 #include "host/masked_blend.h"
@@ -14122,6 +14123,33 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
             }
         }
         if (g_import_audit) audit_range(va, need, kUseMirror);
+        if ((!loc.buffer || loc.avail < placed_need) && !heap_record && version == kCopyVersionNone && !windowed) {
+            // In no import (its import failed, or none holds the record
+            // whole): the record from a copy (host/import_fallback.h) - one
+            // its other elements share - rather than the page table's walk,
+            // which reads the sink page where no import is.
+            const std::uint64_t rec_va = va - fe.offset, rec_bytes = w[2] ? static_cast<std::uint64_t>(w[2]) * stride : fe.offset + bytes;
+            const RecordShadow* had = nullptr;
+            for (std::size_t k = 0; k < n_shadows; ++k) {
+                if (std::memcmp(shadows[k].w, w, 12) == 0) had = &shadows[k];
+            }
+            Located fb;
+            int how = import_fallback::kOff;
+            if (had && had->whole.buffer) {
+                fb = had->whole;
+                how = had->snapped ? import_fallback::kCopy : import_fallback::kMirror;
+            } else if (rec_bytes >= fe.offset + bytes) {
+                how = shadow_import_fallback_locked(rec_va, rec_bytes, draw_read_bytes(w, stride, rec_bytes), fb);
+            }
+            if (how == import_fallback::kMirror && fb.avail > fe.offset) {
+                loc = {fb.buffer, fb.offset + fe.offset, fb.avail - fe.offset};
+                mirrored = true;
+            } else if (how == import_fallback::kCopy) {
+                snap = fb;
+                loc = {fb.buffer, fb.offset + fe.offset, need};
+                snapped = true;
+            }
+        }
         if (!loc.buffer || loc.avail < placed_need) {
             t_vertex_input_refusal = kVsWhyPlacement;
             return keep("vertex data not within one imported buffer");
@@ -20563,6 +20591,12 @@ static bool draw_impl(const GpuDraw& d) {
                     index_why = shadow_locate_why();
                 }
             }
+        }
+        if (!loc.buffer && !by_handle && version != kCopyVersionInside) {
+            // In no import: the indices from a copy (host/import_fallback.h).
+            Located fb;
+            if (import_fallback::served(static_cast<import_fallback::Choice>(shadow_import_fallback_locked(d.index_va, index_bytes, index_bytes, fb))))
+                loc = fb;
         }
         if (!loc.buffer) {
             static std::atomic<int> logs{0};

@@ -600,6 +600,10 @@ if(UNIX)
   add_executable(apu_memory_test tests/apu_memory_test.cpp)
   target_include_directories(apu_memory_test PRIVATE src)
   add_test(NAME apu_memory_test COMMAND apu_memory_test)
+  # What serves a draw's range in no guest-memory import: the mirrors, a copy, or nothing and why.
+  add_executable(import_fallback_test tests/import_fallback_test.cpp)
+  target_include_directories(import_fallback_test PRIVATE src)
+  add_test(NAME import_fallback_test COMMAND import_fallback_test)
   # Where a plugin's read() reads: the image by Binary Ninja address, the rest at runtime - the slid Windows layout too.
   add_executable(plugin_address_test tests/plugin_address_test.cpp)
   target_include_directories(plugin_address_test PRIVATE src)
