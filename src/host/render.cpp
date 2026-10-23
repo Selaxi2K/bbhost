@@ -977,12 +977,26 @@ struct VbWatch {
     std::uint64_t behind;    // submissions the GPU had still to finish when it was recorded
     bool land_checked;       // hashed again just before its submission's labels landed (vb_race_before_land)
     bool land_changed;       // and changed then
+    bool land_wanted;        // looked at then (BBHOST_VB_RACE_LAND)
 };
 const int g_vb_race_level = [] {
     const char* e = std::getenv("BBHOST_VB_RACE");
     return e && e[0] >= '1' && e[0] <= '3' ? e[0] - '0' : 0;
 }();
 const bool g_vb_race = g_vb_race_level != 0;
+// BBHOST_VB_RACE_LAND: which ranges are hashed again as their labels land
+// (vb_race_before_land). handed (the default): those on pages GX handed out,
+// rewritten, write-watched or untracked, the ones a hand-out can reach - a
+// told mesh is placed again at any told write, and hashing every mesh there
+// held the labels back (37 ms from submission to landing, against 0.55,
+// and the game's pace with them). all: every range. none: the command
+// processor's later check only, as before.
+const int g_vb_race_land = [] {
+    const char* e = std::getenv("BBHOST_VB_RACE_LAND");
+    if (e && std::strcmp(e, "all") == 0) return 2;
+    if (e && std::strcmp(e, "none") == 0) return 0;
+    return 1;
+}();
 // BBHOST_VB_RACE_LOG=all: every change gets its line (bounded), not only the
 // first 24 and then each power of two.
 const bool g_vb_race_log_all = [] {
@@ -1117,6 +1131,10 @@ void vb_race_before_land(std::uint64_t completed) {
     while (g_vb_land_at < g_vb_popped + g_vb_watch.size()) {
         VbWatch& w = g_vb_watch[static_cast<std::size_t>(g_vb_land_at - g_vb_popped)];
         if (w.serial >= completed) break;
+        if (!w.land_wanted) {
+            ++g_vb_land_at;
+            continue;
+        }
         w.land_checked = true;
         w.land_changed =
             hle_kernel_va_mapped(w.va, w.bytes) && (w.mirrored ? vb_race_hash_ends(w.va, w.bytes) : vb_race_hash(w.va, w.bytes)) != w.hash;
@@ -1132,7 +1150,7 @@ bool vb_race_wide_on() { return g_vb_race_level == 3; }
 void vb_race_note_locked(const char* name, std::uint64_t va, std::uint64_t bytes, bool mirrored, std::uint8_t why, std::uint64_t holder) {
     if (!g_vb_race) return;
     static const bool hooked = [] {
-        if (label_landing::on()) label_landing::set_before_land(&vb_race_before_land);
+        if (label_landing::on() && g_vb_race_land) label_landing::set_before_land(&vb_race_before_land);
         return true;
     }();
     (void)hooked;
@@ -1168,6 +1186,8 @@ void vb_race_note_locked(const char* name, std::uint64_t va, std::uint64_t bytes
     w.loading = loading_screen_up();
     w.behind = g.flushes > g.completed_submits ? g.flushes - g.completed_submits : 0;
     w.hands = mirrored ? 0 : static_cast<std::uint8_t>(shadow_hand_kinds_locked(va));
+    w.land_wanted = g_vb_race_land == 2 || (g_vb_race_land == 1 && (w.hands != 0 || w.cls == kPlaceHanded || w.cls == kPlaceDynamic ||
+                                                                    w.cls == kPlaceWatched || w.cls == kPlaceUntracked));
     w.hash = mirrored ? vb_race_hash_ends(va, bytes) : vb_race_hash(va, bytes);
     std::memcpy(w.head, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va)), std::min<std::uint64_t>(bytes, sizeof(w.head)));
     w.flip = hle_video_flip_count();
