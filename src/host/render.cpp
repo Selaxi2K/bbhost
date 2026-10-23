@@ -12,6 +12,7 @@
 #include "host/lvp_split.h"
 #include "host/masked_blend.h"
 #include "host/shader_bundles.h"
+#include "host/vertex_clamp.h"
 #include "host/shader_patch.h"
 #include "host/tess_lds.h"
 #include "host/translation_cache.h"
@@ -13908,7 +13909,12 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
                 // placement has it - kept the whole record in host memory, and
                 // each draw staged all of it (0.2-18 GB a 15-s window there,
                 // run to run). BBHOST_VERTEX_CLAMP=0: the V#'s extent.
-                if (ns.whole.buffer == loc.buffer && g_vertex_clamp) {
+                // Looked up only where the extent decides something - a mirror
+                // asked again, a snapshot or a staging copy, the race census
+                // (host/vertex_clamp.h): an integrated GPU without room for the
+                // mirrors reads every record in place, whatever its extent.
+                if (ns.whole.buffer == loc.buffer &&
+                    vertex_clamp::lookup_wanted(g_vertex_clamp, buffer_shadow_on(), vertex_stage_on(), vb_race_on())) {
                     const std::uint64_t end = gx_buffer_end(record_va);
                     if (end && end - record_va < record_bytes) {
                         record_bytes = end - record_va;

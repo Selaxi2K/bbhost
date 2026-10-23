@@ -557,6 +557,10 @@ if(UNIX)
   add_executable(flip_pacing_test tests/flip_pacing_test.cpp)
   target_include_directories(flip_pacing_test PRIVATE src)
   add_test(NAME flip_pacing_test COMMAND flip_pacing_test)
+  # The vertex clamp's lookup, only where its result is used (host/vertex_clamp.h).
+  add_executable(vertex_clamp_test tests/vertex_clamp_test.cpp)
+  target_include_directories(vertex_clamp_test PRIVATE src)
+  add_test(NAME vertex_clamp_test COMMAND vertex_clamp_test)
   # The copy watch: its granules, then its ranges searched in halves (host/gxvk_watch.h).
   add_executable(gxvk_arena_test tests/gxvk_arena_test.cpp src/host/gxvk_arena.cpp)
   target_include_directories(gxvk_arena_test PRIVATE src)
