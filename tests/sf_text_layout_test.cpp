@@ -480,6 +480,21 @@ void test_run_locked() {
     CHECK(gsync::mutex_destroy(&m) == 0);
 }
 
+// A wrapper table entry goes to another movie only when its wrapper no
+// longer holds its movie: gone, cleared by its destructor, or reused.
+void test_wrapper_stale() {
+    const std::uint64_t w = alloc(0x60, 16);
+    const std::uint64_t movie = alloc(0x40, 16);
+    wr(w + 0x18, movie);
+    CHECK(!wrapper_stale(movie, w, kReadable));
+    wr(w + 0x18, 0);  // its destructor ran
+    CHECK(wrapper_stale(movie, w, kReadable));
+    wr(w + 0x18, movie + 0x100);  // the memory went to another wrapper's movie
+    CHECK(wrapper_stale(movie, w, kReadable));
+    CHECK(wrapper_stale(movie, 0, kReadable));
+    CHECK(wrapper_stale(movie, base() - 0x1000, kReadable));  // not readable
+}
+
 }  // namespace
 
 int main() {
@@ -492,6 +507,7 @@ int main() {
     test_restrand();
     test_destrand();
     test_run_locked();
+    test_wrapper_stale();
     if (g_failed) {
         std::printf("sf_text_layout_test: %d failure(s)\n", g_failed);
         return 1;

@@ -301,6 +301,14 @@ int destrand(std::uint64_t published, std::uint64_t next, Readable readable) {
     return n;
 }
 
+// A movie wrapper seen for `movie` that no longer holds it: gone, or its
+// destructor ran (it clears the movie, +0x18, first), or its memory went to
+// something else. Its table entry may go to another movie.
+template <class Readable>
+bool wrapper_stale(std::uint64_t movie, std::uint64_t wrapper, Readable readable) {
+    return !wrapper || !readable(wrapper + 0x18, 8) || rd(wrapper + 0x18) != movie;
+}
+
 // How run_locked ran its body.
 enum class LockRun {
     kLocked,       // under the lock, taken for it

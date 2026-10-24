@@ -385,12 +385,16 @@ GUEST_ABI std::int64_t handle_changes_hook(std::uint64_t, std::uint64_t* saved) 
 // --- the detector ---------------------------------------------------------------
 // The movie wrappers seen, by movie: their jobs name them, and say which
 // thread last ran each job and which thread is inside the movie's capture.
-constexpr int kWrappers = 64;
+// An entry whose wrapper no longer holds its movie (a wrapper's destructor
+// clears it) is taken again by the next movie when none is free: a long
+// session makes and drops more movies than the table holds.
+constexpr int kWrappers = 128;
 struct Wrapper {
     std::atomic<std::uint64_t> movie, wrapper;
     std::atomic<gsync::Thread*> advance, display, capturing;
 };
 Wrapper g_wrap[kWrappers];
+std::atomic<std::uint64_t> g_wrap_reused{0}, g_wrap_full{0};
 
 Wrapper* find_movie(std::uint64_t movie) {
     for (Wrapper& w : g_wrap) {
@@ -414,6 +418,18 @@ Wrapper* note_wrapper(std::uint64_t w) {
             return &e;
         }
     }
+    for (Wrapper& e : g_wrap) {
+        std::uint64_t old = e.movie.load(std::memory_order_acquire);
+        if (!old || !wrapper_stale(old, e.wrapper.load(std::memory_order_acquire), readable)) continue;
+        if (!e.movie.compare_exchange_strong(old, movie)) continue;
+        e.advance.store(nullptr, std::memory_order_relaxed);
+        e.display.store(nullptr, std::memory_order_relaxed);
+        e.capturing.store(nullptr, std::memory_order_relaxed);
+        e.wrapper.store(w, std::memory_order_release);
+        g_wrap_reused.fetch_add(1, std::memory_order_relaxed);
+        return &e;
+    }
+    g_wrap_full.fetch_add(1, std::memory_order_relaxed);
     return nullptr;
 }
 
@@ -838,6 +854,9 @@ void sf_text_layout_report() {
                  static_cast<unsigned long long>(g_lock_wait_max.load()), static_cast<unsigned long long>(g_lock_timeouts.load()),
                  static_cast<unsigned long long>(kLockWaitUs / 1000), static_cast<unsigned long long>(g_lock_no_wrapper.load()),
                  static_cast<unsigned long long>(g_lock_already.load()));
+        host_log("sf lock: movie wrappers' table entries taken again from a gone wrapper %llu, a movie left out for a full "
+                 "table %llu",
+                 static_cast<unsigned long long>(g_wrap_reused.load()), static_cast<unsigned long long>(g_wrap_full.load()));
     }
     if (g_guard) {
         host_log("sf text: %llu text update(s) ran without their layout's part; %llu node(s) marked again when it arrived, "
