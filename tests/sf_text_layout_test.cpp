@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <thread>
 #include <vector>
 
@@ -495,6 +496,99 @@ void test_wrapper_stale() {
     CHECK(wrapper_stale(movie, base() - 0x1000, kReadable));  // not readable
 }
 
+// The movie table over a session that makes and drops far more movies than
+// it holds (engine/sf_text_layout.h's table_note): a few alive at a time,
+// hundreds made, each wrapper cleared by its destructor (+0x18) when its
+// movie goes. Fake wrappers in an arena of their own.
+struct FakeMovies {
+    static constexpr int kMax = 400;
+    alignas(16) std::uint8_t mem[kMax * 0x40];
+    std::uint64_t wrapper[kMax], movie[kMax];
+    FakeMovies() {
+        std::memset(mem, 0, sizeof(mem));
+        for (int i = 0; i < kMax; ++i) {
+            wrapper[i] = reinterpret_cast<std::uint64_t>(mem) + 0x40 * static_cast<std::uint64_t>(i);
+            movie[i] = 0x7f0000000000ull + 0x10000ull * static_cast<std::uint64_t>(i + 1);  // never read
+            wr(wrapper[i] + 0x18, movie[i]);
+        }
+    }
+    bool readable(std::uint64_t a, std::size_t n) const {
+        const auto lo = reinterpret_cast<std::uint64_t>(mem);
+        return a >= lo && a + n <= lo + sizeof(mem);
+    }
+    void destroy(int i) { wr(wrapper[i] + 0x18, 0); }
+};
+
+WrapperEntry* note(WrapperTable& t, FakeMovies& f, int i) {
+    return table_note(t, f.wrapper[i], f.movie[i], [&](std::uint64_t a, std::size_t n) { return f.readable(a, n); });
+}
+
+bool found(WrapperTable& t, FakeMovies& f, int i) {
+    WrapperEntry* e = table_find(t, f.movie[i]);
+    return e && e->wrapper.load() == f.wrapper[i];
+}
+
+void test_table() {
+    static WrapperEntry entries[kWrapperTableSize];
+    const auto fresh = [&] {
+        for (WrapperEntry& e : entries) {
+            e.movie.store(0);
+            e.wrapper.store(0);
+        }
+    };
+    {
+        // Past 64 and past 128: 64 made and dropped, then 236 more, never more
+        // than 9 alive. Every movie gets an entry; 300 - 128 entries taken again.
+        fresh();
+        WrapperTable t{entries, kWrapperTableSize};
+        auto f = std::make_unique<FakeMovies>();
+        bool all = true;
+        for (int i = 0; i < 64; ++i) all = note(t, *f, i) && all;
+        for (int i = 0; i < 64; ++i) f->destroy(i);
+        for (int i = 64; i < 300; ++i) {
+            all = note(t, *f, i) && all;
+            all = found(t, *f, i) && all;
+            if (i >= 72) f->destroy(i - 8);
+        }
+        CHECK(all);
+        for (int i = 292; i < 300; ++i) CHECK(found(t, *f, i));
+        CHECK(t.reused.load() == 300 - kWrapperTableSize);
+        CHECK(t.left_out.load() == 0);
+        CHECK(table_live(t, [&](std::uint64_t a, std::size_t n) { return f->readable(a, n); }) == 8);
+    }
+    {
+        // 128 alive at once fit; the 129th, with none gone, is left out and
+        // takes no live movie's entry.
+        fresh();
+        WrapperTable t{entries, kWrapperTableSize};
+        auto f = std::make_unique<FakeMovies>();
+        bool all = true;
+        for (int i = 0; i < 128; ++i) all = note(t, *f, i) && all;
+        CHECK(all);
+        CHECK(note(t, *f, 128) == nullptr);
+        CHECK(t.left_out.load() == 1 && t.reused.load() == 0);
+        all = true;
+        for (int i = 0; i < 128; ++i) all = found(t, *f, i) && all;
+        CHECK(all);
+        CHECK(table_live(t, [&](std::uint64_t a, std::size_t n) { return f->readable(a, n); }) == 128);
+        // One goes: the next movie takes its entry and only its entry.
+        f->destroy(37);
+        CHECK(note(t, *f, 129) != nullptr);
+        CHECK(t.reused.load() == 1 && t.left_out.load() == 1);
+        CHECK(found(t, *f, 129) && table_find(t, f->movie[37]) == nullptr);
+        all = true;
+        for (int i = 0; i < 128; ++i) all = (i == 37 || found(t, *f, i)) && all;
+        CHECK(all);
+        // A movie seen again keeps its entry; a new wrapper for it replaces the old.
+        WrapperEntry* e = table_find(t, f->movie[5]);
+        CHECK(note(t, *f, 5) == e && t.reused.load() == 1);
+        const std::uint64_t w2 = f->wrapper[300];
+        wr(w2 + 0x18, f->movie[5]);
+        CHECK(table_note(t, w2, f->movie[5], [&](std::uint64_t a, std::size_t n) { return f->readable(a, n); }) == e);
+        CHECK(e && e->wrapper.load() == w2 && t.reused.load() == 1 && t.left_out.load() == 1);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -508,6 +602,7 @@ int main() {
     test_destrand();
     test_run_locked();
     test_wrapper_stale();
+    test_table();
     if (g_failed) {
         std::printf("sf_text_layout_test: %d failure(s)\n", g_failed);
         return 1;

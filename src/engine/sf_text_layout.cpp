@@ -383,54 +383,43 @@ GUEST_ABI std::int64_t handle_changes_hook(std::uint64_t, std::uint64_t* saved) 
 }
 
 // --- the detector ---------------------------------------------------------------
-// The movie wrappers seen, by movie: their jobs name them, and say which
-// thread last ran each job and which thread is inside the movie's capture.
-// An entry whose wrapper no longer holds its movie (a wrapper's destructor
-// clears it) is taken again by the next movie when none is free: a long
-// session makes and drops more movies than the table holds.
-constexpr int kWrappers = 128;
-struct Wrapper {
-    std::atomic<std::uint64_t> movie, wrapper;
-    std::atomic<gsync::Thread*> advance, display, capturing;
-};
-Wrapper g_wrap[kWrappers];
-std::atomic<std::uint64_t> g_wrap_reused{0}, g_wrap_full{0};
+// The movie wrappers seen, by movie (WrapperTable, in the header): their jobs
+// name them, and say which thread last ran each job and which thread is inside
+// the movie's capture. BBHOST_TEST_SF_TABLE=<n> uses only n of its entries,
+// so that a short session turns the table over as a long one does: the reuse
+// is the same code at any size.
+using Wrapper = WrapperEntry;
+WrapperEntry g_wrap_entries[kWrapperTableSize];
+WrapperTable g_wrap{g_wrap_entries, kWrapperTableSize};
+std::atomic<int> g_wrap_live_max{0};
+std::atomic<bool> g_wrap_turned{false};  // an entry was taken again
 
-Wrapper* find_movie(std::uint64_t movie) {
-    for (Wrapper& w : g_wrap) {
-        if (w.movie.load(std::memory_order_acquire) == movie) return &w;
-    }
-    return nullptr;
-}
+Wrapper* find_movie(std::uint64_t movie) { return table_find(g_wrap, movie); }
 
 Wrapper* note_wrapper(std::uint64_t w) {
     if (!readable(w + kWrapperMovie, 8)) return nullptr;
     const std::uint64_t movie = rd(w + kWrapperMovie);
     if (!movie) return nullptr;
-    if (Wrapper* e = find_movie(movie)) {
-        if (e->wrapper.load(std::memory_order_relaxed) != w) e->wrapper.store(w, std::memory_order_release);
-        return e;
+    const std::uint64_t reused = g_wrap.reused.load(std::memory_order_relaxed);
+    const std::uint64_t left_out = g_wrap.left_out.load(std::memory_order_relaxed);
+    bool fresh = false;
+    Wrapper* e = table_note(g_wrap, w, movie, readable, &fresh);
+    if (!fresh) return e;
+    // A movie new to the table (rare: a few a load): how many are alive now.
+    const int live = table_live(g_wrap, readable);
+    for (int m = g_wrap_live_max.load(std::memory_order_relaxed);
+         live > m && !g_wrap_live_max.compare_exchange_weak(m, live, std::memory_order_relaxed);) {
     }
-    for (Wrapper& e : g_wrap) {
-        std::uint64_t expected = 0;
-        if (e.movie.load(std::memory_order_relaxed) == 0 && e.movie.compare_exchange_strong(expected, movie)) {
-            e.wrapper.store(w, std::memory_order_release);
-            return &e;
-        }
+    if (g_wrap.reused.load(std::memory_order_relaxed) > reused && !g_wrap_turned.exchange(true)) {
+        host_log("sf lock: the movie table took its first entry again (movie %llx, wrapper %llx; %d of %d entries live)",
+                 static_cast<unsigned long long>(movie), static_cast<unsigned long long>(w), live, g_wrap.size);
     }
-    for (Wrapper& e : g_wrap) {
-        std::uint64_t old = e.movie.load(std::memory_order_acquire);
-        if (!old || !wrapper_stale(old, e.wrapper.load(std::memory_order_acquire), readable)) continue;
-        if (!e.movie.compare_exchange_strong(old, movie)) continue;
-        e.advance.store(nullptr, std::memory_order_relaxed);
-        e.display.store(nullptr, std::memory_order_relaxed);
-        e.capturing.store(nullptr, std::memory_order_relaxed);
-        e.wrapper.store(w, std::memory_order_release);
-        g_wrap_reused.fetch_add(1, std::memory_order_relaxed);
-        return &e;
+    if (g_wrap.left_out.load(std::memory_order_relaxed) > left_out && left_out == 0) {
+        host_log("sf lock: the movie table is full of live movies (%d): movie %llx is left out, and the HUD's lock and "
+                 "the detector don't see it",
+                 g_wrap.size, static_cast<unsigned long long>(movie));
     }
-    g_wrap_full.fetch_add(1, std::memory_order_relaxed);
-    return nullptr;
+    return e;
 }
 
 // The wrapper of a context, checked live: a wrapper's destructor clears its
@@ -489,7 +478,7 @@ constexpr std::uint64_t kLockWaitUs = 100000;
 bool g_lock = false;
 std::uint8_t* g_hud_trampoline = nullptr;
 std::atomic<std::uint64_t> g_lock_runs{0}, g_lock_waits{0}, g_lock_wait_us{0}, g_lock_wait_max{0}, g_lock_timeouts{0},
-    g_lock_no_wrapper{0}, g_lock_already{0};
+    g_lock_no_wrapper{0}, g_lock_already{0}, g_lock_runs_turned{0};
 
 void* guest_code(std::uint64_t a) { return reinterpret_cast<void*>(static_cast<std::uintptr_t>(a)); }
 
@@ -541,6 +530,7 @@ GUEST_ABI std::int64_t hud_update_hook(std::uint64_t, std::uint64_t* saved) {
         note_max(g_lock_wait_max, us);
     }
     if (how == LockRun::kLocked) {
+        if (g_wrap_turned.load(std::memory_order_relaxed)) g_lock_runs_turned.fetch_add(1, std::memory_order_relaxed);
         if (g_lock_runs.fetch_add(1, std::memory_order_relaxed) == 0) {
             host_log("sf lock: the HUD's update runs under the lock of movie %llx (wrapper %llx)",
                      static_cast<unsigned long long>(movie), static_cast<unsigned long long>(w));
@@ -768,6 +758,14 @@ void sf_text_layout_install(ElfImage* image) {
     const char* c = std::getenv("BBHOST_SF_TEXT_CHECK");
     const char* t = std::getenv("BBHOST_TEST_SF_CAPTURE_US");
     const char* l = std::getenv("BBHOST_SF_MOVIE_LOCK");
+    if (const char* ts = std::getenv("BBHOST_TEST_SF_TABLE")) {
+        const long n = std::strtol(ts, nullptr, 10);
+        if (n > 0 && n < kWrapperTableSize) {
+            g_wrap.size = static_cast<int>(n);
+            host_log("sf lock: the movie table uses %d of its %d entries (BBHOST_TEST_SF_TABLE, a test switch)", g_wrap.size,
+                     kWrapperTableSize);
+        }
+    }
     g_guard = !(g && *g == '0');
     g_check = c && *c == '1';
     g_lock = !(l && *l == '0');
@@ -854,9 +852,12 @@ void sf_text_layout_report() {
                  static_cast<unsigned long long>(g_lock_wait_max.load()), static_cast<unsigned long long>(g_lock_timeouts.load()),
                  static_cast<unsigned long long>(kLockWaitUs / 1000), static_cast<unsigned long long>(g_lock_no_wrapper.load()),
                  static_cast<unsigned long long>(g_lock_already.load()));
-        host_log("sf lock: movie wrappers' table entries taken again from a gone wrapper %llu, a movie left out for a full "
-                 "table %llu",
-                 static_cast<unsigned long long>(g_wrap_reused.load()), static_cast<unsigned long long>(g_wrap_full.load()));
+        host_log("sf lock: the movie table (%d entries%s): at most %d movies alive in it at once; entries taken again from "
+                 "a gone wrapper %llu, movies left out %llu; the HUD's update ran %llu time(s) under the lock after the "
+                 "first entry was taken again",
+                 g_wrap.size, g_wrap.size < kWrapperTableSize ? ", BBHOST_TEST_SF_TABLE" : "", g_wrap_live_max.load(),
+                 static_cast<unsigned long long>(g_wrap.reused.load()), static_cast<unsigned long long>(g_wrap.left_out.load()),
+                 static_cast<unsigned long long>(g_lock_runs_turned.load()));
     }
     if (g_guard) {
         host_log("sf text: %llu text update(s) ran without their layout's part; %llu node(s) marked again when it arrived, "

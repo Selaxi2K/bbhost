@@ -67,6 +67,7 @@
 
 #include "hle/sync.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -307,6 +308,76 @@ int destrand(std::uint64_t published, std::uint64_t next, Readable readable) {
 template <class Readable>
 bool wrapper_stale(std::uint64_t movie, std::uint64_t wrapper, Readable readable) {
     return !wrapper || !readable(wrapper + 0x18, 8) || rd(wrapper + 0x18) != movie;
+}
+
+// The table of movie wrappers seen (engine/sf_text_layout.cpp): an entry a
+// movie, found by the movie, filled in by the wrapper's jobs. A new movie
+// takes a free entry; when none is free, one whose wrapper no longer holds
+// its movie (wrapper_stale) - a long session makes and drops far more movies
+// than are alive at once; with neither, it is left out, counted. The game's
+// own list of live wrappers holds 32 (SprjScaleform's at +0x990), so 128
+// entries leave room for the dead ones not yet taken again.
+constexpr int kWrapperTableSize = 128;
+struct WrapperEntry {
+    std::atomic<std::uint64_t> movie{0}, wrapper{0};
+    std::atomic<gsync::Thread*> advance{nullptr}, display{nullptr}, capturing{nullptr};
+};
+struct WrapperTable {
+    WrapperEntry* entries;
+    int size;  // in use of the entries (BBHOST_TEST_SF_TABLE shrinks it, for a test)
+    std::atomic<std::uint64_t> reused{0}, left_out{0};
+};
+
+inline WrapperEntry* table_find(WrapperTable& t, std::uint64_t movie) {
+    for (int i = 0; i < t.size; ++i) {
+        if (t.entries[i].movie.load(std::memory_order_acquire) == movie) return &t.entries[i];
+    }
+    return nullptr;
+}
+
+// Wrapper `w`, which holds `movie` (the caller read it): the movie's entry,
+// made or taken again; nullptr when the table has no room (counted).
+template <class Readable>
+WrapperEntry* table_note(WrapperTable& t, std::uint64_t w, std::uint64_t movie, Readable readable, bool* fresh = nullptr) {
+    if (fresh) *fresh = false;
+    if (WrapperEntry* e = table_find(t, movie)) {
+        if (e->wrapper.load(std::memory_order_relaxed) != w) e->wrapper.store(w, std::memory_order_release);
+        return e;
+    }
+    if (fresh) *fresh = true;
+    for (int i = 0; i < t.size; ++i) {
+        WrapperEntry& e = t.entries[i];
+        std::uint64_t expected = 0;
+        if (e.movie.load(std::memory_order_relaxed) == 0 && e.movie.compare_exchange_strong(expected, movie)) {
+            e.wrapper.store(w, std::memory_order_release);
+            return &e;
+        }
+    }
+    for (int i = 0; i < t.size; ++i) {
+        WrapperEntry& e = t.entries[i];
+        std::uint64_t old = e.movie.load(std::memory_order_acquire);
+        if (!old || !wrapper_stale(old, e.wrapper.load(std::memory_order_acquire), readable)) continue;
+        if (!e.movie.compare_exchange_strong(old, movie)) continue;
+        e.advance.store(nullptr, std::memory_order_relaxed);
+        e.display.store(nullptr, std::memory_order_relaxed);
+        e.capturing.store(nullptr, std::memory_order_relaxed);
+        e.wrapper.store(w, std::memory_order_release);
+        t.reused.fetch_add(1, std::memory_order_relaxed);
+        return &e;
+    }
+    t.left_out.fetch_add(1, std::memory_order_relaxed);
+    return nullptr;
+}
+
+// Entries whose wrapper still holds their movie: the movies alive in it.
+template <class Readable>
+int table_live(WrapperTable& t, Readable readable) {
+    int n = 0;
+    for (int i = 0; i < t.size; ++i) {
+        const std::uint64_t movie = t.entries[i].movie.load(std::memory_order_acquire);
+        if (movie && !wrapper_stale(movie, t.entries[i].wrapper.load(std::memory_order_acquire), readable)) ++n;
+    }
+    return n;
 }
 
 // How run_locked ran its body.
