@@ -33,8 +33,7 @@
 // with its flag set and no layout - and off every later propagate list, its
 // list link left in the drained one - and faults at 0x52d6c0, reading +0x1c
 // of the null layout. That was a death during an area load on the Steam
-// Deck, in the loading screen's movie, whose window (0x1fce260) sets its tips
-// through GFx's SetText from the menu code (0x1fdd240).
+// Deck.
 //
 // The guard (on; BBHOST_SF_TEXT_GUARD=0 turns it off): at the transform
 // update's entry, a text cache node whose displayed data has no layout runs
@@ -56,7 +55,18 @@
 // and the first of each kind are logged with their callers.
 // BBHOST_TEST_SF_CAPTURE_US=<n> sleeps n microseconds in every capture
 // between its propagate pass and its lock - the window, made wide for a test.
+//
+// The cause (on; BBHOST_SF_MOVIE_LOCK=0 turns it off): the movie changed
+// outside its lock is the in-game HUD's, by its update (0x1ff7c20), an EzWork
+// job queued beside the movies' Advance jobs that drives the HUD movie
+// through GFx's Value API. The update now runs under its movie wrapper's
+// lock, as the movie's own jobs run theirs (run_locked below; the hook is in
+// engine/sf_text_layout.cpp). Logged as "sf lock:". The guard stays as the
+// check behind it.
 
+#include "hle/sync.h"
+
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -288,6 +298,42 @@ int destrand(std::uint64_t published, std::uint64_t next, Readable readable) {
     wr(head, head);
     wr(head + 8, head);
     return n;
+}
+
+// How run_locked ran its body.
+enum class LockRun {
+    kLocked,       // under the lock, taken for it
+    kAlreadyHeld,  // this thread held the lock already (the game's is recursive)
+    kTimedOut,     // the lock stayed busy past the wait: without it, as the game has it
+};
+
+// Runs `body` under the gsync mutex in `slot` - a movie wrapper's lock (its
+// scePthreadMutex at +0x40) - as the movie's Advance and NextCapture jobs run
+// theirs, unless this thread holds it already. A wait past `wait_us` runs
+// `body` without it: a guard against a lock order the game never takes, not
+// a path it should see. `waited_us` gets how long a busy lock took (0 when
+// it was free).
+template <class Body>
+LockRun run_locked(void** slot, std::uint64_t wait_us, std::uint64_t* waited_us, Body&& body) {
+    *waited_us = 0;
+    if (gsync::mutex_owner(slot) == gsync::current_thread()) {
+        body();
+        return LockRun::kAlreadyHeld;
+    }
+    if (gsync::mutex_trylock(slot) != 0) {
+        const auto t0 = gsync::Clock::now();
+        const gsync::Deadline dl = t0 + std::chrono::microseconds(wait_us);
+        const int rc = gsync::mutex_lock(slot, &dl);
+        *waited_us = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(gsync::Clock::now() - t0).count());
+        if (rc != 0) {
+            body();
+            return LockRun::kTimedOut;
+        }
+    }
+    body();
+    gsync::mutex_unlock(slot);
+    return LockRun::kLocked;
 }
 
 }  // namespace sf_text_layout

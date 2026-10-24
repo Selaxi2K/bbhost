@@ -2,9 +2,12 @@
 #include "engine/sf_text_layout.h"
 
 #include "core/elf.h"
+#include "core/memory.h"
 #include "core/portable.h"
+#include "core/thunk.h"
 #include "engine/addr.h"
 #include "engine/graphics_patch.h"
+#include "hle/hle.h"
 #include "hle/modules.h"
 #include "hle/sync.h"
 #include "log.h"
@@ -12,6 +15,7 @@
 #include <pthread.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -116,26 +120,125 @@ std::string callers_text(const std::uint64_t* saved) {
     return s;
 }
 
-// The game code further up a racing change's stack: code addresses outside
-// Scaleform's (below 0x1000000) in the next 16 KiB of the guest stack - the
-// GFx frames above a Value call are deep - to name the job that made it.
-// Words, not frames: a stale one can show up too.
-std::string game_callers_text(const std::uint64_t* saved) {
+// The guest's own frames above a change, by its frame-pointer chain. The
+// hooked function has not run its push of rbp yet, so rbp is still its
+// caller's frame; the prologue stub leaves rbp alone and hle_thunk_common
+// pushes it first, under the stub's six pushes, 136 bytes of vector saves and
+// the return address of its call: 19 words below `saved`. The chain stays on
+// the thread's own stack (the host part runs on another), checked against its
+// bounds; a frameless function on the way only drops out of the list.
+constexpr int kGuestRbpWord = -19;
+
+bool guest_stack(std::uint64_t* lo, std::uint64_t* hi) {
+    thread_local std::uint64_t t_lo = 0, t_hi = 0;
+    thread_local bool t_known = false;
+    if (!t_known) {
+        t_known = true;
+#if !defined(_WIN32)
+        pthread_attr_t a;
+        if (pthread_getattr_np(pthread_self(), &a) == 0) {
+            void* base = nullptr;
+            std::size_t size = 0;
+            if (pthread_attr_getstack(&a, &base, &size) == 0) {
+                t_lo = reinterpret_cast<std::uint64_t>(base);
+                t_hi = t_lo + size;
+            }
+            pthread_attr_destroy(&a);
+        }
+#endif
+    }
+    *lo = t_lo;
+    *hi = t_hi;
+    return t_hi != 0;
+}
+
+// Up to `cap` return addresses into the eboot, innermost first. The boot
+// thread runs the guest on a stack of its own (hle_set_guest_stack).
+int guest_frames(const std::uint64_t* saved, std::uint64_t* out, int cap) {
+    std::uint64_t lo = 0, hi = 0;
+    std::uint64_t fp = saved[kGuestRbpWord];
+    std::uint64_t blo = 0, bhi = 0;
+    if (hle_guest_boot_stack(&blo, &bhi) && fp >= blo && fp < bhi) {
+        lo = blo;
+        hi = bhi;
+    } else if (!guest_stack(&lo, &hi)) {
+        return 0;
+    }
+    std::uint64_t floor = reinterpret_cast<std::uint64_t>(saved + 7);
+    int k = 0;
+    for (int i = 0; i < 96 && k < cap; ++i) {
+        if (fp < floor || fp < lo || fp > hi - 16 || (fp & 7)) break;
+        const std::uint64_t next = rd(fp), ret = rd(fp + 8);
+        if (text(ret)) out[k++] = bn(ret);
+        floor = fp + 16;
+        fp = next;
+    }
+    return k;
+}
+
+std::string frames_text(const std::uint64_t* f, int n) {
     std::string s;
     char b[24];
-    int k = 0;
-    const std::uint64_t base = reinterpret_cast<std::uint64_t>(saved + 7);
-    for (std::uint64_t off = 0; off < 0x4000 && k < 8; off += 8) {
-        const std::uint64_t at = base + off;
-        if ((at & 0xfff) == 0 && !readable(at, 0x1000)) break;
-        if (off == 0 && !readable(at, 8)) break;
-        const std::uint64_t a = rd(at);
-        if (!text(a) || bn(a) < 0x1000000) continue;
-        std::snprintf(b, sizeof(b), "%s%llx", s.empty() ? "" : " ", static_cast<unsigned long long>(bn(a)));
+    for (int i = 0; i < n; ++i) {
+        std::snprintf(b, sizeof(b), "%s%llx", i ? " " : "", static_cast<unsigned long long>(f[i]));
         s += b;
-        ++k;
     }
     return s.empty() ? "none" : s;
+}
+
+// The game's code that made changes outside the movie's lock: the first frames
+// up the chain in the game's own code (0x1000000-0x2700000; Scaleform and the
+// libraries are on either side), counted by class. No allocation, for the
+// crash report.
+constexpr std::uint64_t kGameLo = 0x1000000, kGameHi = 0x2700000;
+constexpr int kSites = 48, kSiteFrames = 4;
+struct Site {
+    std::atomic<std::uint64_t> key;
+    std::uint64_t f[kSiteFrames];
+    char name[16];
+    char movie[24];
+    std::atomic<std::uint64_t> n[8];
+};
+Site g_sites[kSites];
+std::mutex g_sites_mu;
+std::atomic<std::uint64_t> g_sites_full{0};
+
+void count_site(const std::uint64_t* f, int n, int c, const char* thread, const char* movie) {
+    std::uint64_t g[kSiteFrames] = {};
+    int k = 0;
+    for (int i = 0; i < n && k < kSiteFrames; ++i) {
+        if (f[i] >= kGameLo && f[i] < kGameHi) g[k++] = f[i];
+    }
+    std::uint64_t key = 1469598103934665603ull;
+    for (const std::uint64_t a : g) key = (key ^ a) * 1099511628211ull;
+    for (const char* t = thread; *t; ++t) key = (key ^ static_cast<unsigned char>(*t)) * 1099511628211ull;
+    for (const char* t = movie; *t; ++t) key = (key ^ static_cast<unsigned char>(*t)) * 1099511628211ull;
+    if (!key) key = 1;
+    for (Site& s : g_sites) {
+        const std::uint64_t at = s.key.load(std::memory_order_acquire);
+        if (at == key) {
+            s.n[c].fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        if (!at) break;
+    }
+    std::lock_guard<std::mutex> lk(g_sites_mu);
+    for (Site& s : g_sites) {
+        const std::uint64_t at = s.key.load(std::memory_order_relaxed);
+        if (at == key) {
+            s.n[c].fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        if (!at) {
+            std::memcpy(s.f, g, sizeof(g));
+            std::snprintf(s.name, sizeof(s.name), "%s", thread);
+            std::snprintf(s.movie, sizeof(s.movie), "%s", movie);
+            s.n[c].fetch_add(1, std::memory_order_relaxed);
+            s.key.store(key, std::memory_order_release);
+            return;
+        }
+    }
+    g_sites_full.fetch_add(1, std::memory_order_relaxed);
 }
 
 // --- the guard ------------------------------------------------------------------
@@ -326,6 +429,25 @@ Wrapper* wrapper_of(std::uint64_t ctx, std::uint64_t* w_out) {
     return e;
 }
 
+// The movie's name as its wrapper keeps it (+0x28: the name its creator,
+// sub_235fae0, was given, a UTF-16 string), in ASCII; "?" when unreadable.
+constexpr std::uint64_t kWrapperName = 0x28;
+void movie_name(std::uint64_t w, char* out, std::size_t n) {
+    std::snprintf(out, n, "?");
+    if (!w || !readable(w + kWrapperName, 8)) return;
+    const std::uint64_t p = rd(w + kWrapperName);
+    if (!p || !readable(p, 2)) return;
+    const bool all = readable(p, 2 * n);  // the usual case: one lookup, not one a character
+    std::size_t k = 0;
+    for (; k + 1 < n && (all || readable(p + 2 * k, 2)); ++k) {
+        std::uint16_t c = 0;
+        std::memcpy(&c, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(p + 2 * k)), 2);
+        if (!c) break;
+        out[k] = c >= 0x20 && c < 0x7f ? static_cast<char>(c) : '?';
+    }
+    out[k ? k : 1] = 0;
+}
+
 GUEST_ABI std::int64_t advance_job_hook(std::uint64_t, std::uint64_t* saved) {
     if (Wrapper* e = note_wrapper(saved[5])) e->advance.store(gsync::current_thread(), std::memory_order_release);
     return 0;
@@ -334,6 +456,114 @@ GUEST_ABI std::int64_t advance_job_hook(std::uint64_t, std::uint64_t* saved) {
 GUEST_ABI std::int64_t display_job_hook(std::uint64_t, std::uint64_t* saved) {
     if (Wrapper* e = note_wrapper(saved[5])) e->display.store(gsync::current_thread(), std::memory_order_release);
     return 0;
+}
+
+// --- the cause: the HUD's update runs under its movie's lock -----------------------
+// sub_1ff7c20(item, state, dt) is the in-game HUD's update: the player's bars,
+// enemy tags, boss list, talk window, map name and event text. The game runs
+// it as an EzWork job (vtable 0x5756bd0, sub_2363d00, a tail call) that
+// sub_2362e30 queues into the work pool beside the movies' Advance jobs, and
+// it drives the HUD movie through GFx's Value API (SetText at +0x138,
+// GotoAndPlay at +0x150, member lookups) with no lock. The movie's own jobs -
+// Advance and Capture (sub_2358e50), NextCapture (sub_2359150) - each hold
+// the movie wrapper's lock (+0x38, a recursive DL mutex over the
+// scePthreadMutex at +0x40) around theirs, so nothing keeps the update apart
+// from them: a text set while a capture publishes goes out flagged for a
+// layout none built (the crash at 0x52d6c0), and two threads in one movie's
+// tree break its lists (the crashes in Display's recursive draw and the next
+// capture's merge).
+//
+// So the update takes that lock too. The hook finds the item's movie the way
+// the update itself does first (sub_1edb8a0: the movie handle at +0x20, whose
+// method 0 returns the movie), the movie's wrapper among the Advance jobs
+// seen, and runs the update through a trampoline under the wrapper's mutex.
+// Lock order: when the game runs the update itself, on the main thread
+// (sub_2362e30 without the pool), it holds data_5994200, which NextCapture
+// takes before +0x38 as well; Advance never takes data_5994200 (only the
+// wrapper's destructor, NextCapture and the HUD list's add, remove and update
+// do). A thread already holding the lock runs as is; a wait past 100 ms runs
+// as the game does, counted.
+constexpr std::uint64_t kHudUpdate = 0x1ff7c20;
+constexpr std::uint8_t kHudUpdatePrologue[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55,
+                                               0x41, 0x54, 0x53, 0x48, 0x81, 0xec, 0x28, 0x07, 0x00, 0x00};
+constexpr std::uint64_t kHudItemMovie = 0x20;  // the item's movie handle
+constexpr std::uint64_t kMovieRelease = 0x41cfb0;
+constexpr std::uint64_t kLockWaitUs = 100000;
+
+bool g_lock = false;
+std::uint8_t* g_hud_trampoline = nullptr;
+std::atomic<std::uint64_t> g_lock_runs{0}, g_lock_waits{0}, g_lock_wait_us{0}, g_lock_wait_max{0}, g_lock_timeouts{0},
+    g_lock_no_wrapper{0}, g_lock_already{0};
+
+void* guest_code(std::uint64_t a) { return reinterpret_cast<void*>(static_cast<std::uintptr_t>(a)); }
+
+// The item's movie, as its handle's method 0 gives it (a Ptr<Movie>, returned
+// through rdi), with the reference that call took let go again: the handle
+// keeps its own.
+std::uint64_t hud_movie(std::uint64_t item) {
+    if (item < 0x10000) return 0;
+    const std::uint64_t handle = rd(item + kHudItemMovie);
+    if (handle < 0x10000) return 0;
+    const std::uint64_t get = rd(rd(handle));
+    if (!text(get)) return 0;
+    std::uint64_t movie = 0;
+    hle_call_guest<std::int64_t>(guest_code(get), &movie, handle);
+    if (movie) hle_call_guest<std::int64_t>(guest_code(va(kMovieRelease)), movie);
+    return movie;
+}
+
+void note_max(std::atomic<std::uint64_t>& m, std::uint64_t v) {
+    std::uint64_t cur = m.load(std::memory_order_relaxed);
+    while (v > cur && !m.compare_exchange_weak(cur, v, std::memory_order_relaxed)) {
+    }
+}
+
+GUEST_ABI std::int64_t hud_update_hook(std::uint64_t, std::uint64_t* saved) {
+    const std::uint64_t movie = hud_movie(saved[5]);
+    Wrapper* e = movie ? find_movie(movie) : nullptr;
+    const std::uint64_t w = e ? e->wrapper.load(std::memory_order_acquire) : 0;
+    if (!w || rd(w + kWrapperMovie) != movie) {
+        const std::uint64_t n = g_lock_no_wrapper.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n == 1) {
+            host_log("sf lock: the HUD's update before its movie's Advance job was seen (movie %llx): it runs as the "
+                     "game has it until then",
+                     static_cast<unsigned long long>(movie));
+        }
+        return 0;
+    }
+    GuestCallRegs r{};
+    r.fn = g_hud_trampoline;
+    for (int k = 0; k < 6; ++k) r.ints[k] = saved[5 - k];  // rdi rsi rdx rcx r8 r9
+    const auto* xmm = reinterpret_cast<const std::uint8_t*>(saved) - 136;
+    for (int k = 0; k < 8; ++k) std::memcpy(&r.xmm[k], xmm + 16 * k, 8);
+    std::uint64_t us = 0;
+    const LockRun how = run_locked(reinterpret_cast<void**>(static_cast<std::uintptr_t>(w + kWrapperMutex)), kLockWaitUs,
+                                   &us, [&] { hle_call_guest_regs(&r); });
+    if (us) {
+        g_lock_waits.fetch_add(1, std::memory_order_relaxed);
+        g_lock_wait_us.fetch_add(us, std::memory_order_relaxed);
+        note_max(g_lock_wait_max, us);
+    }
+    if (how == LockRun::kLocked) {
+        if (g_lock_runs.fetch_add(1, std::memory_order_relaxed) == 0) {
+            char mn[24];
+            movie_name(w, mn, sizeof(mn));
+            host_log("sf lock: the HUD's update runs under the lock of movie %llx '%s' (wrapper %llx)",
+                     static_cast<unsigned long long>(movie), mn, static_cast<unsigned long long>(w));
+        }
+    } else if (how == LockRun::kAlreadyHeld) {
+        g_lock_already.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        const std::uint64_t n = g_lock_timeouts.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (log_this(n)) {
+            host_log("sf lock: the HUD's update waited %llu us for its movie's lock (wrapper %llx) and ran without it, as "
+                     "the game has it (%llu such waits so far)",
+                     static_cast<unsigned long long>(us), static_cast<unsigned long long>(w),
+                     static_cast<unsigned long long>(n));
+        }
+    }
+    saved[-1] = r.ret;
+    return 1;  // the update ran
 }
 
 // The capture's window, from its propagate pass to its unlock.
@@ -473,17 +703,32 @@ void classify(const char* what, std::uint64_t ctx, std::uint64_t entry, std::uin
     }
     const std::uint64_t n = g_class[c].fetch_add(1, std::memory_order_relaxed) + 1;
     count_thread(c);
-    if (c == kInside || c == kUnknown || !log_this(n)) return;
-    char tn[32];
-    thread_name(tn, sizeof(tn));
+    if (c == kInside) return;
+    // The thread's name as it had it at its first change here: reading it is
+    // a file read on Linux, too dear for every change.
+    thread_local char tn[16] = {};
+    if (!tn[0]) {
+        thread_name(tn, sizeof(tn));
+        tn[sizeof(tn) - 1] = 0;
+        if (!tn[0]) std::snprintf(tn, sizeof(tn), "?");
+    }
+    char mn[24];
+    movie_name(w, mn, sizeof(mn));
+    std::uint64_t f[24];
+    const int nf = guest_frames(saved, f, 24);
+    count_site(f, nf, c, tn, mn);
+    if (c == kUnknown || !log_this(n)) return;
     const std::uint64_t data = entry ? entry_data(entry, kPageActive, readable) : arg;
     const bool is_text = data && readable(data, 8) && rd(data) == va(kTextDataVtable);
-    const bool racing = c == kInCapture || c == kInAdvance || c == kBesideDisplay || c == kHeldOther;
-    host_log("sf text: %s %s (entry %llx%s, %llx) on %s, movie %llx, wrapper %llx, callers %s%s%s (%llu so far)", what,
-             kClassText[c], static_cast<unsigned long long>(entry), is_text ? ", a text's" : "",
-             static_cast<unsigned long long>(arg), tn, static_cast<unsigned long long>(ctx - kMovieContext),
-             static_cast<unsigned long long>(w), callers_text(saved).c_str(), racing ? "; game code up the stack " : "",
-             racing ? game_callers_text(saved).c_str() : "", static_cast<unsigned long long>(n));
+    // Beside NextCapture is Scaleform's design: the render side works on the
+    // snapshot on display, not the one being built.
+    const bool racing = c == kInCapture || c == kInAdvance || c == kHeldOther;
+    host_log("sf text: %s %s (entry %llx%s, %llx) on %s, movie %llx '%s', wrapper %llx, callers %s; frames %s%s (%llu so "
+             "far)",
+             what, kClassText[c], static_cast<unsigned long long>(entry), is_text ? ", a text's" : "",
+             static_cast<unsigned long long>(arg), tn, static_cast<unsigned long long>(ctx - kMovieContext), mn,
+             static_cast<unsigned long long>(w), callers_text(saved).c_str(), frames_text(f, nf).c_str(),
+             racing ? " - a race" : "", static_cast<unsigned long long>(n));
 }
 
 GUEST_ABI std::int64_t get_writable_hook(std::uint64_t, std::uint64_t* saved) {
@@ -530,8 +775,10 @@ void sf_text_layout_install(ElfImage* image) {
     const char* g = std::getenv("BBHOST_SF_TEXT_GUARD");
     const char* c = std::getenv("BBHOST_SF_TEXT_CHECK");
     const char* t = std::getenv("BBHOST_TEST_SF_CAPTURE_US");
+    const char* l = std::getenv("BBHOST_SF_MOVIE_LOCK");
     g_guard = !(g && *g == '0');
     g_check = c && *c == '1';
+    g_lock = !(l && *l == '0');
     g_capture_us = t ? std::strtoull(t, nullptr, 10) : 0;
     g_slide = image->mem.slide;
     bool ok = true;
@@ -547,9 +794,33 @@ void sf_text_layout_install(ElfImage* image) {
         ok = call_hook(image, kCaptureUnlockCall, kPthreadMutexUnlockStub, reinterpret_cast<void*>(&capture_end_hook),
                        "Context::Capture's unlock") && ok;
     }
-    if (g_check) {
+    if (g_check || g_lock) {
         ok = hook(image, kAdvanceJob, kAdvanceJobPrologue, sizeof(kAdvanceJobPrologue),
                   reinterpret_cast<void*>(&advance_job_hook), "the movie's Advance job") && ok;
+    }
+    bool locked = false;
+    if (g_lock) {
+        // The trampoline: the update's prologue, then a jump back past it.
+        auto* page = static_cast<std::uint8_t*>(host_page_alloc(0x1000, true));
+        const std::uint64_t at = va(kHudUpdate);
+        if (page && std::memcmp(guest_ptr(image->mem, at), kHudUpdatePrologue, sizeof(kHudUpdatePrologue)) == 0) {
+            constexpr std::size_t n = sizeof(kHudUpdatePrologue);
+            std::memcpy(page, kHudUpdatePrologue, n);
+            page[n] = 0xff;
+            page[n + 1] = 0x25;  // jmp [rip+0]
+            std::memset(page + n + 2, 0, 4);
+            const std::uint64_t back = at + n;
+            std::memcpy(page + n + 6, &back, 8);
+            g_hud_trampoline = page;
+            locked = hook(image, kHudUpdate, kHudUpdatePrologue, n, reinterpret_cast<void*>(&hud_update_hook),
+                          "the HUD's update");
+        } else {
+            host_log("sf lock: the HUD's update (0x%llx) NOT hooked (%s)", static_cast<unsigned long long>(kHudUpdate),
+                     page ? "unexpected bytes" : "no page for its trampoline");
+        }
+        ok = locked && ok;
+    }
+    if (g_check) {
         ok = hook(image, kDisplayJob, kDisplayJobPrologue, sizeof(kDisplayJobPrologue),
                   reinterpret_cast<void*>(&display_job_hook), "the movie's NextCapture job") && ok;
         ok = hook(image, kGetWritable, kGetWritablePrologue, sizeof(kGetWritablePrologue),
@@ -563,6 +834,11 @@ void sf_text_layout_install(ElfImage* image) {
         ok = call_hook(image, kCaptureLockCall, kPthreadMutexLockStub, reinterpret_cast<void*>(&capture_lock_hook),
                        "Context::Capture's lock") && ok;
     }
+    host_log("sf lock: %s", locked ? "the HUD's update runs under its movie's lock, as the movie's Advance and NextCapture "
+                                     "jobs do theirs"
+                                   : g_lock ? "the HUD's update runs as the game has it (its hook was not placed)"
+                                            : "off (BBHOST_SF_MOVIE_LOCK=0): the HUD's update runs as the game has it, "
+                                              "beside its movie's jobs");
     if (!g_guard && !g_check && !g_capture_us) {
         host_log("sf text: the text-layout guard is off (BBHOST_SF_TEXT_GUARD=0)");
         return;
@@ -576,6 +852,17 @@ void sf_text_layout_install(ElfImage* image) {
 }
 
 void sf_text_layout_report() {
+    if (g_lock) {
+        const std::uint64_t runs = g_lock_runs.load(), waits = g_lock_waits.load(), us = g_lock_wait_us.load();
+        host_log("sf lock: the HUD's update ran %llu time(s) under its movie's lock; it waited for the lock %llu time(s), "
+                 "%llu us in all (%.1f us a run, the longest %llu us), %llu wait(s) past %llu ms ran without it; %llu run(s) "
+                 "before its movie's Advance job was seen, %llu with the lock held already",
+                 static_cast<unsigned long long>(runs), static_cast<unsigned long long>(waits),
+                 static_cast<unsigned long long>(us), runs ? static_cast<double>(us) / static_cast<double>(runs) : 0.0,
+                 static_cast<unsigned long long>(g_lock_wait_max.load()), static_cast<unsigned long long>(g_lock_timeouts.load()),
+                 static_cast<unsigned long long>(kLockWaitUs / 1000), static_cast<unsigned long long>(g_lock_no_wrapper.load()),
+                 static_cast<unsigned long long>(g_lock_already.load()));
+    }
     if (g_guard) {
         host_log("sf text: %llu text update(s) ran without their layout's part; %llu node(s) marked again when it arrived, "
                  "%llu not marked, %d still waiting",
@@ -610,5 +897,28 @@ void sf_text_layout_report() {
                                  static_cast<unsigned long long>(t.n[c].load()));
         }
         host_log("sf text:   %-15s %s (the classes above, in order)", t.name, row);
+    }
+    // Who made the changes outside the lock: the game's code up the stack.
+    for (const Site& s : g_sites) {
+        if (!s.key.load(std::memory_order_acquire)) break;
+        char row[256];
+        int len = std::snprintf(row, sizeof(row), "%-15s %-16s", s.name, s.movie);
+        for (int c = 1; c < kClasses && len >= 0 && len < static_cast<int>(sizeof(row)); ++c) {
+            len += std::snprintf(row + len, sizeof(row) - static_cast<std::size_t>(len), " %llu",
+                                 static_cast<unsigned long long>(s.n[c].load()));
+        }
+        for (int i = 0; i < kSiteFrames && s.f[i] && len >= 0 && len < static_cast<int>(sizeof(row)); ++i) {
+            len += std::snprintf(row + len, sizeof(row) - static_cast<std::size_t>(len), "%s%llx", i ? " " : " | ",
+                                 static_cast<unsigned long long>(s.f[i]));
+        }
+        host_log("sf text:   by the game's code: %s", row);
+    }
+    if (g_sites_full.load()) {
+        host_log("sf text:   %llu change(s) from code past the %d places counted", static_cast<unsigned long long>(g_sites_full.load()),
+                 kSites);
+    }
+    if (g_sites[0].key.load()) {
+        host_log("sf text:   (by the game's code: the thread, the movie, then the classes after the first, in order, then "
+                 "the first frames up the stack in the game's own code)");
     }
 }

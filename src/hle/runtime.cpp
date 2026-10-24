@@ -188,6 +188,12 @@ void hle_set_guest_stack(void* base, std::size_t size) {
     host_log("guest boot stack %p size=0x%zx", base, size);
 }
 
+bool hle_guest_boot_stack(std::uint64_t* lo, std::uint64_t* hi) {
+    *lo = g_boot_stack_base;
+    *hi = g_boot_stack_base + g_boot_stack_size;
+    return g_boot_stack_size != 0;
+}
+
 void* hle_thread_enter_guest() { return guest_thread_enter(); }
 
 void hle_thread_leave_guest(void* tcb) { guest_thread_leave(tcb); }

@@ -6,12 +6,18 @@
 // the Steam Deck - with the guard and without it; the marking that brings the
 // layout's part back once a capture delivers the layout, and the tree
 // update's walk over the root's pending list that turns it into the flag; and
-// the cases the guard must leave alone.
+// the cases the guard must leave alone. And the fix at the cause: the HUD's
+// update run under its movie's lock (run_locked) against a stand-in for the
+// movie's Advance job holding that lock across its capture, on a real gsync
+// mutex.
 #include "engine/sf_text_layout.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 using namespace sf_text_layout;
@@ -412,6 +418,68 @@ void test_destrand() {
     CHECK(destrand(next, next, kReadable) == 0 && destrand(0, next, kReadable) == 0);
 }
 
+// The movie's Advance job takes the wrapper's lock around its Advance and
+// Capture; a stand-in holds it across a "capture" window again and again
+// while the HUD's update stand-in changes the movie through run_locked. No
+// change may land inside a window - one run bare (the game's way) lands in
+// them. Then the lock already held, and a lock busy past the wait.
+void test_run_locked() {
+    void* m = nullptr;
+    CHECK(gsync::mutex_init(&m, gsync::kMutexRecursive) == 0);
+    std::atomic<int> in_capture{0}, inside{0}, done{0};
+    std::thread advance([&] {
+        for (int i = 0; i < 300; ++i) {
+            gsync::mutex_lock(&m, nullptr);
+            in_capture.store(1);
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+            in_capture.store(0);
+            gsync::mutex_unlock(&m);
+            std::this_thread::sleep_for(std::chrono::microseconds(20));
+        }
+        done.store(1);
+    });
+    int runs = 0, locked = 0;
+    while (!done.load()) {
+        std::uint64_t us = 0;
+        const LockRun how = run_locked(&m, 100000, &us, [&] {
+            if (in_capture.load()) inside.fetch_add(1);
+        });
+        locked += how == LockRun::kLocked;
+        ++runs;
+    }
+    advance.join();
+    CHECK(inside.load() == 0);
+    CHECK(runs > 0 && locked == runs);
+    CHECK(gsync::mutex_owner(&m) == nullptr);
+
+    // Held by this thread already: runs as is and leaves it held.
+    CHECK(gsync::mutex_lock(&m, nullptr) == 0);
+    std::uint64_t us = 0;
+    bool ran = false;
+    CHECK(run_locked(&m, 1000, &us, [&] { ran = true; }) == LockRun::kAlreadyHeld);
+    CHECK(ran && us == 0);
+    CHECK(gsync::mutex_owner(&m) == gsync::current_thread());
+    CHECK(gsync::mutex_unlock(&m) == 0);
+    CHECK(gsync::mutex_owner(&m) == nullptr);
+
+    // Busy past the wait: runs without it, and says so.
+    std::atomic<int> held{0};
+    std::thread holder([&] {
+        gsync::mutex_lock(&m, nullptr);
+        held.store(1);
+        while (held.load() != 2) std::this_thread::yield();
+        gsync::mutex_unlock(&m);
+    });
+    while (held.load() != 1) std::this_thread::yield();
+    ran = false;
+    CHECK(run_locked(&m, 2000, &us, [&] { ran = true; }) == LockRun::kTimedOut);
+    CHECK(ran && us >= 2000);
+    CHECK(gsync::mutex_owner(&m) != gsync::current_thread());
+    held.store(2);
+    holder.join();
+    CHECK(gsync::mutex_destroy(&m) == 0);
+}
+
 }  // namespace
 
 int main() {
@@ -423,6 +491,7 @@ int main() {
     test_layout_arrives();
     test_restrand();
     test_destrand();
+    test_run_locked();
     if (g_failed) {
         std::printf("sf_text_layout_test: %d failure(s)\n", g_failed);
         return 1;

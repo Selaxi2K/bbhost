@@ -532,9 +532,11 @@ if(UNIX)
   add_test(NAME fmod_ring_test COMMAND fmod_ring_test)
   # The guard for a Scaleform text shown before its layout exists, without the
   # game (tests/sf_text_layout_test.cpp).
-  add_executable(sf_text_layout_test tests/sf_text_layout_test.cpp)
+  add_executable(sf_text_layout_test tests/sf_text_layout_test.cpp src/hle/sync.cpp src/host/main_wait.cpp src/core/futex.cpp)
   target_include_directories(sf_text_layout_test PRIVATE src)
+  target_link_libraries(sf_text_layout_test PRIVATE pthread)
   add_test(NAME sf_text_layout_test COMMAND sf_text_layout_test)
+  set_tests_properties(sf_text_layout_test PROPERTIES TIMEOUT 60)  # a lock left held hangs its threads
   add_executable(tess_lds_test tests/tess_lds_test.cpp src/host/tess_lds.cpp)
   target_include_directories(tess_lds_test PRIVATE src)
   add_test(NAME tess_lds_test COMMAND tess_lds_test)

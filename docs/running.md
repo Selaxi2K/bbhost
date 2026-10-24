@@ -194,17 +194,21 @@ that are never freed). `BBHOST_FMOD_GUARD=0` is the game's own behaviour;
 `BBHOST_FMOD_CHECK=1` also logs FMOD's sounds as they come and go and checks
 the list as sounds are loaded.
 
-**A crash on a loading screen, or `sf text:` in the log.** Scaleform, the
-game's menu library, works out how a piece of text is laid out when it hands a
-menu's changes to the renderer, and the renderer uses that layout without
-checking that it exists. A text changed by another part of the game while
-that hand-over is under way reaches the renderer without one, and the
-renderer's first use of it crashes the game (the loading screen's tips are
-such a text). bbhost leaves out the part of that text's update that needs the
-layout, and does it once the layout arrives; the log's `sf text:` lines say
-when, and the one at exit how often. `BBHOST_SF_TEXT_GUARD=0` is the game's
-own behaviour; `BBHOST_SF_TEXT_CHECK=1` also counts the menus' changes by
-whether the thread making them held the menu's lock.
+**A crash on a loading screen, or `sf lock:` / `sf text:` in the log.**
+Scaleform, the game's menu library, expects one thread at a time in a menu.
+The game updates its in-game HUD - the bars, the boss list, the map name - on
+a worker thread that does not take the HUD's lock, while another worker runs
+the HUD's own animation and hands its changes to the renderer. A text changed
+during that hand-over reaches the renderer without its layout, and the
+renderer's first use of it crashes the game; two threads in one menu at once
+can also break its lists. bbhost has the HUD's update take the HUD's lock, as
+the game's own menu jobs do; the `sf lock:` line at exit says how often it
+waited and for how long, and `BBHOST_SF_MOVIE_LOCK=0` is the game's own
+behaviour. Behind it, a text that still arrives without a layout skips the
+part of its update that needs one until the layout arrives (`sf text:`;
+`BBHOST_SF_TEXT_GUARD=0` turns that off). `BBHOST_SF_TEXT_CHECK=1` also
+counts the menus' changes by whether the thread making them held the menu's
+lock, and names the game code and the menu behind the others.
 
 **Wrong picture.** Wrong colours, a green or black screen, missing parts:
 press F12 in the game while it shows. bbhost writes that frame, every render
