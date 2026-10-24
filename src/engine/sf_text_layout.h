@@ -26,14 +26,15 @@
 // null.
 //
 // In Bloodborne the movie's Advance and Capture run as a CSEzWork job
-// (0x2358e50) and NextCapture on the GX job thread (0x2359150), both under the
-// movie wrapper's lock (+0x38, its mutex at +0x40). Nothing else takes that
-// lock, and the render tree's changes take none of their own, so a text
-// changed by another thread after a capture's propagate pass is published
-// with its flag set and no layout - and off every later propagate list, its
-// list link left in the drained one - and faults at 0x52d6c0, reading +0x1c
-// of the null layout. That was a death during an area load on the Steam
-// Deck.
+// (0x2358e50) and NextCapture on the GX job thread (0x2359150), both under
+// the movie wrapper's lock (+0x38, its mutex at +0x40). Nothing else in the
+// game takes that lock, and the render tree's changes take none of their
+// own, so a text changed by another thread after a capture's propagate pass
+// is published with its flag set and no layout - and off every later
+// propagate list, its list link left in the drained one - and faults at
+// 0x52d6c0, reading +0x1c of the null layout. That was a death during an
+// area load on the Steam Deck; the other thread is the in-game HUD's update
+// (below).
 //
 // The guard (on; BBHOST_SF_TEXT_GUARD=0 turns it off): at the transform
 // update's entry, a text cache node whose displayed data has no layout runs
