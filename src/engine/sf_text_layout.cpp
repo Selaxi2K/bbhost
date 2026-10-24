@@ -116,6 +116,28 @@ std::string callers_text(const std::uint64_t* saved) {
     return s;
 }
 
+// The game code further up a racing change's stack: code addresses outside
+// Scaleform's (below 0x1000000) in the next 16 KiB of the guest stack - the
+// GFx frames above a Value call are deep - to name the job that made it.
+// Words, not frames: a stale one can show up too.
+std::string game_callers_text(const std::uint64_t* saved) {
+    std::string s;
+    char b[24];
+    int k = 0;
+    const std::uint64_t base = reinterpret_cast<std::uint64_t>(saved + 7);
+    for (std::uint64_t off = 0; off < 0x4000 && k < 8; off += 8) {
+        const std::uint64_t at = base + off;
+        if ((at & 0xfff) == 0 && !readable(at, 0x1000)) break;
+        if (off == 0 && !readable(at, 8)) break;
+        const std::uint64_t a = rd(at);
+        if (!text(a) || bn(a) < 0x1000000) continue;
+        std::snprintf(b, sizeof(b), "%s%llx", s.empty() ? "" : " ", static_cast<unsigned long long>(bn(a)));
+        s += b;
+        ++k;
+    }
+    return s.empty() ? "none" : s;
+}
+
 // --- the guard ------------------------------------------------------------------
 std::atomic<std::uint64_t> g_skipped{0}, g_marked{0}, g_unmarked{0};
 // Text cache nodes whose layout part was taken out, until their layout
@@ -436,10 +458,12 @@ void classify(const char* what, std::uint64_t ctx, std::uint64_t entry, std::uin
     thread_name(tn, sizeof(tn));
     const std::uint64_t data = entry ? entry_data(entry, kPageActive, readable) : arg;
     const bool is_text = data && readable(data, 8) && rd(data) == va(kTextDataVtable);
-    host_log("sf text: %s %s (entry %llx%s, %llx) on %s, movie %llx, wrapper %llx, callers %s (%llu so far)", what,
+    const bool racing = c == kInCapture || c == kInAdvance || c == kBesideDisplay || c == kHeldOther;
+    host_log("sf text: %s %s (entry %llx%s, %llx) on %s, movie %llx, wrapper %llx, callers %s%s%s (%llu so far)", what,
              kClassText[c], static_cast<unsigned long long>(entry), is_text ? ", a text's" : "",
              static_cast<unsigned long long>(arg), tn, static_cast<unsigned long long>(ctx - kMovieContext),
-             static_cast<unsigned long long>(w), callers_text(saved).c_str(), static_cast<unsigned long long>(n));
+             static_cast<unsigned long long>(w), callers_text(saved).c_str(), racing ? "; game code up the stack " : "",
+             racing ? game_callers_text(saved).c_str() : "", static_cast<unsigned long long>(n));
 }
 
 GUEST_ABI std::int64_t get_writable_hook(std::uint64_t, std::uint64_t* saved) {
