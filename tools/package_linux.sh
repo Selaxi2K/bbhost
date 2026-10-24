@@ -114,9 +114,14 @@ SPIRV-Tools.
 
 libdxcompiler.so beside it is the DirectX Shader Compiler $dxc_tag, Microsoft's
 release unmodified (https://github.com/microsoft/DirectXShaderCompiler,
-licences in licenses/dxc): the HLSL shader path (BBHOST_HLSL, off by default)
-compiles with it, and it loads the system's libstdc++.so.6 (GCC 11 or newer).
-Without it that path keeps every shader as it was; nothing else uses it.
+licences in licenses/dxc): the HLSL shader path, on by default, compiles with
+it, and it loads the system's libstdc++.so.6 (GCC 11 or newer). The game's
+shaders are compiled in the background after a start's own shader builds (on
+an integrated GPU such as the Steam Deck's, only while the title and loading
+screens are up), and the translator's own are drawn until then; the setup
+window's Shaders tab compiles them all at once (Compile shaders now), and its
+Shaders setting picks Lifted to keep the translator's own. Without it that
+path keeps every shader as it was; nothing else uses it.
 
 Setup
   Untar this folder somewhere of its own, for example ~/Games/bbhost, and run

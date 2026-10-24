@@ -132,9 +132,14 @@ Online
 The shader compiler
   dxcompiler.dll is the DirectX Shader Compiler $dxc_tag, Microsoft's release
   unmodified (https://github.com/microsoft/DirectXShaderCompiler, licences
-  in licenses\\dxc). The HLSL shader path (BBHOST_HLSL, off by default)
-  compiles with it; without it that path keeps every shader as it was, and
-  nothing else uses it.
+  in licenses\\dxc). The HLSL shader path, on by default, compiles with it:
+  the game's shaders are compiled on this PC in the background after a
+  start's own shader builds (on an integrated GPU, only while the title and
+  loading screens are up), and the translator's own are drawn until then.
+  The setup window's Shaders tab compiles them all at once (Compile shaders
+  now); its Shaders setting (also F10 under Graphics) picks Lifted to keep
+  the translator's own. Without dxcompiler.dll that path keeps every shader
+  as it was, and nothing else uses it.
 
 Plugins
   plugins/ holds the official ones, signed by the bbhost release key
