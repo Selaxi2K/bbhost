@@ -17,6 +17,11 @@ Requirements:
   libswscale, libswresample) and SPIRV-Tools are optional but needed for a
   usable build: networking, windowing, audio, movies and shader optimisation
   are compiled out without them
+- for the HLSL shader path, the default, DXC's `libdxcompiler.so`, which bbhost
+  loads at run time: the one `BBHOST_HLSL_DXC` names, else the one beside the
+  executable, else the system's. `tools/fetch_dxc.sh linux build` puts the
+  packages' pinned library beside `build/bbhost`. Without one, every shader
+  keeps the lifter's SPIR-V
 
 On Arch Linux the packages are `vulkan-headers vulkan-icd-loader sdl3 ffmpeg
 curl zlib spirv-tools`. On Ubuntu 24.04 the distribution's Vulkan headers and
@@ -120,8 +125,9 @@ whole game drew, which a first start builds before the player reaches it
 `build/pipeline-list`). `BBHOST_PACKAGE_PIPELINE_LIST=<file>` packs a local
 list instead, `BBHOST_PIPELINE_LIST_FETCH=0` leaves it out (a development
 kit), and `tools/check_release_bundle.sh` fails a release whose packages lack
-the pinned list. Until the first list is published the pin is empty: the
-packages carry none and the check asks for none.
+the pinned list. The pin is `pipeline-list-v2`, a pre-release of its own with
+1,924 pipelines and 9 compute records; with the pin left empty, the packages
+carry no list and the check asks for none.
 
 ## Continuous integration
 
