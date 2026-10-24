@@ -15,9 +15,12 @@
 
 // Every vkAllocateMemory/vkFreeMemory in the files that include this header
 // is tagged with its site (gpu_memtrack.cpp), so a VRAM report can say which
-// allocation holds what - the question when several instances share a GPU.
+// allocation holds what - the question when several instances share a GPU -
+// and with its owner where a MemOwner names one (host/gpu_memtrack.h).
 #include <chrono>
 #include <string>
+
+#include "host/gpu_memtrack.h"
 VkResult bb_alloc_memory(VkDevice device, const VkMemoryAllocateInfo* info, const VkAllocationCallbacks* cb,
                          VkDeviceMemory* out, const char* file, int line);
 void bb_free_memory(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks* cb);
@@ -28,7 +31,8 @@ std::string bb_memory_sites_report();
 void bb_memory_test_limit(std::uint32_t types, std::uint64_t bytes);
 // The memory types of the device-local heap: what our allocations hold in
 // them is counted (bb_memory_local_bytes), and the report's sites outside it
-// are marked "@host".
+// are marked "@bar" (another device-local heap: bb_memory_set_heap_classes)
+// or "@host".
 void bb_memory_set_local_types(std::uint32_t types);
 std::uint64_t bb_memory_local_bytes();
 // Whether BBHOST_TEST_VRAM_MB acts out a smaller card: its limit, and what
@@ -47,6 +51,8 @@ bool bb_memory_test_limited(std::uint64_t* limit, std::uint64_t* used);
 #include <string>
 #include <type_traits>
 #include <vector>
+
+#include "host/heap_compact.h"  // the compaction's blocks and items (global namespace)
 
 namespace gpu {
 
@@ -88,7 +94,10 @@ constexpr std::uint32_t kStageSlots = 2;      // VS + PS descriptor sets per dra
 // the laptop it waited 1.1-1.9 s of every 5 s for a slot in heavy views, and
 // the frame rate fell to 53-56 there. 16: 6-10 ms, 60 fps (2026-10-04).
 constexpr int kSlots = 16;
-constexpr std::uint64_t kStagingChunkBytes = 64ull << 20;  // upload staging chunk size
+// Upload staging's chunk size: 64 MiB, BBHOST_STAGING_CHUNK_MB=<4..64> smaller
+// (each chunk given back in play is one vkFreeMemory, which on an RTX 4070
+// took 22-29 ms for 64 MiB and stalled the frame behind it; gpu.cpp).
+std::uint64_t staging_chunk_bytes();
 constexpr std::uint64_t kStagingKeepBytes = 1024ull << 20;  // free upload staging chunks kept for reuse
 // BBHOST_GPU_PROFILE timestamp queries per slot: a pair per draw/dispatch,
 // the last pair spans the whole command buffer.
@@ -103,6 +112,9 @@ struct Chunk {
     std::uint64_t size = 0;
     std::uint64_t lo = 0;
     std::vector<VkDeviceMemory> pieces;  // dma-buf imports bound into a sparse `buffer` (gpu.cpp, dmabuf_span)
+    // The idle census (BBHOST_IMPORT_IDLE_CENSUS=1, gpu.cpp): when it was made
+    // and last found by dmem_import (steady ms, flip).
+    std::uint64_t made_ms = 0, used_ms = 0, used_flip = 0;
 };
 // SCE_KERNEL_PROT_GPU_READ | SCE_KERNEL_PROT_GPU_WRITE: a mapping the GPU can reach.
 constexpr int kGuestProtGpu = 0x30;
@@ -112,19 +124,29 @@ inline bool chunk_covers(const Chunk& c, std::uint64_t in, std::uint64_t bytes) 
 }
 // Direct memory is imported a 16 MiB window at a time, when the GPU side
 // first resolves a range in it (a binding, a copy, an untile source, a mirror
-// page), and only inside the span the chunk's GPU-visible mappings cover
-// (gpu_span): the game's CPU-only heaps, the never-allocated tail and the GPU
-// heaps' untouched parts stay out of the driver's pinned memory - what
-// Windows counts as the process's shared GPU memory. A range across windows
-// gets one import of them all. Only with BBHOST_IMPORT_WINDOWS=1 for now (the
-// page-table walks the host does not resolve, gpu.cpp); otherwise each span
-// is imported whole when the mappings are made.
+// page, what a dispatch reads), and only inside the span the chunk's
+// GPU-visible mappings cover (gpu_span): the game's CPU-only heaps, the
+// never-allocated tail and the GPU heaps' untouched parts stay out of the
+// driver's pinned memory - what Windows counts as the process's shared GPU
+// memory. A range across windows gets one import of them all, widened to the
+// whole of every import it overlaps, which it replaces: those retire (their
+// windows and page-table entries move to the new one, and they are freed once
+// the work recorded with them has run), so no page of a chunk is imported
+// twice. An import may run on past its chunk's end into the next chunk's span
+// (kChunkOverlap), so a buffer across the seam lies in one import, as the
+// whole spans' overlap gives. Only with BBHOST_IMPORT_WINDOWS=1 (the counted
+// fallback of the native path, gpu.cpp); otherwise each span is imported whole
+// when the mappings are made.
 constexpr std::uint32_t kImportWindowShift = 24;
 constexpr std::uint32_t kImportWindows = 1u << (gcn::kDmemChunkShift - kImportWindowShift);  // per chunk
 struct DmemChunk {
     std::uint64_t span_lo = 0, span_hi = 0;      // what may be imported (gpu_span); empty: nothing
-    std::vector<std::unique_ptr<Chunk>> imports;  // made on demand, all kept while the game runs
-    Chunk* window[kImportWindows] = {};           // the import that covers each window, the latest made
+    std::vector<std::unique_ptr<Chunk>> imports;  // the live imports (retired ones go to a slot's dead_imports)
+    Chunk* window[kImportWindows] = {};           // the import that covers each window
+    // When an import over each window last failed (steady ms; 0: never): the
+    // window is not asked of the driver again for a while (import_backoff_ms),
+    // its draws read through the page table and the sink meanwhile.
+    std::uint64_t failed_ms[kImportWindows] = {};
 };
 // A plain device-addressable buffer (page tables, sink page).
 struct DevBuffer {
@@ -138,10 +160,25 @@ struct DevBuffer {
     bool in_host = false;
 };
 
+// A compute shader translated with its constant buffers, tables and typed
+// loads read through storage buffers the dispatch pushes (set 1 of
+// Gpu::cs_buffers_layout) and no page-table fallback for them
+// (BBHOST_CS_BUFFERS, gpu.cpp): a dispatch every one of whose buffers binds
+// runs it, any other the pipeline beside it.
+struct ComputeLean {
+    gcn::TranslateResult meta;
+    VkShaderModule module = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    bool standin = false;  // unoptimized, the optimized one queued (ComputePipeline::standin)
+    std::uint64_t opt_seen = 0;
+    bool lifted = false;  // a lifted program's: the lift of the lean translation (gpu.cpp build_compute_lean)
+};
+
 struct ComputePipeline {
     VkShaderModule module = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
     gcn::TranslateResult meta;
+    std::shared_ptr<ComputeLean> lean;  // null: none (off, nothing to bind, or it failed)
     std::string name;
     bool failed = false;
     // Its pipeline is still in the driver's compiler on a worker, and was not
@@ -177,6 +214,18 @@ struct ComputePipeline {
     int img_src_sgpr = -1;       // the source V#'s user SGPR, for buffer_to_image
     bool untraced_stores_logged = false;
     bool gds_overlap_checked = false;     // GDS counters: whether a V# of the program covers a counter word, looked at once
+    // Its module is the program's typed lift (gcn::lift_compute_shader,
+    // BBHOST_LIFT_COMPUTE), not its translation; otherwise why not (empty:
+    // not asked for), and the dispatches that ran it (under g.mu).
+    bool lifted = false;
+    std::string lift_why;
+    std::uint64_t dispatches = 0;
+    // The user-data dwords the translation touches at all (table_slots_read's
+    // `any`), worked out the first time a dispatch asks for it
+    // (GpuDispatch::want_user_reads: the dispatch-token shadow).
+    std::uint32_t user_reads = 0xffff;
+    bool user_reads_known = false;
+    bool oob_named = false;  // BBHOST_OOB_COUNT: its counter slot named (note_oob_compute_slot)
 };
 
 // Guest VA -> (VkBuffer, offset) for index buffers.
@@ -191,6 +240,8 @@ struct Located {
 struct Gpu {
     std::uint32_t max_lds_bytes = 32 * 1024;  // maxComputeSharedMemorySize
     float max_anisotropy = 16.0f;             // maxSamplerAnisotropy
+    float max_lod_bias = 15.0f;               // maxSamplerLodBias
+    bool mirror_clamp = false;                // samplerMirrorClampToEdge, enabled
     bool in_transfer = false;                 // a coalesced run of guest-memory transfers is open
     // Fence writes held back to the end of the command buffer (see
     // host_gpu_mem_write): recording them inline broke the render pass and
@@ -256,6 +307,15 @@ struct Gpu {
     // shaderFloat16 and shaderInt16 enabled: the host's own shaders may do f16
     // math (the half-precision FSR 1, fsr.cpp).
     bool has_f16_math = false;
+    // The game's submissions' timeline (Vulkan 1.2 timeline semaphore): each
+    // signals its serial + 1 (Gpu::flushes), so how far the GPU got is one
+    // counter read without the renderer's lock, and a wait for a frame is a
+    // sleep in the driver, not a poll (host_gpu_wait_completed). Null without
+    // timelineSemaphore, or with BBHOST_TIMELINE=0: the slots' fences, polled.
+    VkSemaphore timeline = VK_NULL_HANDLE;
+    // The presenter's own-queue copies' timeline (host_gpu_present_reads_locked):
+    // each signals the value it registered. Made with `timeline`.
+    VkSemaphore present_timeline = VK_NULL_HANDLE;
     bool has_device_fault = false;            // VK_EXT_device_fault
     bool has_checkpoints = false;             // VK_NV_device_diagnostic_checkpoints, or AMD's buffer markers
     PFN_vkCmdSetCheckpointNV cmd_checkpoint = nullptr;
@@ -294,12 +354,17 @@ struct Gpu {
         VkDescriptorPool pool = VK_NULL_HANDLE;
         bool in_flight = false;
         std::uint64_t serial = 0;  // Gpu::flushes when this slot was submitted
+        // The presenter's own-queue copy recorded while this slot was the one
+        // being recorded: its value on Gpu::present_timeline, waited for
+        // before the slot retires (0: none).
+        std::uint64_t present_target = 0;
         // What the submission holds, for the line a wait for it that runs long
         // writes (fence_wait_locked): the draws, dispatches and tessellated
         // draws recorded since the submission before, and the flip.
         std::uint64_t held_draws = 0, held_dispatches = 0, held_tess = 0, held_flip = 0;
         bool said_stuck = false;  // that line was written for this submission
         std::vector<DevBuffer> garbage;
+        std::vector<Chunk> dead_imports;  // window imports a merged one replaced (gpu.cpp retire_import_locked)
         std::vector<DevBuffer> staging_chunks;  // the upload staging chunks this slot's uploads are in, each once (Gpu::staging_users)
         std::vector<DevBuffer> scratch_chunks;  // the same for the device-local untile scratch (Gpu::scratch_users)
         // Images (with their memory and views) whose guest memory was
@@ -335,6 +400,9 @@ struct Gpu {
         // once the slot retired. `busy_written`: this recording wrote both.
         VkQueryPool busy_pool = VK_NULL_HANDLE;
         bool busy_written = false;
+        // The buffer shadow's upload command buffer, which runs just ahead of
+        // this one in the same submission, wrote its start (query 2).
+        bool busy_upload = false;
         // Descriptor sets allocated ahead from this slot's pool, by layout
         // (alloc_set_locked); dropped with the pool's reset.
         std::vector<std::pair<VkDescriptorSetLayout, std::vector<VkDescriptorSet>>> spare_sets;
@@ -359,6 +427,9 @@ struct Gpu {
     std::map<VkBuffer, std::uint32_t> scratch_users;
     VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
     VkPipelineLayout pipe_layout = VK_NULL_HANDLE;         // compute: one set
+    // Compute with its buffers pushed (ComputeLean): set 0 as pipe_layout's,
+    // set 1 cb_push_layout. Null without push descriptors.
+    VkPipelineLayout cs_buffers_layout = VK_NULL_HANDLE;
     VkPipelineLayout gfx_pipe_layout = VK_NULL_HANDLE;     // graphics: set 0 VS, set 1 PS
     VkDescriptorPool desc_pool = VK_NULL_HANDLE;
     VkPipelineCache cache = VK_NULL_HANDLE;
@@ -374,6 +445,7 @@ struct Gpu {
     // PIPELINE_COMPILE_REQUIRED_BIT), which answers without compiling.
     bool cache_control = false;
     std::uint32_t vendor_id = 0;  // VkPhysicalDeviceProperties::vendorID (0x10de NVIDIA, 0x1002 AMD)
+    VkDriverId driver_id = {};    // VkPhysicalDeviceDriverProperties::driverID (VK_DRIVER_ID_MESA_LLVMPIPE: lavapipe)
     bool integrated = false;      // VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: its device-local memory is system RAM
     bool tight = false;           // little memory in all its heaps (gpu.cpp, memory_tight)
     // A discrete GPU with under 7.5 GiB of video memory free at the start
@@ -428,6 +500,12 @@ struct Gpu {
     std::map<std::uint32_t, VkImage> dummy_dim_images;
     std::map<std::uint32_t, VkDeviceMemory> dummy_dim_mem;
     std::map<std::uint32_t, VkImageView> dummy_dim_views;
+    // 1x1 D32_SFLOAT images at the far plane, by (dim << 1) | arrayed (2D, 2D
+    // array, cube, cube array): what a depth-compare binding samples where its
+    // colour view cannot compare (depth_dummy_view_for).
+    std::map<std::uint32_t, VkImage> dummy_depth_images;
+    std::map<std::uint32_t, VkDeviceMemory> dummy_depth_mem;
+    std::map<std::uint32_t, VkImageView> dummy_depth_views;
     VkSampler dummy_sampler = VK_NULL_HANDLE;
     // Constant buffers as storage buffers (TranslateOptions::cb_ssbo, BBHOST_CB_SSBO=0 to turn off):
     // the buffer bound where a V# could not be, and the device limits for binding one.
@@ -443,6 +521,7 @@ struct Gpu {
     std::uint64_t mirror_size = 0;
     DmemChunk dmem[gcn::kDmemChunks];
     DevBuffer l1, sink, sink_l2;
+    DevBuffer oob;  // BBHOST_OOB_COUNT=1: gcn::set_oob_count's counters (gcn::kOobSlots x kOobKinds dwords)
     std::map<std::uint32_t, DevBuffer> l2;          // by va >> 32
     std::map<std::uint64_t, Chunk> anon_imports;    // by va: imported flexible mappings
     std::vector<GuestMapInfo> maps;                 // last snapshot
@@ -453,11 +532,15 @@ struct Gpu {
     std::map<std::uint64_t, ComputePipeline> pipelines;
     // Stats
     std::atomic<std::uint64_t> dispatches{0}, failures{0}, translated{0}, dummy_images{0};
+    // Dispatches that ran a shader (not a recognised fill or copy), and of
+    // them those whose module was the program's typed lift.
+    std::atomic<std::uint64_t> shader_dispatches{0}, lifted_dispatches{0};
     std::atomic<std::uint64_t> transfer_batches{0};  // barrier pairs the transfers above needed
     std::atomic<std::uint64_t> rt_replacements{0};   // render targets re-created (each idles the device)
     std::atomic<std::uint64_t> draws{0}, draw_failures{0}, gfx_pipelines{0};
     // The draws by how their pixel shader ran (DrawPs, gpu.h), beside `draws`.
     std::atomic<std::uint64_t> draws_ps[4] = {};
+    std::atomic<std::uint64_t> draws_clip_discard{0};  // GpuStats::draws_clip_discard
     std::atomic<std::uint64_t> draws_vs[4] = {};  // ... and by how their vertex shader ran (DrawVs)
     std::atomic<std::uint64_t> draws_vs_why[16] = {};  // kDrawVsOther by why (DrawVsWhy)
     std::atomic<std::uint64_t> draws_tess[6] = {};     // the host tessellator's draws by lifted stages (DrawTess)
@@ -561,6 +644,23 @@ void stage_manifest_load(const std::string& path);
 void stage_manifest_save(const std::string& path);
 void stage_manifest_save_async(const std::string& path);
 std::string stage_manifest_path();
+// The pipeline manifest (render.cpp PipelineRecipe): <data root>/bbhost/pipeline-manifest.bin.
+void pipeline_manifest_load(const std::string& path, const std::string& list_path);
+void pipeline_manifest_save(const std::string& path);
+void pipeline_manifest_save_async(const std::string& path);
+std::string pipeline_manifest_path();
+// The shader sweep (render.cpp): every shader in the game's bundles compiled
+// into the caches at the first start for this translator and device, the
+// stamp at `stamp_path` (<data root>/bbhost/shader-sweep.txt) saying it ran.
+void shader_sweep_start(const std::string& stamp_path, const std::string& eboot_path);
+// The compile session (host_gpu_set_compile_session): set before the device
+// starts; the sweep then takes the bundles' shaders at once, in full.
+inline std::atomic<bool> g_compile_session{false};
+void compile_session_progress(std::uint64_t& total, std::uint64_t& done, std::uint64_t& failed, bool& listed, bool& finished,
+                              std::string& reasons, std::uint64_t& recipes_total, std::uint64_t& recipes_done);
+void compile_session_cancel();
+// What it has left while the title or a loading screen is up (else 0).
+std::size_t shader_sweep_left();
 // render.cpp: the precompile workers run on half the hardware threads until
 // the first in-game frame and while a loading screen is up, a quarter of them
 // otherwise.
@@ -591,6 +691,10 @@ std::uint64_t render_tess_draws();  // the tessellated draws so far (render.cpp)
 // Copies guest memory as the work being recorded now will see it: the CP writes
 // still queued in unfinished submissions applied on top (Gpu::pending_writes).
 void read_guest_locked(std::uint64_t va, std::size_t bytes, void* out);
+// A dispatch token's compute-stage user data from its records (render.cpp):
+// the dwords its descriptors write, tables in the host ring; `set` says
+// which. False when a descriptor is one the builder does not take.
+bool render_cs_user_data_locked(const GxStageRecords& st, std::uint32_t user[16], std::uint16_t* set);
 void defer_destroy(const DevBuffer& b);  // freed once the current command buffer retired
 // Upload staging: `size` bytes placed in a mapped host-visible chunk the current command buffer shares with the ones
 // before and after it; the chunk is free for reuse once all of them retired. `b` is the chunk with `map` advanced to
@@ -611,7 +715,72 @@ void defer_destroy_image(VkImage image, VkDeviceMemory memory);
 // texture: a sampled image or a copy made for one, which the video memory
 // reserve keeps out of the last of video memory (vram_reserve_bytes);
 // otherwise a render target or snapshot, which may take the reserve.
-bool image_memory_alloc(const VkMemoryRequirements& req, ImageMemory& out, bool texture = false);
+// cls: the blocks it goes in (HeapClass; -1: kHeapTextures for a texture,
+// kHeapTargets otherwise) - render targets, snapshots and what the GPU
+// writes live as long as an area does, textures come and go as the game
+// streams them, and apart the textures' blocks empty (BBHOST_HEAP_CLASSES).
+enum HeapClass : int { kHeapTargets = 0, kHeapTextures = 1 };
+bool image_memory_alloc(const VkMemoryRequirements& req, ImageMemory& out, bool texture = false, int cls = -1);
+// The class of the block `m` was placed in (-1: none, -2: memory of its own).
+int image_memory_class_locked(const ImageMemory& m);
+bool image_heap_classes_on();  // BBHOST_HEAP_CLASSES
+// The textures' block in video memory with the least in use, not one in
+// `skip` (-1: none, or only one texture block), what it has in use, and the
+// free room in all the textures' blocks together.
+int image_heap_drain_candidate_locked(std::uint64_t* class_free, std::uint64_t* used, const std::vector<int>& skip);
+// The textures' blocks drain (textures.cpp, BBHOST_HEAP_DRAIN): see there.
+void drain_texture_blocks_locked();
+// The targets' blocks drain (render.cpp drain_target_blocks_locked): the
+// targets' block that holds least when the class has two or more - its index,
+// the bytes it holds and the free room of the others' (-1: none); a block no
+// image goes in while it is emptied (-1: none); a block's bytes in use; and an
+// image's memory from room the heap's video memory blocks already have -
+// never a new block, never host memory (false when there is none).
+int image_heap_target_drain_candidate_locked(std::uint64_t* used, std::uint64_t* room_elsewhere);
+void image_heap_avoid_block_locked(int block);
+int image_heap_avoided_block_locked();
+std::uint64_t image_heap_block_used_locked(int block);
+bool image_memory_place_existing_locked(const VkMemoryRequirements& req, ImageMemory& out, int cls);
+// textures.cpp: whether the block holds a surface that cannot be made again
+// (a shader or a copy wrote it), and letting go of what it holds that can -
+// textures, copies of targets' regions, level aliases (made again at their
+// next bind); returns the bytes let go.
+bool textures_block_pinned_locked(int block);
+std::uint64_t textures_drop_block_locked(int block);
+void drain_target_blocks_locked();  // render.cpp, once a second from the submission
+std::uint64_t image_heap_spare_in_play();  // the memory keeper's spare blocks in play (gpu.cpp)
+std::string target_drain_report();  // render.cpp: what the targets' blocks drain did
+// The image heap's compaction (render.cpp compact_image_heap_locked,
+// host/heap_compact.h; BBHOST_HEAP_COMPACT, on where the image heap is lean,
+// in place of the two drains): its switch (gpu.cpp); the heap's blocks as it
+// sees them, the memory type of its images and the placement's switches
+// (gpu.cpp); the surfaces of each block it would copy and whether a block
+// holds one that can neither move nor go (textures.cpp); a turn's textures -
+// those that need no copy let go, then copies while `credit` lasts, false
+// when one found no room (textures.cpp); the turn, once a second from the
+// submission, and what it has done for the census (render.cpp).
+bool heap_compact_on();
+bool world_reached();  // render.cpp: the first in-game frame has come (a block made before it is the boot's, not the play's)
+void image_heap_blocks_locked(std::vector<heap_compact::Block>& out, std::uint32_t* type, bool* classes, bool* overflow, bool* fullest);
+void textures_compact_items_locked(std::vector<std::vector<heap_compact::Item>>& items, std::vector<bool>& pinned, std::uint64_t hot_ms);
+struct CompactTextureTurn {
+    std::uint64_t let_go = 0, let_go_bytes = 0, copied = 0, copied_bytes = 0, busy = 0;
+};
+bool textures_compact_turn_locked(int block, std::uint64_t hot_ms, std::int64_t& credit, std::size_t& copied_this_turn, CompactTextureTurn& out);
+void compact_image_heap_locked();
+std::string heap_compact_report();
+// The drain so far: blocks emptied, textures and MiB taken out, blocks left
+// because a surface the GPU wrote sits in them.
+void textures_drain_counts(std::uint64_t out[4]);
+// The textures' blocks' pinned surfaces (one a shader or a copy wrote) moved
+// into the targets' room, for the block the drain named (textures.cpp): in the
+// flush, while its recording is open. And what it has done, for the census.
+void textures_relocate_pinned_locked();
+std::string textures_relocate_report();
+// The targets' drain (render.cpp) asking for block `block`'s pinned surfaces
+// to move at the next flush, as the textures' drain does: true when they will
+// (BBHOST_HEAP_RELOCATE on, none failed, 32 MiB at most, no other block named).
+bool textures_relocate_block_locked(int block);
 // The video memory this process may still take, in bytes (negative: over
 // budget): BBHOST_TEST_VRAM_MB's limit less what our allocations hold against
 // it, else the driver's budget for the heap less its usage
@@ -626,6 +795,23 @@ std::uint64_t vram_reserve_bytes();
 // Whether video memory is down to the reserve (headroom under reserve +
 // `more` bytes); false when the reserve is off.
 bool vram_within_reserve(std::uint64_t more = 0);
+// The caches' budget and the lean image heap (gpu.cpp, host/apu_memory.h),
+// set with the reserve once the device is chosen: the budget in bytes (0:
+// none); whether the video memory we hold, with `more` about to be made, is
+// over it; how far over it is (0 under it); whether the image heap is lean -
+// no spare block in play, the textures' blocks drained at the lean
+// thresholds. Any thread.
+void cache_budget_init();
+std::uint64_t cache_budget_bytes();
+bool cache_over_budget(std::uint64_t more = 0);
+std::uint64_t cache_budget_excess();
+bool heap_lean_on();
+// The world settled: no loading screen, and BBHOST_CACHE_SETTLE_S (30) since
+// the last one ended. The budget and the lean heap press only then
+// (cache_budget_pressing: settled and over the budget), so an area being
+// entered keeps what it makes ahead.
+bool world_settled();
+bool cache_budget_pressing(std::uint64_t more = 0);
 // Textures kept out of the reserve so far (placed in host memory instead).
 std::uint64_t vram_reserve_refusals();
 // Whether what a shortage put in host memory comes back once video memory has
@@ -645,8 +831,55 @@ void textures_return_from_host_locked();
 // BBHOST_VRAM_EVICT_S).
 void evict_cold_surfaces_locked();
 // Free room in the image heap's blocks of video memory (gpu.cpp).
-std::uint64_t image_heap_vram_free_locked();
+// cls (HeapClass): only the room that class may take - its blocks' and the
+// empty ones'; -1 every block's.
+std::uint64_t image_heap_vram_free_locked(int cls = -1);
 std::string vram_return_report();  // the 5-second report's counts
+// What the image heap's images hold by kind, for the video memory report
+// (video_memory_report, gpu.cpp). Under g.mu. Bytes in video memory, and
+// what a shortage put in host memory apart (rt_host, tex_host).
+struct VramKind {
+    std::uint64_t bytes = 0, n = 0;
+    void add(std::uint64_t b) {
+        bytes += b;
+        ++n;
+    }
+};
+struct VramCensus {
+    // render.cpp: colour and depth targets (g_rts), the display buffers' size
+    // apart; of all three, those no draw, fill or copy has written for 10 s
+    // (rt_idle); copy snapshots (g_snapshots), likewise.
+    VramKind rt_colour, rt_depth, rt_display, rt_idle, snapshots, snap_idle, rt_host;
+    // textures.cpp: surfaces a shader or a copy wrote (and those not written
+    // for 10 s), textures made ahead and never bound, textures no bind looked
+    // up for 20 s (what the cold eviction takes when video memory is down to
+    // the reserve), the rest; copies of targets' regions and level aliases.
+    VramKind gpu_written, gpu_written_idle, tex_ahead, tex_cold, tex_bound, regions, tex_host;
+    // The image heap's classes (BBHOST_HEAP_CLASSES): surfaces that turned
+    // out GPU-written but sit in the textures' blocks, and uploaded ones in
+    // the targets' - the guess at creation missed both.
+    VramKind gpu_written_in_tex, tex_in_targets;
+    // depth_copy.cpp and other images with memory of their own in video
+    // memory: counted by gpu_memtrack's owners instead.
+    // By image heap block (ImageMemory::block), bytes of each kind: colour
+    // targets, depth targets, snapshots, GPU-written surfaces, textures,
+    // copies of targets' regions and levels - what keeps a block from emptying.
+    enum : int { kBlockColour, kBlockDepth, kBlockSnapshot, kBlockGpuWritten, kBlockTexture, kBlockRegion, kBlockKinds };
+    std::vector<std::array<std::uint64_t, kBlockKinds>> by_block;
+    void note_block(std::int32_t block, int kind, std::uint64_t bytes) {
+        if (block < 0 || block > 4096) return;
+        if (by_block.size() <= static_cast<std::size_t>(block)) by_block.resize(static_cast<std::size_t>(block) + 1, {});
+        by_block[static_cast<std::size_t>(block)][static_cast<std::size_t>(kind)] += bytes;
+    }
+};
+// display_w x display_h: the display buffers' size (0 x 0: not known).
+void render_vram_census_locked(VramCensus& c, std::uint32_t display_w, std::uint32_t display_h);  // render.cpp
+void textures_vram_census_locked(VramCensus& c);  // textures.cpp
+// The video memory report's lines (gpu.cpp): the driver's count and ours, what
+// is held by kind and owner, what caches hold; at exit also each owner's
+// highest. BBHOST_VRAM_REPORT=0: vram_report_on() is false and nothing is made.
+bool vram_report_on();
+std::string video_memory_report_locked(bool at_exit);
 // Frees `m` with `image` once the recording in progress has retired.
 void defer_destroy_image(VkImage image, const ImageMemory& m);
 std::string image_heap_report();
@@ -657,6 +890,11 @@ void defer_destroy_private_view(VkImageView view);  // a pass's own view, never 
 // given - so the work goes behind the game's - then holds g.queue_mu.
 void queue_drain();
 std::string submit_thread_report();  // for the hang report
+std::string submit_merge_report();   // the submission thread's jobs and queue submissions so far (recorder report)
+// Writes into write-combined memory the GPU reads (params blocks, constant-
+// buffer snapshots) run to the end of their last 64-byte line (gpu.cpp,
+// BBHOST_WC_LINES).
+extern const bool g_wc_whole_lines;
 struct QueueGuard {
     QueueGuard();
     ~QueueGuard();
@@ -679,6 +917,27 @@ std::uint32_t alloc_params_slot_locked(const gcn::StageParams& params, VkDescrip
 VkDescriptorSet alloc_set_locked(VkDescriptorSetLayout layout = VK_NULL_HANDLE);  // the shared layout when null
 bool rebuild_page_tables();
 bool create_dev_buffer(DevBuffer& b, std::uint64_t size, bool host_visible, bool cached = false);  // cached: host-cached memory, for readbacks
+// BBHOST_OOB_COUNT (gcn::set_oob_count): the counters' totals by slot and kind
+// (kOobSlots x kOobKinds) in 64 bits - each 32-bit counter's change since the
+// last call added, so one that wraps between calls still adds up; called once
+// a second (host_gpu_stats) and at exit. Empty when not counting.
+std::vector<std::uint64_t> oob_totals();
+// The same: a compute program's slot named for the exit report, as render.cpp
+// names a draw's stages (note_oob_slots).
+void note_oob_compute_slot(std::uint32_t slot, const std::string& name);
+// A host-visible buffer the CPU writes and shaders read every draw: in video
+// memory the CPU can write on a discrete GPU (rings_in_vram), else as
+// create_dev_buffer(b, size, true). `what` names it in the log.
+bool create_upload_buffer(DevBuffer& b, std::uint64_t size, const char* what);
+bool rings_in_vram();
+// Whether a ring of `bytes` may go in memory type `type` (video memory the CPU
+// writes) by its heap's budget (host/ring_budget.h); logs and counts it as left
+// in host memory when not. `note` gets the heap's numbers for the caller's log.
+bool ring_fits_budget(std::uint32_t type, VkDeviceSize bytes, const char* what, std::string* note);
+// Counts a ring placed in video memory the CPU writes (true) or left in host
+// memory by the budget (false), for rings_placement_report.
+void note_ring_placed(bool vram, VkDeviceSize bytes);
+std::string rings_placement_report();
 std::uint32_t find_memory_type(std::uint32_t type_bits, VkMemoryPropertyFlags want);
 bool extract_program(std::uint64_t code_va, std::vector<std::uint32_t>& words, std::string& name);
 // A GX shader creator ran (render.cpp; host_gpu_note_shader_created).
@@ -690,6 +949,21 @@ bool compute_precompile_enabled();
 bool note_compute_created(const std::string& name, std::uint64_t flip);
 void precompile_compute(const std::string& name, const std::vector<std::uint8_t>& container, std::uint64_t created_flip);
 void compute_precompile_report();
+// The pipeline manifest's compute records (render.cpp): a compute pipeline a
+// dispatch had to build itself (built_here: a shader GX never created through
+// the hook, or one whose bound images differ from the creation's guess) with
+// what its key was made from, so a start builds it before the dispatch; a
+// dispatch that took one (built_here false) only counts the record's use - the
+// shaders GX creates are compiled at their creation already.
+void recipe_note_compute(const std::string& name, const std::vector<std::uint32_t>& words, std::uint64_t key, std::uint32_t rsrc1,
+                         std::uint32_t rsrc2, const std::uint32_t threads[3], const std::vector<std::pair<std::uint32_t, bool>>& dims,
+                         const std::vector<bool>& modes, bool built_here);
+// On a precompile worker: a compute record's pipeline, as precompile_compute
+// builds one from a container but with the record's images and samplers.
+// False when it failed (or another build had its key).
+bool precompile_compute_recorded(const std::string& name, const std::vector<std::uint32_t>& words, std::uint32_t rsrc1, std::uint32_t rsrc2,
+                                 const std::uint32_t threads[3], const std::vector<std::pair<std::uint32_t, bool>>& dims,
+                                 const std::vector<bool>& modes);
 // Where guest bytes [va, va + bytes) are, in imported memory: one buffer
 // holds them all (imported now when they are direct memory the GPU may reach),
 // avail bytes of it from the offset. A null buffer otherwise.
@@ -697,11 +971,38 @@ Located locate(std::uint64_t va, std::uint64_t bytes = 1);
 // The import of direct-memory chunk `chunk` holding [in, in + bytes) (offsets
 // in the chunk), made now when that lies in the chunk's GPU-visible span;
 // nullptr when it does not, or the import failed.
-const Chunk* dmem_import(std::uint32_t chunk, std::uint64_t in, std::uint64_t bytes);
+// With past_end (and window imports) the range may run on into the next
+// chunk's span by up to kChunkOverlap, as one import of this chunk's.
+const Chunk* dmem_import(std::uint32_t chunk, std::uint64_t in, std::uint64_t bytes, bool past_end = false);
+// Whether direct memory is imported whole (the default on a discrete GPU, and
+// under Linux) rather than by window on demand (BBHOST_IMPORT_WINDOWS=1,
+// gpu.import_windows in the config, or the default of an integrated GPU under
+// Windows; host/import_mode.h). Decided once - at the GPU's
+// start, or at an earlier first ask when the environment or config says, else
+// once the device is chosen - and read
+// inline after that: the command processor asks dozens of times a draw (a
+// call to a function-local static was 1.2-1.5% of bb-cp0 at 60 fps).
+extern std::atomic<signed char> g_imports_whole;  // -1 until decided, then 1 or 0
+bool imports_whole_decide();
+inline bool imports_whole() {
+    const signed char v = g_imports_whole.load(std::memory_order_relaxed);
+    return v >= 0 ? v != 0 : imports_whole_decide();
+}
 // The windows guest bytes [va, va + bytes) touch, each imported on its own if
 // it is not: for what the shaders reach through the page table, which needs
 // the pages mapped but no one buffer over them.
 void import_windows(std::uint64_t va, std::uint64_t bytes);
+// The path whose locate() or import_windows() is under way (a vertex buffer,
+// a label's write, a copy token...), for the exit report's census of what
+// still takes window imports: set for the call's length, nullptr outside one.
+extern thread_local const char* t_import_site;
+struct ImportSite {
+    const char* prev;
+    explicit ImportSite(const char* site) : prev(t_import_site) { t_import_site = site; }
+    ~ImportSite() { t_import_site = prev; }
+    ImportSite(const ImportSite&) = delete;
+    ImportSite& operator=(const ImportSite&) = delete;
+};
 // BBHOST_IMPORT_AUDIT=1 (gpu.cpp): counts the GPU side's resolutions per guest
 // mapping - kind 0 locate, 1 a device address, 2 a vertex/index mirror source.
 extern const bool g_import_audit;
@@ -713,6 +1014,87 @@ void audit_range(std::uint64_t va, std::uint64_t bytes, ImportUse use);
 // The device address of guest bytes when they lie in one imported mapping,
 // else 0 (gpu.cpp).
 VkDeviceAddress guest_device_address(std::uint64_t va, std::size_t bytes);
+// locate() without the GX buffers' device-local twins: guest memory's import.
+Located locate_guest(std::uint64_t va, std::uint64_t bytes);
+// GX buffers the GPU writes, as device resources (BBHOST_GX_TWINS=1; gpu.cpp,
+// gx twins). twin_locate_locked: [va, va + bytes) inside one - `out` the twin
+// (made and filled from guest memory at its first use), `address` its device
+// address when asked; false: guest memory serves it. twin_covers_locked: the
+// range overlaps a live twin, whose guest bytes are stale - no CPU copy of
+// them. twins_release_locked: a reader of guest memory (`why` 0 a page-table
+// walk, 1 a texture) reaches them - copied back and let go.
+// GX on Vulkan, stage 1 (host/gxvk.h, gxvk_vk.cpp): GX buffers bound by
+// handle. gxvk_resolve_locked: where a vertex record's element or an index
+// range [va, va + bytes) of the GX buffer whose holder carried `handle` at
+// the call lies in that buffer's device-local copy (placed and filled in this
+// recording's uploads at its first binding) - gxvk::kFalls with `out` the
+// copy's range, else why not (gxvk::Fallback). A vertex record may count on
+// past its buffer's end (its V# counts from the buffer's start, its base an
+// offset into it): it is bound all the same, out.avail what the copy holds
+// from va - the draw reads only its vertices, inside the buffer (the compare
+// mode checks that). gxvk_count_locked counts a
+// binding's outcome (kFalls: by handle). gxvk_buffers_bind_mode: whether
+// draws bind the copies (BBHOST_GXVK_BUFFERS=1) rather than only check them
+// beside today's path (2): gxvk_disagree_locked counts what such a check
+// found, and retires the entry.
+bool gxvk_buffers_bind_mode();
+int gxvk_resolve_locked(int use, std::uint32_t handle, std::uint64_t holder, std::uint64_t va, std::uint64_t bytes, Located& out);
+// Whether the last resolve bound a buffer after its end (its holder released,
+// its memory unmapped or reused): the copy holds what the draw recorded
+// before the end reads, and guest memory may not any more.
+bool gxvk_last_resolve_ended();
+void gxvk_count_locked(int use, int result);
+enum GxvkDisagree : int {
+    gxvk_kCopyVersion,   // today's path finds a copy version over the bytes
+    gxvk_kWindow,        // ... the bytes in one of the draw's CPU-written windows
+    gxvk_kSnapshot,      // ... the bytes on a page the game rewrites (a snapshot)
+    gxvk_kLayout,        // the vertex input planned from the handles is not today's
+    gxvk_kGuestChanged,  // the buffer's bytes no longer hash as they did when copied
+    gxvk_kDeviceCopy,    // the device copy, read back, is not those bytes
+    gxvk_kPastEnd,       // a draw reads a record past its buffer's end (its V# counted from the buffer's start)
+    gxvk_kDisagrees,
+};
+void gxvk_disagree_locked(int kind, std::uint32_t handle);
+// At a recording's start: retired entries taken back (their ranges free once
+// the work recorded with them has run). At a slot's retirement: the compare
+// run's read-backs of the copies its uploads made, checked.
+void gxvk_begin_recording_locked();
+void gxvk_slot_retired_locked(int slot);
+std::string gxvk_report();
+bool twins_on();
+bool import_census_on();  // BBHOST_IMPORT_CENSUS=1: the exit report's census of guest memory in place
+// BBHOST_GX_TWINS: 0 off, 1 the buffers shaders write, 2 also those GPU copies
+// write; 3 the GPU particles' buffers alone (BBHOST_PARTICLE_TWINS: on a
+// discrete GPU unless set); -1 until the device is chosen.
+int twins_level();
+// The device is chosen: level 3 on a discrete GPU (or BBHOST_PARTICLE_TWINS=1),
+// else 0 - unless BBHOST_GX_TWINS set it.
+void twins_decide(bool discrete);
+// Level 3: a dispatch that counts in GDS binds [va...]: the candidate holding
+// va is armed when the next recording begins (twins_arm_wanted_locked, from
+// begin_recording_locked), its twin made at that recording's first use.
+void twins_want_locked(std::uint64_t va);
+void twins_arm_wanted_locked();
+bool twin_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& out, VkDeviceAddress* address = nullptr);
+bool twin_covers_locked(std::uint64_t va, std::uint64_t bytes);
+bool twin_candidate_holds(std::uint64_t va, std::uint64_t bytes);  // a twin holds it, or will at its first binding
+bool twin_holds_live_locked(std::uint64_t va, std::uint64_t bytes);  // inside a live twin: its stores leave guest memory as it was
+bool twin_candidate_straddles(std::uint64_t va, std::uint64_t bytes);  // runs across a candidate's edge
+void twin_note_import_near_locked(std::uint64_t va, std::uint64_t bytes, const char* site);  // logs a few imports over a candidate's kind
+// A GPU copy (a copy token, a copy version) about to write [dst, dst + bytes):
+// with BBHOST_GX_TWINS=2 the GX buffer it lies in becomes a candidate.
+void twin_note_copy_target_locked(std::uint64_t dst, std::uint64_t bytes);
+void twins_release_locked(std::uint64_t va, std::uint64_t bytes, int why);
+// [va, va + bytes) is read by the CPU (an occlusion block): twins over it are
+// copied back and let go, and candidates over it let go before they are made.
+void twins_keep_in_guest_locked(std::uint64_t va, std::uint64_t bytes);
+void twins_buffer_made(std::uint64_t memory, std::uint64_t bytes, std::uint8_t usage, std::uint8_t bind, std::uint64_t gen);
+void twins_buffer_mapped_own(std::uint64_t memory, std::uint64_t gen);
+void twins_buffer_gone(std::uint64_t memory, std::uint64_t gen);
+std::string twins_report();
+// The buffer shadow's command buffer for this recording's uploads, run before
+// the recording's own work (buffer_shadow.cpp upload_cmd_locked).
+VkCommandBuffer shadow_upload_cmd_locked();
 // A PS4 tiled texture level untiled on the GPU into linear elements
 // (gpu_untile.cpp, shaders/untile.comp), recorded into the current command
 // buffer outside a render pass. `mode` 0 linear, 1 1D tiled thin, 2 2D tiled
@@ -746,12 +1128,68 @@ std::string untile_gpu_report();
 // recording); `loc` keeps the import otherwise. A write over a range makes the
 // next read copy it again, or - written by the GPU - bind it from the import.
 bool buffer_shadow_on();  // BBHOST_BUFFER_SHADOW, else on except on an integrated GPU or with tight memory
+// Whether the shadow reads told pages in place (BBHOST_SHADOW_IN_PLACE and,
+// with window imports, BBHOST_SHADOW_IN_PLACE_WINDOWS): only once the device
+// is made, which it is decided by.
+bool shadow_in_place_on();
 void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc);
+// Why the last shadow_locate_locked on this thread left its range where it
+// was, or that a mirror serves it (BBHOST_VB_RACE's census and lines).
+enum : std::uint8_t {
+    kLocNotAsked = 0,  // the shadow off, or not asked
+    kLocTwin,          // a GX buffer's device-local twin holds it
+    kLocNoMirror,      // in no chunk with a mirror
+    kLocInPlace,       // read in place on purpose: told pages (BBHOST_SHADOW_IN_PLACE)
+    kLocCrossing,      // across two mirror windows
+    kLocServed,        // a mirror serves it
+    kLocHost,          // a page in host memory for good, or one the GPU writes in this recording
+    kLocRoom,          // no room in the mirrors' share for now
+    kLocWindow,        // its mirror window is not made
+    kLocNoImport,      // no import to copy it from (whole imports)
+    kLocGpuPending,    // a GPU write still to land on a page to copy (window imports)
+    kLocNoCopy,        // no upload commands or staging for the copy
+    kLocWhys
+};
+std::uint8_t shadow_locate_why();
+// GX's hand-outs over [va]: bit k when a hand-out of kind k was ever over
+// its 4 KiB page - 0 Maps' renamed copies, 1 the upload pool's blocks, 2 ring
+// allocations, 3 YEBIS's renames (1-3 with BBHOST_RESOURCE_CENSUS=1) - and
+// bit 4 while a renamed copy over its 64 KiB page is outstanding.
+unsigned shadow_hand_kinds_locked(std::uint64_t va);
+// The same without a host location first: true, `out` the mirror, when the
+// mirrors serve [va, va+bytes) whole (copying what they must); false when it
+// is read from host memory (an import). Window imports bind meshes this way,
+// so their memory needs no import (its copies come through staging).
+bool shadow_mirror_locked(std::uint64_t va, std::uint64_t bytes, Located& out);
 // A copy of [va, va+bytes) - `loc`, its import, which the mirrors keep in host
 // memory - made for one draw in device memory, in the same uploads; `loc`
 // becomes the copy. False, `loc` unchanged, for a range past 1 MiB, one the
 // GPU writes earlier in this recording, or no room left in the staging chunks.
 bool shadow_stage_locked(std::uint64_t va, std::uint64_t bytes, Located& loc);
+// The bytes [va, va+bytes) of a page the game keeps rewriting, copied on the
+// CPU as the draw records into a ring the GPU reads; `loc` becomes the copy.
+// False, `loc` unchanged, for a range on no dynamic page, past 1 MiB, or one a
+// GPU write is still to land on (BBHOST_VERTEX_SNAPSHOT).
+bool shadow_snapshot_locked(std::uint64_t va, std::uint64_t bytes, Located& loc);
+// Whether shadow_snapshot_locked may copy any of [va, va+bytes) - a page of it
+// the game rewrites, or a range this cannot tell cheaply - before the caller
+// works out how much of it a draw reads.
+bool shadow_snapshot_maybe_locked(std::uint64_t va, std::uint64_t bytes);
+// A vertex record's or an index range's bytes in no guest-memory import (its
+// import failed, or none holds it whole): `out` a copy of them - the mirrors'
+// pages copied through staging, else the `read_bytes` the draw reads copied as
+// it records into the snapshot ring - so a failed import costs speed, not the
+// picture (host/import_fallback.h; BBHOST_IMPORT_COPY=0 leaves such a range).
+// Returns the import_fallback::Choice made; import_fallback::served says
+// whether `out` holds the range. And its counts, for the imports' exit line.
+int shadow_import_fallback_locked(std::uint64_t va, std::uint64_t bytes, std::uint64_t read_bytes, Located& out);
+std::string shadow_import_fallback_report();
+// What the pages of [va, va+bytes) are to the buffer shadow now, the least
+// placeable page deciding (BBHOST_VB_RACE=2's census): read in place, told
+// and never handed out (what in place reads; mirrored), under renamed copies
+// GX hands out, write-watched, rewritten (host memory for good), not tracked.
+enum : int { kPlaceNone = 0, kPlacePlaced, kPlaceTold, kPlaceHanded, kPlaceWatched, kPlaceDynamic, kPlaceUntracked, kPlaceClasses };
+int shadow_place_class_locked(std::uint64_t va, std::uint64_t bytes);
 void shadow_written_locked(std::uint64_t va, std::uint64_t bytes, bool by_gpu);
 // BBHOST_INDIRECT_STATS=1: an indirect dispatch (kind 0) or draw (1, 2
 // indexed) recorded now, whose arguments are read once its submission is
@@ -794,12 +1232,35 @@ void shadow_flush_at_load_locked(Gpu::Slot& slot);
 // Whether a loading screen is up (host_gpu_set_loading).
 bool loading_screen_now();
 std::string shadow_report();
+// What the mirrors hold, for the video memory report: whole mirrors (a guest
+// chunk each, where there is no sparse binding) and sparse 64 MiB blocks, and
+// how much of either holds a page copy; the share (cap, 0 with the live
+// share, which follows the budget), and whether they were given back.
+struct ShadowCensus {
+    bool live = false, sparse = false, given_back = false;
+    std::uint64_t cap = 0;
+    std::uint64_t whole_bytes = 0, block_bytes = 0, data_bytes = 0;
+    std::uint32_t whole = 0, blocks = 0;
+    std::uint32_t windows = 0;  // 64 MiB windows of the chunks that hold a page copy or a bound page
+};
+void shadow_vram_census_locked(ShadowCensus& c);
+// Draws the mirrors' live share refused room so far (refused copies and the
+// draws read from host memory while refused): a sign that video memory the
+// image heap's blocks hold idle would be better used by the mirrors.
+std::uint64_t shadow_room_refusals_locked();
 std::uint64_t fnv1a(const void* data, std::size_t n, std::uint64_t h = 1469598103934665603ull);
 void bind_dummy_images(VkDescriptorSet set, const gcn::TranslateResult& meta, std::vector<VkWriteDescriptorSet>& writes,
                        std::vector<VkDescriptorImageInfo>& infos, VkDescriptorImageInfo& smp_info);
 // A 1x1 view matching a binding's (spv::Dim, arrayed), for when the T# gives
 // nothing usable. Never null for a dimension the translator can emit.
 VkImageView dummy_view_for(std::uint32_t dim, bool arrayed, bool zero = false);
+// BBHOST_COMPARE_GUARD (on unless 0): a depth-compare binding that resolves to a
+// colour view whose format the device cannot compare in (VkFormatProperties3's
+// SAMPLED_IMAGE_DEPTH_COMPARISON, which lavapipe's R32F lacks) samples
+// a far-plane depth dummy of its shape instead; `view` where the device compares
+// in its format, has no such dummy, or the guard is off. tsharp: the binding's T#.
+VkImageView compare_guard_view(VkImageView view, const std::uint32_t* tsharp, std::uint32_t dim, bool arrayed);
+extern std::atomic<std::uint64_t> g_compare_guarded;
 
 // Guest memory as the translated shaders reach it (draw capture): the host
 // bytes and guest address behind a storage-buffer binding over imported
@@ -817,6 +1278,9 @@ struct GfxFixedState {
     VkCullModeFlags cull_mode = 0;
     VkFrontFace front_face = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     bool depth_clamp = false;
+    // PA_CL_CLIP_CNTL's DX_RASTERIZATION_KILL (host/clip_control.h): the pipeline
+    // takes rasterizer discard as a dynamic state and the draw sets it.
+    bool rasterizer_discard = false;
     bool depth_test = false, depth_write = false, depth_bounds_test = false, stencil_test = false;
     VkCompareOp depth_compare = VK_COMPARE_OP_NEVER;
     VkStencilOpState front{}, back{};
@@ -885,10 +1349,30 @@ struct RtImage {
     std::uint64_t fill_va = 0;
     std::uint64_t pending_seen = 0;  // g_pending_gen when apply_pending_clear last scanned for it (render.cpp)
     std::size_t fill_bytes = 0;
+    // A clear token's clear not made yet (render.cpp, BBHOST_GX_CLEAR_LAZY):
+    // the next pass that binds the image whole takes it as its load op;
+    // anything else that ends a pass (a copy, a dispatch, a readback, a draw
+    // that samples it, the submission) makes it first.
+    bool view_clear = false;
+    bool view_clear_load = false;  // taken by the pass the current draw begins
+    VkImageAspectFlags view_clear_aspects = 0;
+    VkClearValue view_clear_value{};
+    std::uint32_t view_clear_first = 0, view_clear_count = 0;
     // The flip it was made at, and the flip and the time (steady clock, ms) a
     // draw, a fill or a copy last wrote it: its age and order for the reuse
-    // retire (image_reuse_sweep_locked).
-    std::uint64_t created_flip = 0, written_flip = 0, written_ms = 0;
+    // retire (image_reuse_sweep_locked). last_write numbers the writes (one
+    // counter for every target): what the clear costs compare to tell whether
+    // a draw came between two clears.
+    std::uint64_t created_flip = 0, written_flip = 0, written_ms = 0, last_write = 0;
+    // The submission (hle_gnm_cp_job_seq) that last wrote it, and the
+    // generation of the GX resource it is the image of (0: none known) - it
+    // goes when that resource does (render_retire_generation_locked).
+    std::uint64_t written_seq = 0, gx_gen = 0;
+    // Its resource died (steady ms; 0: alive) with this many submissions
+    // made, and that resource's memory: retired once idle for the reuse idle
+    // time, or taken by the memory's next resource if one draws into it first
+    // or is made over it without data (render_retire_reused_locked).
+    std::uint64_t dead_ms = 0, dead_after = 0, dead_memory = 0;
     // How its image was made, to make it again elsewhere (a target that went
     // to host memory for want of video memory comes back: render_return_targets_locked).
     VkImageCreateFlags create_flags = 0;
@@ -896,6 +1380,28 @@ struct RtImage {
 };
 // The bytes a target covers in guest memory (render.cpp).
 std::size_t rt_size_bytes(const RtImage& r);
+// Lazy clears (render.cpp): a clear token's clear owed to `r` made now, by
+// transfer, before something reads or writes the image; every owed clear
+// (a dispatch, the submission, a frame dump). `why` is what made it, for the
+// exit report.
+enum ViewClearWhy : int {
+    kVcwAttachment,  // a draw binds the image, its pass does not cover it whole
+    kVcwSampled,     // a draw's vertex or pixel stage samples it
+    kVcwTess,        // a tessellated draw (its other stages sample too)
+    kVcwOlder,       // a newer clear of the image does not cover the owed one
+    kVcwClear,       // another clear of the image (the fill path's, DB_RENDER_CONTROL)
+    kVcwCopy,        // a copy reads or writes it
+    kVcwTexture,     // a texture view of it is made (render_target_view, rt_copied_view)
+    kVcwReadback,    // read back to memory
+    kVcwReplaced,    // its image is replaced by another
+    kVcwDispatch,    // a compute dispatch
+    kVcwSubmit,      // the submission
+    kVcwDump,        // a frame dump or capture
+    kVcwOther,
+    kVcwCount
+};
+void view_clear_apply_locked(RtImage& r, int why = kVcwOther);
+void view_clears_flush_locked(int why = kVcwOther);
 // Images over memory the game has given to something newer. On the console a
 // render target, a copy's snapshot or a shader-written texture is only memory:
 // when the game frees it and makes a newer object there, the old contents are
@@ -912,13 +1418,18 @@ std::size_t rt_size_bytes(const RtImage& r);
 void image_reuse_sweep_locked();
 struct ReuseRetired {
     std::uint64_t n = 0, bytes = 0;
+    std::uint64_t dead_n = 0;  // targets and snapshots of a dead GX resource retired once idle (counted apart from n)
 };
 // Each scan goes on from where the last one stopped and stops at `deadline`,
 // so a sweep holds g.mu for a bounded time however many images there are.
+// `address_rule`: whether the rule by a newer object over an idle image's
+// memory applies (BBHOST_IMG_RETIRE_REUSED); the images of dead GX resources
+// (marked by render_retire_generation_locked / retire_surfaces_locked) go once
+// idle either way, unless the memory's next resource wrote them first.
 ReuseRetired render_retire_reused_locked(std::uint64_t now_ms, std::uint64_t idle_ms,
-                                         std::chrono::steady_clock::time_point deadline);  // render.cpp: targets and snapshots
+                                         std::chrono::steady_clock::time_point deadline, bool address_rule);  // render.cpp: targets and snapshots
 ReuseRetired textures_retire_reused_locked(std::uint64_t now_ms, std::uint64_t idle_ms,
-                                           std::chrono::steady_clock::time_point deadline);  // textures.cpp: shader-written surfaces
+                                           std::chrono::steady_clock::time_point deadline, bool address_rule);  // textures.cpp: shader-written surfaces
 // Whether a target or snapshot made after `after_flip` (other than `self`)
 // covers part of [va, va + bytes).
 bool render_target_newer_overlapping_locked(std::uint64_t va, std::size_t bytes, std::uint64_t after_flip, const RtImage* self);
@@ -926,7 +1437,15 @@ bool render_target_newer_overlapping_locked(std::uint64_t va, std::size_t bytes,
 void textures_drop_rt_regions_locked(std::uint64_t base);
 // The reuse retire's line for the 5-second report.
 std::string image_reuse_report_locked();
+// The draws' and clears' target lookups by their views' resource generations (render.cpp rt_take_generation).
+std::string draw_gen_report_locked();
 RtImage* find_render_target(std::uint64_t base);
+// BBHOST_LAYOUT_FIXES (on unless 0; textures.cpp): a target's every layer and
+// level leaves UNDEFINED before it is used as GENERAL - a copy into a target
+// nothing has made GENERAL yet, a target carried from a texture - which
+// g_layout_fixed[0] counts the first kind of.
+bool render_layout_fixes();
+extern std::atomic<std::uint64_t> g_layout_fixed[4];
 // The view formats a colour target of `format` is created for (at most 5, the
 // format first): its channel layout's other numeric kinds, which keep RADV's
 // delta colour compression (render.cpp).
@@ -963,15 +1482,46 @@ extern std::uint32_t g_draw_dummies;
 // neighbours' a few flips after they were recorded.
 constexpr std::size_t kDrawRecs = 16384;
 extern DrawRec g_draw_recs[kDrawRecs];
+// BBHOST_VB_RACE=1 (render.cpp): each non-indexed draw's vertex range hashed
+// when recorded and again when its submission retires - memory rewritten while
+// the draw waited for the GPU. =2: the ranges the buffer shadow's mirrors
+// serve too (`mirrored`), hashed at their ends - what reading them in place
+// would have raced - counted by page class (shadow_place_class_locked). =3:
+// those the mirrors serve with window imports too (shadow_mirror_locked), and
+// mirrored indices. Ranges read in place are counted by why the mirrors left
+// them there (`why`, shadow_locate_why); `holder` is the GX buffer the draw
+// bound them by, for the lines. BBHOST_VB_RACE_LOG=all: a line for every
+// change, not only the first ones. Caller holds the lock.
+bool vb_race_on();
+bool vb_race_mirrored_on();
+void vb_race_note_locked(const char* name, std::uint64_t va, std::uint64_t bytes, bool mirrored = false, std::uint8_t why = 0,
+                         std::uint64_t holder = 0);
+void vb_race_retired_locked(std::uint64_t serial);
+void vb_race_exit_report_locked();  // the counts at exit, by page class too (a short run's only line)
+// buffer_shadow.cpp: GPU writes by page (every shadow_written_locked by the
+// GPU, the shadow on or off), and whether one over [va, va+bytes) is still to
+// land - recorded in a submission that has not retired. Caller holds the lock.
+void gpu_writes_note_locked(std::uint64_t va, std::uint64_t bytes);
+bool gpu_writes_pending_locked(std::uint64_t va, std::uint64_t bytes);
+// Whether a GPU write over [va, va+bytes) was recorded in recording `serial` or later.
+bool gpu_wrote_since_locked(std::uint64_t va, std::uint64_t bytes, std::uint64_t serial);
+// The newest recording whose GPU writes the tables above have let go of
+// (they keep only writes still to land when they fill): gpu_wrote_since_locked
+// cannot answer for a serial at or before it.
+std::uint64_t gpu_writes_dropped_locked();
+// g.completed_submits as last stored, for readers without the lock (gpu.cpp).
+extern std::atomic<std::uint64_t> g_completed_submits_seen;
 extern std::uint64_t g_draw_rec_next;
 
 // A compute shader's pipeline at its first use, with or without the driver's
 // optimizer as BBHOST_CS_OPTIMIZE says (gpu.cpp). `standin`: it is the
 // unoptimized one, and the optimized one is being built on a bb-cs-optimize
 // thread under `opt_key`; adopt_optimized_compute swaps it in. `watch`: the
-// name the watchdog lists it under while it compiles.
+// name the watchdog lists it under while it compiles. `layout`: null for
+// Gpu::pipe_layout.
 VkPipeline first_compute_pipeline(VkShaderModule module, std::uint64_t opt_key, const std::string& name,
-                                  const std::vector<std::uint32_t>& spirv, bool& standin, const std::string& watch);
+                                  const std::vector<std::uint32_t>& spirv, bool& standin, const std::string& watch,
+                                  VkPipelineLayout layout = VK_NULL_HANDLE);
 // A stand-in's optimized pipeline, when it is built: true when `pipeline` now
 // is it (and `standin` false). Cheap when nothing new was built since `seen`.
 bool adopt_optimized_compute(std::uint64_t opt_key, VkPipeline& pipeline, bool& standin, std::uint64_t& seen);
@@ -994,6 +1544,7 @@ void compute_compiling_report();
 void busy_init_locked();                           // after the slots exist: the query pools, or off
 void busy_begin_locked(Gpu::Slot& sl);             // a recording's first command
 void busy_end_locked(Gpu::Slot& sl);               // its last, before vkEndCommandBuffer
+void busy_upload_begin_locked(Gpu::Slot& sl, VkCommandBuffer cmd);  // the uploads ahead of it: their start
 void busy_submitted_locked(Gpu::Slot& sl);         // it is on its way to the queue
 void busy_retired_locked(Gpu::Slot& sl, bool ok);  // its fence signalled (ok), or it never will
 std::string busy_exit_report();                    // the whole run's line, for host_gpu_report
@@ -1121,6 +1672,11 @@ std::string texture_view_by_id_report();
 // larger than the caches; a draw asks for its views' entries together).
 void texture_view_by_id_prefetch(std::uint32_t id);
 VkSampler sampler_for(const std::uint32_t* ssharp, bool compare);
+// BBHOST_SAMPLER_FIXES (on unless 0; textures.cpp): a sampler's state within
+// what the device allows - MIRROR_CLAMP_TO_EDGE with its feature (else
+// MIRRORED_REPEAT), maxLod at or above minLod, the LOD bias within
+// maxSamplerLodBias.
+bool sampler_fixes_on();
 // spv::Dim of a T# type as the translator is told it: DimCube for a cube, which
 // the translator then declares, and texture_view binds, as a 2D array of faces.
 std::uint32_t tsharp_dim(std::uint32_t type, bool& arrayed);
@@ -1130,6 +1686,64 @@ std::uint32_t tsharp_dim(std::uint32_t type, bool& arrayed);
 std::uint32_t tsharp_kind(const std::uint32_t* w);
 std::size_t format_bytes_per_pixel(VkFormat format);
 void textures_report();
+// What is resolving textures on this thread (a draw token's kind, "dispatch",
+// "upload token", ...), for the census of surfaces no GX resource covers;
+// set for a scope by ResolveKind (textures.cpp defines it).
+extern thread_local const char* t_resolve_kind;
+// The host image of one GX resource (engine/gx_resources.h: its memory and
+// generation), a render target's, a copy's snapshot's or a texture surface's:
+// what a copy between resources can copy image to image. False when the host
+// has none of that generation there (a surface of another generation, or none).
+struct HostImageRef {
+    VkImage image = VK_NULL_HANDLE;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    std::uint32_t width = 0, height = 0, layers = 1, levels = 1;
+    bool target = false;         // a render target or snapshot (RtImage), else a texture surface
+    bool depth = false;          // a depth target
+    bool gpu_written = false;    // its image holds what the guest memory does not
+};
+bool host_image_by_resource_locked(std::uint64_t memory, std::uint64_t gen, HostImageRef* out);
+// A GX texture copied whole as memory whose source surface a shader or copy
+// wrote: copied image to image into the destination resource's target or
+// surface (textures.cpp). 1 copied, 0 not that case (counted by reason).
+int textures_copy_resource_locked(std::uint64_t src, std::uint64_t src_gen, std::uint64_t dst, std::uint64_t dst_gen);
+std::string textures_resource_copy_report();
+// BBHOST_COPY_BY_RESOURCE (on unless 0, and with BBHOST_RES_IDENTITY): copies
+// and texture binds take a target by its resource's generation (gpu.cpp).
+bool copy_by_resource_on();
+// Images belong to their GX resource's generation (BBHOST_RES_IDENTITY, on
+// unless 0): retired with it, never handed to a later resource at the same
+// memory (textures.cpp).
+bool res_identity_on();
+// The colour and depth targets and the snapshots in [base, base + bytes)
+// that are generation `gen`'s images: marked dead, and retired by the reuse
+// sweep once idle (render.cpp).
+// A target something wrote in a submission made after `after_submitted` (the
+// count when the resource died) has a newer owner: it stays, and takes the
+// generation of the resource that now holds its memory.
+void render_retire_generation_locked(std::uint64_t base, std::size_t bytes, std::uint64_t gen, std::uint64_t after_submitted);
+struct ResolveKind {
+    const char* prev;
+    explicit ResolveKind(const char* kind) : prev(t_resolve_kind) { t_resolve_kind = kind; }
+    ~ResolveKind() { t_resolve_kind = prev; }
+    ResolveKind(const ResolveKind&) = delete;
+    ResolveKind& operator=(const ResolveKind&) = delete;
+};
+// The 5-second report's resource line(s): the write watch's faults, arms and
+// releases by owner, the hashes, the surfaces by registration and the census
+// of new ones; with BBHOST_RESOURCE_CENSUS=1 also the images whose memory no
+// live GX resource holds (textures.cpp, render.cpp). Under g.mu.
+std::string textures_census_window_locked();
+struct OrphanImages {
+    std::uint64_t n = 0, bytes = 0;            // no live GX resource over any of its memory
+    std::uint64_t partial = 0, partial_bytes = 0;  // one over part of it, none over all
+    std::uint64_t gone = 0, gone_bytes = 0;    // the image of a GX resource (generation) that is no longer live
+    std::uint64_t yebis = 0, yebis_bytes = 0;  // of `n`, on memory YEBIS's own device made (BBHOST_RESOURCE_CENSUS)
+    std::uint64_t scaleform = 0, scaleform_bytes = 0;  // of `n`, on a Scaleform texture's (the same)
+};
+// Colour and depth targets [0], snapshots [1] whose memory no live GX
+// resource covers (render.cpp).
+void render_orphans_locked(OrphanImages out[2]);
 // Drops the descriptor-keyed view memo in textures.cpp: call it wherever an
 // image view, a surface or a render target is created or destroyed, so a
 // remembered descriptor cannot resolve to a view that is gone or stale.
@@ -1156,7 +1770,12 @@ bool tsharp_sample_as_2d(std::uint32_t type, std::uint32_t base_array, std::uint
 // from guest memory at their next use (the periodic content hash is too slow
 // for a texture the game rewrites every frame). Caller holds the GPU lock.
 // Returns how many cached surfaces the range overlaps.
-int mark_surfaces_dirty_locked(std::uint64_t va, std::size_t bytes);
+// `memory_written`: false for a fill, which reaches images (a target, HTILE,
+// the textures it clears) and never the guest memory, and for a copy made
+// image to image: the surfaces under it are not marked, so nothing hashes
+// their memory for a change that is not there.
+// `source` names the writer for the census of what marks GX textures.
+int mark_surfaces_dirty_locked(std::uint64_t va, std::size_t bytes, bool memory_written = true, const char* source = "other");
 // Whether a cached surface overlaps the range. Caller holds the GPU lock.
 bool surfaces_may_cover_locked(std::uint64_t va, std::size_t bytes);
 // GX's dynamic-buffer copy-backs as copy versions (gpu.cpp): the bytes
@@ -1172,8 +1791,15 @@ void copy_versions_pass_end_locked();
 // The copies into place now, the pass ended for them if one is open: a
 // binding across a version's edge, a page-table read over one, a pipeline
 // that walks the page table.
-enum { kCvStraddle, kCvPageTable, kCvWalks, kCvPutReasons };
+enum { kCvStraddle, kCvPageTable, kCvWalks, kCvRetired, kCvPutTwin, kCvPutReasons };
 void copy_versions_put_in_place_locked(int why);
+// Whether a pending version's copy into place writes `buffer` (a window import
+// about to retire: its copies go into place first).
+bool copy_versions_name_buffer_locked(VkBuffer buffer);
+// The same for [lo, hi) of `buffer` (a GX twin's slice about to be let go).
+bool copy_versions_into_locked(VkBuffer buffer, VkDeviceSize lo, VkDeviceSize hi);
+// Whether a pending version's destination overlaps guest [lo, hi).
+bool copy_versions_overlap_locked(std::uint64_t lo, std::uint64_t hi);
 // A binding of [base, base + bytes) against the pending versions:
 // kCopyVersionInside (`out` is the copy to bind), kCopyVersionStraddles (it
 // covers part of one: put them in place first), or kCopyVersionNone.
@@ -1200,9 +1826,16 @@ extern std::atomic<std::uint64_t> g_fill_surfaces, g_fill_surfaces_skipped;
 void invalidate_rt_views(std::uint64_t base);
 // Marks where the GPU is: on a device loss the driver reports the last
 // checkpoint each queue stage reached, which names the draw that faulted.
-// kind 1 = draw, 2 = dispatch. AMD's markers go through the stream (an op,
-// or a draw's packet: DrawCmds::marker), NVIDIA's checkpoints in place.
+// kind 1 = draw, 2 = dispatch, kGpuMarkSubmission = a submission's edges:
+// index = serial * 4 + 0 its buffer-shadow uploads (they run after the wait
+// for their sparse binds), 1 its recording's start, 2 its recording's end -
+// so a loss between one frame's last draw and the next one's first says
+// whether the GPU was in a submission's tail, its wait or its uploads.
+// AMD's markers go through the stream (an op, or a draw's packet:
+// DrawCmds::marker), NVIDIA's checkpoints in place.
+constexpr unsigned kGpuMarkSubmission = 3;
 void gpu_checkpoint(unsigned kind, std::uint64_t index);
+void gpu_checkpoint_cmd(VkCommandBuffer cmd, unsigned kind, std::uint64_t index);
 // AMD's buffer markers: the 32-bit value for a kind and index, and the two
 // writes (the top of the pipe, then the bottom) into g.marker_buf.
 std::uint32_t gpu_marker_value(unsigned kind, std::uint64_t index);
@@ -1286,7 +1919,7 @@ std::size_t texture_src_bytes_locked(std::uint64_t base);
 void textures_before_submit();                      // the uploads this submission copies are untiled (their prep pool jobs done)
 void textures_prewait_for_submit();                 // without g.mu: the same wait for the jobs queued so far, so the one under it is short
 // Creation-time upload and destruction (see gpu.h's entry points).
-bool textures_create_ahead_locked(const std::uint32_t* tsharp);
+bool textures_create_ahead_locked(const std::uint32_t* tsharp, std::uint64_t gen = 0);
 bool textures_upload_region_locked(std::uint64_t base, const std::uint32_t* tsharp, std::uint32_t mip, std::uint32_t layer, std::uint32_t x,
                                    std::uint32_t y, std::uint32_t w, std::uint32_t h, const void* data, std::size_t bytes, std::uint32_t row_bytes);
 bool textures_copy_image_region_locked(const GpuImageCopy& c);
@@ -1295,7 +1928,14 @@ bool textures_copy_image_region_locked(const GpuImageCopy& c);
 // (rt_image). False when there is no such texture.
 bool textures_carry_into_target_locked(std::uint64_t base, std::uint32_t width, std::uint32_t height, std::size_t bytes_per_pixel,
                                        VkImage target);
-void textures_retire(std::uint64_t base, std::size_t bytes, std::uint64_t after_submitted);
+void textures_retire(std::uint64_t base, std::size_t bytes, std::uint64_t after_submitted, std::uint64_t gen = 0);
+// The generation of the live GX texture that takes a dead resource's image
+// (0: none, and the image goes): one made without data at the dead
+// resource's memory, or one covering the image [image_base, +image_bytes)
+// whole - the image the address rule kept. A texture made with data has
+// texels of its own (made ahead, or at its first bind).
+std::uint64_t gx_successor_gen(std::uint64_t dead_memory, std::uint64_t image_base, std::size_t image_bytes);
+void textures_gx_written(std::uint64_t base, std::size_t bytes);  // a texture GX mapped (host_gpu_texture_written)
 void textures_submitted(int slot);                  // the recorded write-backs belong to this submission
 void textures_retired(int slot);                    // that submission completed: copy them to guest memory
 
@@ -1327,6 +1967,13 @@ std::string render_fill_stats();  // " fill-pending=N fill-applied=M"
 // Command-processor pipeline builds so far: [0] translate us, [1] modules us, [2] vkCreateGraphicsPipelines us,
 // [3] stage translations, [4] stages the cache served (with BBHOST_STAGE_CACHE=0: translations whose key was seen before).
 void render_pipeline_time_us(std::uint64_t out[5]);
+// host_gpu_pipeline_work's graphics part, [0..11].
+void render_pipeline_work(std::uint64_t out[12]);
+// Compute pipelines a dispatch built on the command processor so far: [0] microseconds, [1] count.
+void compute_pipeline_work(std::uint64_t out[2]);
+// A compute pipeline the command processor built for a draw (the host
+// tessellator's LS pass), for the same count.
+void note_cp_compute_build(std::uint64_t us);
 // A shader copies a render target's memory elsewhere: copy the image into a snapshot at dst
 // (or into the target there of its shape); a copy one smaller destination long gets the
 // source's top-left overlap (copy_overlap_locked). `via` names the copy in the log ("copy
@@ -1379,6 +2026,20 @@ struct StreamTestCounts {
 };
 StreamTestCounts stream_test_counts();
 extern std::atomic<std::uint64_t> g_validation_messages;  // gpu.cpp: what BBHOST_VK_VALIDATE=1's layer reported
+// BBHOST_VK_VALIDATE=1's census (gpu.cpp): an object named for the layer's
+// messages - a draw's pipeline by its programs - and, for the messages that
+// name none (a pipeline's creation), what the thread is building while a
+// ValidationScope lives. Both cost a branch with the layer off.
+bool validation_on();
+void vk_debug_name(VkObjectType type, std::uint64_t handle, const char* name);
+extern thread_local const char* t_validation_scope;
+struct ValidationScope {
+    const char* prev;
+    explicit ValidationScope(const char* what) : prev(t_validation_scope) { t_validation_scope = what; }
+    ~ValidationScope() { t_validation_scope = prev; }
+    ValidationScope(const ValidationScope&) = delete;
+    ValidationScope& operator=(const ValidationScope&) = delete;
+};
 
 // Flushes this core's write-combining buffers. AMD's Windows driver records
 // into write-combined memory, and a release store does not order those
@@ -1430,6 +2091,10 @@ public:
     void bind_sets(VkPipelineBindPoint bind_point, VkPipelineLayout layout, std::uint32_t first, std::uint32_t n, const VkDescriptorSet* sets,
                    std::uint32_t ndynamic = 0, const std::uint32_t* dynamic = nullptr);
     void push_constants(VkPipelineLayout layout, VkShaderStageFlags stages, std::uint32_t offset, std::uint32_t size, const void* data);
+    // vkCmdPushDescriptorSetKHR of n storage buffers into set `set` (a
+    // dispatch's, ComputeLean).
+    void push_buffers(VkPipelineBindPoint bind_point, VkPipelineLayout layout, std::uint32_t set, std::uint32_t n, const std::uint32_t* bindings,
+                      const VkDescriptorBufferInfo* infos);
     // vkUpdateDescriptorSets at this point of the stream (a set the op
     // stream's earlier commands may still bind in this command buffer).
     void update_sets(std::uint32_t n, const VkWriteDescriptorSet* writes);
@@ -1499,7 +2164,9 @@ public:
     // caller's `writes` and `images` hold nothing it wrote.
     void take_sets(std::vector<VkWriteDescriptorSet>& writes, std::vector<VkDescriptorImageInfo>& images,
                    const std::vector<VkDescriptorBufferInfo>& buffers, const VkDescriptorBufferInfo* extra, std::size_t n_extra);
-    void bind_pipeline(VkPipeline pipeline);
+    // `discard`: the pipeline takes rasterizer discard as a dynamic state, set
+    // on after it is bound (a draw PA_CL_CLIP_CNTL's DX_RASTERIZATION_KILL kills).
+    void bind_pipeline(VkPipeline pipeline, bool discard = false);
     void library_state(const DrawLibraryState& s, bool has_depth_bounds);
     // `dynamic`: the params blocks' offsets (set_cache_on()), else null.
     // `bindless`: the pipeline's stages read the global set, bound as set 3.
@@ -1556,6 +2223,11 @@ DrawCmds* draw_packet_early_locked();
 // The barrier render_end_pass_locked records after vkCmdEndRendering.
 void record_end_rendering(VkCommandBuffer cmd, bool barrier = true);
 void record_pass_barrier(VkCommandBuffer cmd);  // what makes a pass's attachment writes visible to everything after
+// BBHOST_BARRIER_MASKS (on unless 0; gpu.cpp): the barriers after a pass, a
+// dispatch and the tessellation LS pass name every access that can follow -
+// shader stores before a pass ends, vertex fetch and attachments after a
+// dispatch, the tessellation stages after the LS pass.
+bool barrier_masks_fixed();
 // A transfer batch's barrier: into the transfer stage (`begin`), or out of it.
 void record_transfer_barrier(VkCommandBuffer cmd, bool begin);
 // Inside a batch: the transfers recorded before it finish before the ones after.
@@ -1576,11 +2248,29 @@ bool set_cache_on();
 // than in the stage's set, which the cache then keys without them: with the
 // cache, whenever the device has push descriptors.
 bool cb_push_on();
+// Pushed constant buffers bound at their V# bases, shaders translated with
+// TranslateOptions::cb_bias_zero (render.cpp, BBHOST_CB_EXACT).
+bool cb_exact_bindings();
+// A dispatch's storage buffers (ComputeLean::meta's), resolved as a draw's
+// are - bound where they are, or copied as recorded for memory the game
+// writes on the CPU - into params (cb_valid, biases, strides) and `infos`,
+// one a buffer. The dispatch's own stores must be noted as GPU writes first
+// (gpu_writes_note_locked), so nothing it writes is read from a copy.
+// render.cpp; under g.mu, with the dispatch's recording begun.
+void resolve_dispatch_buffers(const gcn::TranslateResult& meta, const char* name, const std::uint32_t* user, gcn::StageParams& params,
+                              std::vector<VkDescriptorBufferInfo>& infos);
+// BBHOST_PIPELINE_STATS=<name>: whether a compute shader is named, and its
+// pipeline's statistics and disassembly to build/pipeline-stats (render.cpp).
+bool compute_pipeline_stats_wanted(const std::string& name);
+void write_compute_pipeline_stats(VkPipeline p, const std::string& name);
 VkDescriptorType params_descriptor_type();
 // The params descriptor with the cache on (set up with the ring).
 extern VkDescriptorBufferInfo g_params_desc;
 // A view is being let go: the cached sets that hold it are dropped. Under g.mu.
 void set_cache_forget_view_locked(VkImageView view);
+// Every cached set is dropped (a buffer they may name is being let go: a
+// retired window import, without push descriptors). Under g.mu.
+void set_cache_drop_all_locked();
 std::string set_cache_report();
 
 }  // namespace gpu

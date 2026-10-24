@@ -1,4 +1,5 @@
 #include "host/plugins.h"
+#include "host/plugin_address.h"
 
 #include "bbhost_plugin.h"
 #include "core/config.h"
@@ -16,19 +17,25 @@
 #include "engine/player_data.h"
 #include "engine/world_chr.h"
 #include "engine/lua_events.h"
+#include "engine/loading.h"
 #include "engine/paramdef.h"
 #include "engine/params.h"
+#include "engine/patch_manifest.h"
 #include "bbhost/engine/symbols.hpp"
 #include "bbhost/sdk.hpp"
 #include "core/thunk.h"
 #include "guest_abi.h"
 #include "hle/fs.h"
+#include "hle/modules.h"
+#include "host/ruleset.h"
 #include "host/updater.h"
 #include "host/window.h"
 #include "log.h"
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <cmath>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -141,9 +148,13 @@ std::uint64_t runtime_of(std::uint64_t bn, std::size_t n) {
 
 std::uint64_t api_guest_addr(std::uint64_t bn) { return api_eboot_is_109() ? runtime_of(bn, 1) : 0; }
 
+// A Binary Ninja address inside the image, else a runtime address: above the
+// image, or anywhere the guest has mapped - under Windows its heaps lie below
+// the slid image too (host/plugin_address.h).
 int api_read(std::uint64_t bn, void* out, std::size_t n) {
-    std::uint64_t at = runtime_of(bn, n);
-    if (!at && g_image && bn >= g_image->mem.slide + g_image->mem.size) at = bn;  // a runtime address elsewhere
+    if (!g_image) return 1;
+    const std::uint64_t at = plugin_address::read_address(bn, n, g_image->mem.slide, g_image->mem.size,
+                                                          [](std::uint64_t a, std::size_t len) { return hle_kernel_va_mapped(a, len); });
     if (!at) return 1;
     return host_read_safe(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(at)), out, n) ? 0 : 1;
 }
@@ -316,6 +327,8 @@ int api_camera_get(float pos[3], float focus[3]) { return api_eboot_is_109() && 
 int api_player_block(std::uint32_t* block) { return api_eboot_is_109() && world_player_block(block) ? 0 : 1; }
 int api_lamp_warp(std::int32_t return_point) { return api_eboot_is_109() && world_lamp_warp_queue(return_point) ? 0 : 1; }
 int api_player_warp(std::uint32_t block, const float xyz[3], float yaw) { return api_eboot_is_109() && world_player_warp_queue(block, xyz, yaw) ? 0 : 1; }
+// Version 12: the loading screen, as the host's own test last saw it (engine/loading.h).
+int api_loading_screen() { return loading_screen_up() ? 1 : 0; }
 
 int api_on_event_flag(void (*fn)(std::uint32_t, int, void*), void* user) {
     if (!fn || !api_eboot_is_109()) return 1;
@@ -507,6 +520,251 @@ int api_sp_effect_has(void* chr, std::int32_t id) {
         node = rp(node + 0x58);                              // SPEFFECT_NODE_NEXT_OFFSET
     }
     return 0;
+}
+
+// BBHOST_SPEFFECT_TEST=<id>[,<seconds>]: how a SpEffect ticks at the frame
+// rate in use. <seconds> (20) into the world the effect is put on the player,
+// again each half second until its node is on the list (a status effect's
+// buildup fills first); then each change of the player's HP and each tick
+// (the node's timer reloaded) is logged with the time and frames since, and
+// the totals as the node goes. Once a session.
+void speffect_test_tick() {
+    static const struct Test {
+        std::int32_t id = 0;
+        double delay = 20.0;
+    } test = [] {
+        Test t;
+        const char* e = std::getenv("BBHOST_SPEFFECT_TEST");
+        if (!e || !e[0]) return t;
+        t.id = std::atoi(e);
+        if (const char* comma = std::strchr(e, ',')) t.delay = std::atof(comma + 1);
+        return t;
+    }();
+    if (!test.id) return;
+    using Clock = std::chrono::steady_clock;
+    static int stage = 0;  // 0 waiting, 1 applying, 2 on, 3 done
+    static Clock::time_point world_since{}, last_apply{}, on_since{};
+    static std::uint64_t on_frames = 0;
+    static int attempts = 0, hp_changes = 0, ticks = 0, hp_at_on = 0, last_hp = 0;
+    static float last_timer = 0.0f;
+    if (stage == 3) return;
+    const std::uint64_t man = world_chr_man();
+    const std::uint64_t player = man ? rp(man + 0x60) : 0;
+    if (!player || loading_screen_up()) {
+        if (stage == 0) world_since = Clock::time_point{};
+        return;
+    }
+    const auto now = Clock::now();
+    if (world_since == Clock::time_point{}) world_since = now;
+    const auto secs = [&](Clock::time_point a) { return std::chrono::duration<double>(now - a).count(); };
+    if (stage == 0 && secs(world_since) < test.delay) return;
+    const std::uint64_t list = rp(player + 0x1c8);  // CHR_INS_SP_EFFECT_OFFSET
+    std::uint64_t node = list ? rp(list + 0x08) : 0;
+    for (int guard = 0; node && guard < 1024; ++guard) {
+        std::int32_t have = 0;
+        if (rd(node + 0x40, &have) && have == test.id) break;
+        node = rp(node + 0x58);
+    }
+    const std::uint64_t modules = rp(player + 0x3b0);
+    const std::uint64_t data = modules ? rp(modules + 0x20) : 0;
+    std::int32_t hp = 0, max_hp = 0;
+    if (data) {
+        rd(data + 0xf8, &hp);
+        rd(data + 0xfc, &max_hp);
+    }
+    float remaining = 0.0f, timer = 0.0f;
+    std::uint32_t flags = 0;
+    if (node) {
+        rd(node + 0x00, &remaining);
+        rd(node + 0x08, &timer);
+        rd(node + 0x1c, &flags);
+    }
+    if (stage < 2) {
+        if (node) {
+            stage = 2;
+            on_since = now;
+            on_frames = 0;
+            hp_at_on = last_hp = hp;
+            last_timer = timer;
+            const std::uint64_t row = rp(node + 0x48);
+            float interval = 0.0f;
+            if (row) rd(row + 0x0c, &interval);
+            host_log("speffect test: %d on after %d application(s): remaining %.3f s, timer %.3f s, interval %.3f s, "
+                     "flags 0x%x, HP %d/%d", test.id, attempts, static_cast<double>(remaining), static_cast<double>(timer),
+                     static_cast<double>(interval), flags, hp, max_hp);
+        } else if (attempts < 60 && (stage == 0 || secs(last_apply) >= 0.5)) {
+            stage = 1;
+            last_apply = now;
+            ++attempts;
+            api_sp_effect_apply(nullptr, test.id);
+        }
+        return;
+    }
+    ++on_frames;
+    if (!node) {
+        const double t = secs(on_since);
+        host_log("speffect test: %d off after %.3f s, %llu frames (%.1f fps): %d ticks (%.2f a second), %d HP changes, "
+                 "HP %d -> %d", test.id, t, static_cast<unsigned long long>(on_frames),
+                 t > 0 ? static_cast<double>(on_frames) / t : 0.0, ticks, t > 0 ? ticks / t : 0.0, hp_changes, hp_at_on, hp);
+        stage = 3;
+        return;
+    }
+    const bool tick = timer > last_timer + 1e-4f;  // reloaded from the interval
+    last_timer = timer;
+    if (tick) ++ticks;
+    if (hp != last_hp || tick) {
+        if (hp != last_hp) ++hp_changes;
+        host_log("speffect test: %d +%.3f s frame %llu: %s HP %d -> %d (%+d), remaining %.3f, timer %.3f, flags 0x%x",
+                 test.id, secs(on_since), static_cast<unsigned long long>(on_frames), tick ? "tick" : "    ", last_hp, hp,
+                 hp - last_hp, static_cast<double>(remaining), static_cast<double>(timer), flags);
+        last_hp = hp;
+    }
+}
+
+// BBHOST_CHR_WATCH=<model>[,god][,<SpEffect id>...]: a fight left to run by
+// itself, measured. The first character of that model (2510: Ebrietas) is
+// found in the world; each SpEffect listed is logged as it goes on and off
+// it, and once a second its HP, the SpEffects on it and the bullets: those
+// alive in the bullet manager's pool (the 0x80 entries off its free list)
+// and those made in that second. "god" keeps the player's HP full; "near=<m>"
+// puts the player that far from it, facing it, 3 s after it is found (the
+// game's own warp: BBHOST_TEST_WARP=1 or an opt-in gameplay plugin on).
+void chr_watch_tick() {
+    static const struct Watch {
+        std::uint32_t model = 0;
+        bool god = false;
+        float approach = 0.0f;
+        std::vector<std::int32_t> ids;
+    } watch = [] {
+        Watch w;
+        const char* e = std::getenv("BBHOST_CHR_WATCH");
+        if (!e || !e[0]) return w;
+        std::string s(e);
+        std::size_t at = 0;
+        for (int k = 0; at <= s.size(); ++k) {
+            const std::size_t comma = std::min(s.find(',', at), s.size());
+            const std::string part = s.substr(at, comma - at);
+            if (k == 0) w.model = static_cast<std::uint32_t>(std::atoi(part.c_str()));
+            else if (part == "god") w.god = true;
+            else if (part.rfind("near=", 0) == 0) w.approach = static_cast<float>(std::atof(part.c_str() + 5));
+            else if (!part.empty()) w.ids.push_back(std::atoi(part.c_str()));
+            at = comma + 1;
+        }
+        return w;
+    }();
+    if (!watch.model) return;
+    using Clock = std::chrono::steady_clock;
+    static Clock::time_point since{}, last_report{};
+    static std::uint64_t ins = 0, frames = 0;
+    static std::vector<std::int32_t> on;  // the listed ids on it last frame
+    static std::vector<std::uint64_t> live;  // bullet entries alive last frame
+    static int made = 0;
+    static std::int64_t stamina_min = INT64_MAX;
+    const std::uint64_t man = world_chr_man();
+    const std::uint64_t player = man ? rp(man + 0x60) : 0;
+    if (!player || loading_screen_up()) {
+        ins = 0;
+        return;
+    }
+    if (watch.god) {
+        const std::uint64_t modules = rp(player + 0x3b0);
+        const std::uint64_t data = modules ? rp(modules + 0x20) : 0;
+        std::int32_t hp = 0, max_hp = 0;
+        if (data && rd(data + 0xf8, &hp) && rd(data + 0xfc, &max_hp) && max_hp > 0 && hp > 0 && hp < max_hp) {
+            *reinterpret_cast<std::int32_t*>(static_cast<std::uintptr_t>(data + 0xf8)) = max_hp;
+        }
+    }
+    const auto now = Clock::now();
+    ++frames;
+    if (!ins && frames % 30 == 0) {
+        static BbChr chrs[512];
+        std::size_t n = 0;
+        api_chr_list(chrs, 512, &n);
+        for (std::size_t i = 0; i < std::min<std::size_t>(n, 512); ++i) {
+            if (chrs[i].model != watch.model) continue;
+            ins = reinterpret_cast<std::uint64_t>(chrs[i].ins);
+            since = last_report = now;
+            host_log("chr watch: c%04u found (npc %d, hp %d/%d) at %.1f %.1f %.1f", watch.model, chrs[i].npc_param,
+                     chrs[i].hp, chrs[i].max_hp, static_cast<double>(chrs[i].pos[0]), static_cast<double>(chrs[i].pos[1]),
+                     static_cast<double>(chrs[i].pos[2]));
+            break;
+        }
+    }
+    if (!ins) return;
+    const double t = std::chrono::duration<double>(now - since).count();
+    if (std::int64_t st = 0; player_stat_get("stamina", &st)) stamina_min = std::min(stamina_min, st);
+    static bool warped = false;
+    if (watch.approach > 0.0f && !warped && t >= 3.0) {
+        warped = true;
+        const std::uint64_t modules = rp(ins + 0x3b0);
+        const std::uint64_t phys = modules ? rp(modules + 0x68) : 0;
+        float at[3] = {}, me[3] = {}, yaw = 0.0f;
+        if (phys && rd(phys + 0x1e0, &at) && world_player_position(me, &yaw)) {
+            const float dx = me[0] - at[0], dz = me[2] - at[2];
+            const float len = std::sqrt(dx * dx + dz * dz);
+            if (len > 0.01f) {
+                const float to[3] = {at[0] + dx / len * watch.approach, at[1] + 0.2f, at[2] + dz / len * watch.approach};
+                const float face = std::atan2(dx / len, dz / len);  // a thing at yaw y faces (-sin y, -cos y)
+                const bool ok = world_player_warp_queue(0, to, face);
+                host_log("chr watch: player to %.1f %.1f %.1f (%.1f m from it), %s", static_cast<double>(to[0]),
+                         static_cast<double>(to[1]), static_cast<double>(to[2]), static_cast<double>(watch.approach),
+                         ok ? "queued" : "warp is off");
+            }
+        }
+    }
+    // Its SpEffects this frame.
+    std::vector<std::int32_t> ids;
+    const std::uint64_t list = rp(ins + 0x1c8);
+    std::uint64_t node = list ? rp(list + 0x08) : 0;
+    for (int guard = 0; node && guard < 256; ++guard) {
+        std::int32_t id = 0;
+        if (rd(node + 0x40, &id)) ids.push_back(id);
+        node = rp(node + 0x58);
+    }
+    std::vector<std::int32_t> now_on;
+    for (std::int32_t id : watch.ids) {
+        if (std::find(ids.begin(), ids.end(), id) != ids.end()) now_on.push_back(id);
+    }
+    for (std::int32_t id : now_on) {
+        if (std::find(on.begin(), on.end(), id) == on.end()) host_log("chr watch: +%.3f s: %d on", t, id);
+    }
+    for (std::int32_t id : on) {
+        if (std::find(now_on.begin(), now_on.end(), id) == now_on.end()) host_log("chr watch: +%.3f s: %d off", t, id);
+    }
+    on.swap(now_on);
+    // The bullets: the pool's entries not on its free list.
+    const std::uint64_t bm = g_image && api_eboot_is_109() ? rp(runtime_of(bb::SPRJ_BULLET_MANAGER_SINGLETON_PTR.bn(), 8)) : 0;
+    const std::uint64_t pool = bm ? rp(bm + 0x00) : 0;
+    std::vector<std::uint64_t> free_list;
+    for (std::uint64_t e = bm ? rp(bm + 0x10) : 0; e && free_list.size() < 0x80; e = rp(e + 0x868)) free_list.push_back(e);
+    std::vector<std::uint64_t> alive;
+    if (pool) {
+        for (std::uint64_t k = 0; k < 0x80; ++k) {
+            const std::uint64_t e = pool + k * 0x890;
+            if (std::find(free_list.begin(), free_list.end(), e) == free_list.end()) alive.push_back(e);
+        }
+    }
+    for (std::uint64_t e : alive) {
+        if (std::find(live.begin(), live.end(), e) == live.end()) ++made;
+    }
+    live.swap(alive);
+    if (std::chrono::duration<double>(now - last_report).count() >= 1.0) {
+        last_report = now;
+        const std::uint64_t modules = rp(ins + 0x3b0);
+        const std::uint64_t data = modules ? rp(modules + 0x20) : 0;
+        std::int32_t hp = 0;
+        if (data) rd(data + 0xf8, &hp);
+        std::sort(ids.begin(), ids.end());
+        std::string s;
+        for (std::int32_t id : ids) s += " " + std::to_string(id);
+        float me[3] = {};
+        world_player_position(me, nullptr);
+        host_log("chr watch: +%.1f s: hp %d, bullets %zu alive, %d made; SpEffects%s; player at %.1f %.1f %.1f, stamina down to %lld",
+                 t, hp, live.size(), made, s.c_str(), static_cast<double>(me[0]), static_cast<double>(me[1]),
+                 static_cast<double>(me[2]), static_cast<long long>(stamina_min == INT64_MAX ? -1 : stamina_min));
+        made = 0;
+        stamina_min = INT64_MAX;
+    }
 }
 
 std::string g_plugin_dir;
@@ -790,6 +1048,7 @@ const BbHostApi g_api = {
     &api_on_option, &api_on_action, &api_game_file, &api_overlay_file,
     &api_set_rules, &api_on_world_rules, &api_visitor,
     &api_replace_text,
+    &api_loading_screen,
 };
 
 std::string read_file(const std::string& path) {
@@ -1006,6 +1265,8 @@ void plugins_image(ElfImage* image) {
 }
 
 void plugins_frame() {
+    speffect_test_tick();  // BBHOST_SPEFFECT_TEST
+    chr_watch_tick();      // BBHOST_CHR_WATCH
     std::vector<FrameCallback> now;
     std::vector<WorldLoadCallback> loads;
     std::vector<MenuRequest> requests;
@@ -1205,11 +1466,17 @@ std::string own_ruleset() {
         }
         parts.push_back(token);
     }
-    std::sort(parts.begin(), parts.end());
-    std::string out;
-    for (const std::string& t : parts) out += (out.empty() ? "" : ",") + t;
-    if (out.empty()) out = "vanilla";
-    if (!unseeded) cached = out;
+    // The patch manifests that change the game (debug dash, the rally window,
+    // bigger weapons, ...: engine/patch_manifest.h), one entry each. Final once
+    // the manifests have applied, so the rules are kept only from then on.
+    for (const std::string& name : patch_manifests_gameplay()) parts.push_back(patch_rule_token(name));
+    const std::string out = ruleset_join(parts);
+    if (!unseeded && patch_manifests_done()) cached = out;
+    static std::string logged;
+    if (out != logged) {
+        logged = out;
+        host_log("plugin: this session's online rules (X-BBHost-Ruleset): %s", out.c_str());
+    }
     return out;
 }
 

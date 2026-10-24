@@ -74,7 +74,8 @@ const char* stream::op_name(stream::Op op) {
                                         "copy order",     "pass barrier", "end rendering",  "begin rendering", "fill",     "copy",
                                         "copy to image",  "copy to buffer", "clear",        "reset queries", "begin query", "end query",
                                         "copy queries",   "timestamp",    "bind pipeline",  "bind sets",     "push constants", "update sets",
-                                        "dispatch",       "clear depth",  "copy image",     "dispatch indirect", "marker"};
+                                        "dispatch",       "clear depth",  "copy image",     "dispatch indirect", "marker",
+                                        "push buffers"};
     static_assert(sizeof(names) / sizeof(names[0]) == static_cast<std::size_t>(stream::Op::kCount), "a name for every op");
     const auto k = static_cast<std::size_t>(op);
     return k < static_cast<std::size_t>(stream::Op::kCount) ? names[k] : "?";
@@ -107,6 +108,7 @@ struct alignas(64) DrawPacket {  // a line of its own: the recorder reads the on
     VkDescriptorBufferInfo extra[2] = {};
 
     VkPipeline pipeline = VK_NULL_HANDLE;  // null: keep the bound one
+    bool raster_discard = false;           // the pipeline's dynamic rasterizer discard, set on after the bind
     bool library = false;
     DrawLibraryState lib{};
     bool has_depth_bounds = false;
@@ -180,6 +182,7 @@ struct alignas(64) DrawPacket {  // a line of its own: the recorder reads the on
         write_buffer.clear();
         write_image.clear();
         pipeline = VK_NULL_HANDLE;
+        raster_discard = false;
         library = bind_sets = viewport = scissor = bounds = stencil = blend = index = draw = marker = false;
         stage_set_bound = false;
         end_pass = begin_pass = false;
@@ -193,6 +196,42 @@ struct alignas(64) DrawPacket {  // a line of its own: the recorder reads the on
         vertex_buffers = 0;
     }
 };
+
+// The lines of a packet every draw writes - its header and vectors, the
+// binds, the pushed constant buffers' first entries, the dynamic state, the
+// geometry and the call - asked for with the intent to write them, for the
+// draw after the one taking a packet now. The ring comes round every 1,024
+// draws, so a packet's lines were last the recorder's and are long cold:
+// written field by field they cost a read for ownership each, in turn, on
+// the command processor. BBHOST_PACKET_PREFETCH=0: not asked for.
+const bool g_packet_prefetch = [] {
+    const char* e = std::getenv("BBHOST_PACKET_PREFETCH");
+    return !(e && e[0] == '0');
+}();
+inline void prefetchw_line(const void* p) {
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+    asm volatile("prefetchw %0" : : "m"(*static_cast<const char*>(p)));
+#else
+    (void)p;
+#endif
+}
+void prefetch_packet_for_write(const DrawPacket& p) {
+    if (!g_packet_prefetch) return;
+    const auto* b = reinterpret_cast<const char*>(&p);
+    const auto line = [](const void* at) { prefetchw_line(at); };
+    // The header, the vectors, the binds and sets, up to the pushes' bindings.
+    for (const char* at = b; at < reinterpret_cast<const char*>(&p.push_binding[0]) + 64; at += 64) line(at);
+    line(&p.push_infos[0]);
+    line(reinterpret_cast<const char*>(&p.push_infos[0]) + 64);
+    line(reinterpret_cast<const char*>(&p.push_infos[0]) + 128);
+    line(&p.viewport);
+    line(&p.stencil_words[0]);
+    line(&p.index);
+    line(&p.vb[0]);
+    line(&p.vb_offset[0]);
+    line(&p.call);
+    line(&p.draw);
+}
 
 // Nothing a pass change must precede is in the packet yet.
 bool before_binds(const DrawPacket& p) {
@@ -338,6 +377,7 @@ void replay_packet(DrawPacket& p, VkCommandBuffer cmd) {
         vkCmdBeginRendering(cmd, &p.rendering);
     }
     if (p.pipeline) vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p.pipeline);
+    if (p.pipeline && p.raster_discard) vkCmdSetRasterizerDiscardEnable(cmd, VK_TRUE);
     if (p.library) record_library_state(cmd, p.lib, p.has_depth_bounds);
     if (p.bind_sets) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p.layout, 0, 2, p.sets, p.dynamic_count, p.dynamic);
     if (p.bind_sets && p.bindless) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p.layout, 3, 1, &g.bindless_set, 0, nullptr);
@@ -375,6 +415,21 @@ template <class T> const T* tail(const std::uint8_t*& at, std::size_t n) {
     const T* t = reinterpret_cast<const T*>(at);
     at += round8(n * sizeof(T));
     return t;
+}
+
+// n storage buffers pushed into set `set` (Op::kPushBuffers, Rec::push_buffers).
+void push_buffer_writes(VkCommandBuffer cmd, VkPipelineBindPoint bind_point, VkPipelineLayout layout, std::uint32_t set, std::uint32_t n,
+                        const std::uint32_t* bindings, const VkDescriptorBufferInfo* infos) {
+    VkWriteDescriptorSet writes[2 * gcn::kMaxBuffers];
+    n = std::min<std::uint32_t>(n, 2 * gcn::kMaxBuffers);
+    for (std::uint32_t k = 0; k < n; ++k) {
+        writes[k] = VkWriteDescriptorSet{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        writes[k].dstBinding = bindings[k];
+        writes[k].descriptorCount = 1;
+        writes[k].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[k].pBufferInfo = &infos[k];
+    }
+    g.cmd_push_descriptor_set(cmd, bind_point, layout, set, n, writes);
 }
 
 void replay_block(const Block& b) {
@@ -569,6 +624,14 @@ void replay_block(const Block& b) {
         case Op::kDispatchIndirect: {
             const auto* r = reinterpret_cast<const stream::DispatchIndirect*>(p);
             vkCmdDispatchIndirect(cmd, r->buffer, r->offset);
+            break;
+        }
+        case Op::kPushBuffers: {
+            const auto* r = reinterpret_cast<const stream::PushBuffers*>(p);
+            const std::uint8_t* q = p + round8(sizeof(*r));
+            const auto* bindings = tail<std::uint32_t>(q, r->n);
+            const auto* infos = tail<VkDescriptorBufferInfo>(q, r->n);
+            push_buffer_writes(cmd, r->bind_point, r->layout, r->set, r->n, bindings, infos);
             break;
         }
         case Op::kCount: break;
@@ -1242,6 +1305,19 @@ void Rec::dispatch(std::uint32_t x, std::uint32_t y, std::uint32_t z) {
     after_op();
 }
 
+void Rec::push_buffers(VkPipelineBindPoint bind_point, VkPipelineLayout layout, std::uint32_t set, std::uint32_t n, const std::uint32_t* bindings,
+                       const VkDescriptorBufferInfo* infos) {
+    if (!n) return;
+    if (!stream_on()) return push_buffer_writes(in_place(REC_SITE), bind_point, layout, set, n, bindings, infos);
+    before_op(REC_SITE);
+    std::uint8_t* at = append_record(Op::kPushBuffers, round8(sizeof(stream::PushBuffers)) + round8(n * sizeof(std::uint32_t)) +
+                                                           round8(n * sizeof(VkDescriptorBufferInfo)));
+    *put_struct<stream::PushBuffers>(at) = stream::PushBuffers{layout, bind_point, set, n, 0};
+    put_array(at, bindings, n);
+    put_array(at, infos, n);
+    after_op();
+}
+
 void Rec::marker(std::uint32_t value) {
     if (!stream_on()) return gpu_write_markers(in_place(REC_SITE), value);
     before_op(REC_SITE);
@@ -1287,6 +1363,8 @@ std::string host_gpu_recorder_report() {
     if (gpu::set_cache_on()) r += "; " + gpu::set_cache_report();
     if (const std::string cv = gpu::copy_versions_report(); !cv.empty()) r += "; " + cv;
     if (const std::string pb = gpu::render_barriers_report(); !pb.empty()) r += "; " + pb;
+    // A line of its own: the recorder's runs past the log's 1 KiB a line.
+    if (const std::string sm = gpu::submit_merge_report(); !sm.empty()) host_log("  %s", sm.c_str());
     return r;
 }
 
@@ -1318,6 +1396,7 @@ void DrawCmds::start(bool deferred) {
     p.number = g_pk_taken++;
     packet_ = &p;
     g_open = this;
+    prefetch_packet_for_write(g_packets[g_pk_taken % kPackets]);
 }
 
 DrawCmds* DrawCmds::open() { return g_open; }
@@ -1410,12 +1489,14 @@ void DrawCmds::take_sets(std::vector<VkWriteDescriptorSet>& writes, std::vector<
     p.taken_images.swap(images);
 }
 
-void DrawCmds::bind_pipeline(VkPipeline pipeline) {
+void DrawCmds::bind_pipeline(VkPipeline pipeline, bool discard) {
     if (!packet_) {
         vkCmdBindPipeline(g_cmd(), VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        if (discard) vkCmdSetRasterizerDiscardEnable(g_cmd(), VK_TRUE);
         return;
     }
     static_cast<DrawPacket*>(packet_)->pipeline = pipeline;
+    static_cast<DrawPacket*>(packet_)->raster_discard = discard;
 }
 
 void DrawCmds::library_state(const DrawLibraryState& s, bool has_depth_bounds) {

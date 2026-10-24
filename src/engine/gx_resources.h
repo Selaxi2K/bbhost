@@ -42,17 +42,60 @@ struct GxResourceInfo {
     bool initial_data = false;
     bool alive = true;
     std::uint64_t created_flip = 0;
+    // The resource's generation: a host number given at registration, one
+    // counter for every resource, never reused (GX's 24-bit id is unique too,
+    // but wraps). A resource made later over the same memory has another, so
+    // (memory, generation) names one resource across destruction and reuse.
+    std::uint64_t gen = 0;
+    std::uint8_t bind = 0;  // GX's bind flags (+0x3b), as the creator stored them
+    // The submissions made when it was created (hle_gnm_submitted_total): a
+    // host image something wrote in a later one is this resource's.
+    std::uint64_t created_submit = 0;
 };
 // A guest address as Binary Ninja shows it (the preferred slide).
 std::uint64_t gx_guest_to_bn(std::uint64_t va);
 
 void gx_resources_install(ElfImage* image);
+// After decomp_install: GX's CreateBuffer hooked for the registry unless
+// ours (decomp/gx/resources.cpp), which tells it itself, is in place.
+void gx_resources_install_late(ElfImage* image);
 // How many buffer and texture creations have returned an error so far (an
 // allocation that did not fit: engine/live_resolution.cpp checks it around a
 // change). 0 when the registry is off.
 std::uint64_t gx_resources_create_failures();
 // The live resource whose memory covers [va, va + bytes), if any.
 bool gx_resource_at(std::uint64_t va, std::size_t bytes, GxResourceInfo* out);
+// Whether live GX buffers (type 1) cover every byte of [va, va + bytes): the
+// CPU writes such memory through GX's Map or a creation with data, which the
+// buffer shadow's mirrors are told of (host_gpu_shadow_gx_write).
+bool gx_buffers_cover(std::uint64_t va, std::uint64_t bytes);
+// The end of the live GX buffer whose memory holds `va` (0: none) - how far a
+// vertex record that starts in it can be read (render.cpp's records whose
+// V# counts past the buffer).
+std::uint64_t gx_buffer_end(std::uint64_t va);
+// The first live resource whose memory overlaps [va, va + bytes) at all, if
+// any (the census of surfaces no resource covers whole).
+bool gx_resource_overlapping(std::uint64_t va, std::size_t bytes, GxResourceInfo* out);
+// BBHOST_RESOURCE_CENSUS=1: whether a live texture or buffer YEBIS's own
+// device made (1) or a Scaleform texture's plane (2) - not GX's - holds any
+// of [va, va + bytes); 0 for neither, and without the census.
+int gx_middleware_at(std::uint64_t va, std::size_t bytes);
+// Whether the live GX buffer whose memory starts at `memory` is a constant
+// buffer (bind flags exactly 4): its renamed copies hold constants only.
+bool gx_constant_buffer_at(std::uint64_t memory);
+// The registry's write sequence now (bumped by every creation with data and
+// every Map), and the latest of the live resources overlapping [va, va +
+// bytes) (0: none overlaps) - whether GX wrote any of them since a moment
+// (the buffer shadow's census of what its write watch catches).
+std::uint64_t gx_write_seq_now();
+std::uint64_t gx_write_seq_overlapping(std::uint64_t va, std::size_t bytes, bool* any_resource);
+// The live resource a GX holder (the object GX's methods take: CopyResource's,
+// a view's +0x08) stands for, if the registry has it - by identity, not by
+// address. A 1D texture's holder is found by its memory (+0x20).
+bool gx_resource_by_holder(std::uint64_t holder, GxResourceInfo* out);
+// The live resource behind a render-target, depth-stencil or shader-resource
+// view (its holder at +0x08).
+bool gx_view_resource(std::uint64_t view, GxResourceInfo* out);
 // Whether a live resource made after flip `after_flip` holds memory in
 // [va, va + bytes): the game gave that memory to something newer.
 bool gx_resource_newer_overlapping(std::uint64_t va, std::size_t bytes, std::uint64_t after_flip);
@@ -89,6 +132,16 @@ std::uint32_t gx_object_id(std::uint64_t object);
 // tiling. (width << 16) | height, 0 when not known (not a 2D texture view, or
 // a view the registry did not see made).
 std::uint32_t gx_view_extent(std::uint64_t view);
+// The generation of the resource a render-target, depth-stencil or
+// shader-resource view was made of (GxResourceInfo::gen), read lock-free at a
+// draw as gx_view_extent is; 0 when the registry did not see the view made or
+// did not know its resource.
+std::uint64_t gx_view_gen(std::uint64_t view);
+// The same by the view's id (gx_object_id: what a draw's records carry), for
+// the command processor; 0 when not known.
+std::uint64_t gx_view_gen_by_id(std::uint32_t id);
+// gx_view_extent and gx_view_gen in one lookup: a draw's targets take both.
+std::uint32_t gx_view_extent_gen(std::uint64_t view, std::uint64_t* gen);
 // Shader-resource views (0x25669a0) and samplers (0x2565b40)
 // are registered too, with their T# (at +0x10) or S# (at +0x0) hashed at
 // creation (gx_words_hash of the 32 bytes). The id of `object` and that hash.

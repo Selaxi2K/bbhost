@@ -88,6 +88,10 @@ struct BufferBinding {
     // and the host binds the guest memory itself - never a copy or snapshot,
     // which would take the stores in its place.
     bool written = false;
+    // Every access at an index through it is a format load that takes its
+    // element at a byte offset (Translator::bound_compute_access): the host
+    // binds it with a stride that is not whole dwords too (a byte table).
+    bool bytes = false;
 };
 // A V#'s range in dwords as GCN checks a buffer load against it, from its
 // words 1 (stride in [29:16]) and 2 (num_records): num_records bytes, times the
@@ -107,7 +111,25 @@ struct VertexElement {
     std::uint32_t vdata = 0;  // first VGPR written
     std::uint32_t count = 0;  // VGPRs written, 1-4
     std::uint32_t w3 = 0;     // the record's word 3: data format [18:15], number format [14:12], DST_SEL [11:0]
+    // 8 or 16: the format's 8- or 16-bit components arrive packed, as the
+    // record holds them, in the dwords of an R16/R32/R32G32 attribute (the
+    // host's choice where the element's address and stride allow it), and
+    // the shader takes them apart; 0: one component a channel. AMD's compiler
+    // fetches an R8G8B8A8 or R16G16B16A16 attribute one component a load,
+    // since Vulkan promises it only the component's alignment: four typed
+    // loads where one dword load does.
+    std::uint32_t packed = 0;
 };
+// The width of `dfmt`'s components where an attribute can carry them packed
+// (0: it cannot): 8_8 as R16_UINT, 8_8_8_8 and 16_16 as R32_UINT, 16_16_16_16
+// as R32G32_UINT.
+inline std::uint32_t vertex_packed_bits(std::uint32_t dfmt) {
+    switch (dfmt) {
+    case 3: case 10: return 8;   // 8_8 (R16_UINT), 8_8_8_8 (R32_UINT)
+    case 5: case 12: return 16;  // 16_16 (R32_UINT), 16_16_16_16 (R32G32_UINT)
+    default: return 0;
+    }
+}
 
 // TranslateOptions::vertex_formats_from_params: the loader's descriptor of an
 // element's word 3 (StageParams::vertex_formats), or 0 when the loader does not
@@ -115,10 +137,12 @@ struct VertexElement {
 // load_vertex_input converts it (1 the raw bits of a float, or of a 32-bit
 // unorm or snorm; 2 the raw bits of an integer: uint, or a 32-bit sint; 3 unorm8;
 // 4 sint16). Bits 4-6: the data format's component count. Bits 8-11: the
-// components past it that read one. DST_SEL must select each of the format's
-// components in place and 0 or 1 past them, as every element of a cold world
-// load did; the loader stays small enough not to slow the driver's compile.
-inline std::uint32_t vertex_format_descriptor(std::uint32_t w3) {
+// components past it that read one. Bits 12-13: VertexElement::packed (1: 8-bit
+// components packed in the input's dwords, 2: 16-bit; 0: one a channel).
+// DST_SEL must select each of the format's components in place and 0 or 1 past
+// them, as every element of a cold world load did; the loader stays small
+// enough not to slow the driver's compile.
+inline std::uint32_t vertex_format_descriptor(std::uint32_t w3, std::uint32_t packed = 0) {
     const std::uint32_t dfmt = (w3 >> 15) & 0xf, nfmt = (w3 >> 12) & 7;
     std::uint32_t count = 0, bits = 0;
     switch (dfmt) {
@@ -151,7 +175,8 @@ inline std::uint32_t vertex_format_descriptor(std::uint32_t w3) {
             return 0;
         }
     }
-    return kind | count << 4 | ones << 8;
+    const std::uint32_t packing = packed == 8 && bits == 8 ? 1u : packed == 16 && bits == 16 ? 2u : 0u;
+    return kind | count << 4 | ones << 8 | packing << 12;
 }
 // Location n's descriptor is also specialization constant kVertexFormatSpecId
 // + n: 0, the default, reads StageParams::vertex_formats; a pipeline's key holds
@@ -227,6 +252,13 @@ struct TranslateOptions {
     std::uint32_t ps_clip_count() const { return ps_clip_discard & 0xff; }
     std::uint32_t ps_clip_location() const { return (ps_clip_discard >> 8) & 31; }
     std::vector<std::uint8_t> ps_input_map;  // PS attr n -> VS param location (SPI_PS_INPUT_CNTL_n.OFFSET); empty = identity
+    // An entry kPsInputDefault | v: the input is GCN's default constant
+    // SPI_PS_INPUT_CNTL_n.DEFAULT_VAL v - (0,0,0,0), (0,0,0,1), (1,1,1,0) or
+    // (1,1,1,1) - which the hardware gives an input whose OFFSET has bit 5 (no
+    // vertex output carries its semantic), instead of an input variable: no
+    // vertex output writes one, and Vulkan leaves such an input undefined.
+    static constexpr std::uint8_t kPsInputDefault = 0x40;
+    static bool ps_input_is_default(std::uint8_t entry) { return (entry & kPsInputDefault) != 0; }
     // Vertex stage with link_outputs: output location k carries param register
     // output_links[k] (kNoLink: nothing), so a pixel shader reads its input k at
     // location k whatever vertex shader it runs with, and the pairing
@@ -265,6 +297,12 @@ struct TranslateOptions {
     // and the pixel stage's from 128.
     int cb_descriptor_set = -1;
     std::uint32_t cb_binding_base = 112;  // kBindingStorageBuffer0
+    // The host binds every constant buffer at its V#'s base (StageParams::
+    // cb_bias_dw always 0): the shader indexes each from dword 0 rather than
+    // from a bias read from the params. Constant offsets stay constants, which
+    // the driver loads several dwords at a time; added to a bias, AMD's
+    // compiler loaded each dword with an address add of its own.
+    bool cb_bias_zero = false;
     // Image dimensions per T# use site, filled by the host from the resolved
     // T#s (spv::Dim, arrayed). Missing entries default to 2D. Bits 8-9 of the
     // dim are the texel kind (ImageBinding::kind), 0 when not given.
@@ -307,6 +345,14 @@ struct TranslateOptions {
     //   point, so gl_VertexIndex is what the workgroup arithmetic gave.
     enum class TessRole : std::uint8_t { None, LsCompute, Domain, HullTcs, DomainTes, LsVertex };
     TessRole tess_role = TessRole::None;
+    // A draw that binds a geometry shader (lift.h GsLift): GX's VS is then an
+    // export shader whose outputs go to the ESGS ring (EsVertex: the
+    // pipeline's vertex stage, each ring dword an output) and its GS reads
+    // them there and writes its vertices to the GSVS ring (Geometry: the
+    // pipeline's geometry stage). Both keep stage Vertex for the reference
+    // translation, which only names their bindings.
+    enum class GsRole : std::uint8_t { None, EsVertex, Geometry };
+    GsRole gs_role = GsRole::None;
     std::uint32_t domain_level = 1;
     // VGT_LS_HS_CONFIG and VGT_TF_PARAM, for the host stages.
     std::uint32_t tess_patch_control_points = 1;
@@ -370,7 +416,123 @@ struct TranslateOptions {
     // BBHOST_GDS_COUNTERS=0), GDS is taken for LDS and each lane is handed its
     // rank on top, as before.
     bool gds_counters = true;
+    // The lift's GDS counters (lift.cpp gds_counter): one atomic a subgroup -
+    // an elected invocation adds the active invocations' count and each takes
+    // the base plus (append) or minus (consume) its rank among them, as GCN
+    // steps the counter once a wave - rather than one atomic an invocation.
+    // The counter word lives where the game's buffer does (imported memory on
+    // a discrete GPU): a word every invocation of a particle pass stepped
+    // went across the bus once each, in turn (CS_VFX_StandardParticle, ~8 ms
+    // a frame for Vicar Amelia's ~37,500 particles). The host's
+    // BBHOST_GDS_SUBGROUP=0 keeps an atomic an invocation.
+    bool gds_subgroup = true;
 };
+
+// The Vulkan shader stages (VkShaderStageFlagBits) that may run subgroup
+// operations: VkPhysicalDeviceSubgroupProperties::supportedStages where the
+// device has the basic, ballot and shuffle operations (none where it lacks
+// one), set once by the host before its first translation, as
+// set_native_half_rtz; every stage until then. A translation for a stage
+// outside it runs each invocation as a wave of its own - lane 0, EXEC and the
+// comparisons' masks its one bit, a ballot that bit, a shuffle, broadcast or
+// election the invocation itself - which is what a 64-lane wave split across
+// smaller subgroups already is, taken to one lane; a lift takes no subgroup
+// operation there (its GDS counters step an invocation at a time, a lane rank
+// is refused). Part of every translation's key where it applies
+// (translation_cache.cpp), so a device with them everywhere keeps its keys.
+void set_subgroup_stages(std::uint32_t vk_stages);
+std::uint32_t subgroup_stages();
+// A pixel shader's discard by the vertex stage's clip distances
+// (TranslateOptions::ps_clip_discard) demotes the pixel to a helper invocation
+// (OpDemoteToHelperInvocation) where the device has the feature - as the
+// PS4's clipper leaves a pixel it cut out of a quad's triangle, a helper whose
+// values the quad's derivatives still take - rather than ending it with
+// OpKill, after which the derivatives of a quad the clip edge crosses are
+// undefined (drivers that end such an invocation take them from whatever its
+// registers held). Set once by the host before its first translation, as
+// set_subgroup_stages; off until then. Part of a clip-discarding translation's
+// key (translation_cache.cpp).
+void set_clip_demote(bool on);
+bool clip_demote();
+// A typed load by index from a bound storage buffer (tbuffer_load_format_*
+// with idxen, translate.cpp indexed_buffer_load and the lift's) checks the
+// index against the V#'s num_records (word 2) and reads 0 at or past it, as
+// GCN does - where the binding ends at the records (the host binds count x
+// stride), an index past them reads past the binding: AMD's descriptors give
+// 0 there too, other drivers whatever memory follows. Set once by the host
+// before its first translation, as set_clip_demote; off until then. Keyed for
+// the programs that hold such a load (indexed_typed_load), so turning it on
+// moves no other program's key.
+void set_index_bounds(bool on);
+bool index_bounds();
+inline bool indexed_typed_load(const Inst& in) { return in.enc == Enc::MTBUF && in.op < 4 && in.idxen; }
+// An image store (image_store, image_store_mip) whose coordinates fall outside
+// the image writes nothing on GCN; Vulkan leaves such a write undefined unless
+// robust image access is on. With set_image_store_bounds a store's lanes
+// outside the size and layers of the view the host binds for its T# skip it
+// (mimg, the lift's guest_image_store), as on the PS4 - the game's compute
+// passes write past the bottom of their targets where the height is not a
+// multiple of their tiles. On by default (the host's
+// BBHOST_IMAGE_STORE_BOUNDS=0 turns it off); set before the first
+// translation. Keyed for the programs that hold an image store
+// (image_store_inst), so it moves no other program's key.
+void set_image_store_bounds(bool on);
+bool image_store_bounds();
+inline bool image_store_inst(const Inst& in) { return in.enc == Enc::MIMG && (in.op == 8 || in.op == 9); }
+// A diagnostic (the host's BBHOST_OOB_COUNT=1): a vertex, pixel or compute
+// stage with no tessellation or GS role, translated or lifted, counts the
+// accesses that leave what GCN would read or what the bound view holds,
+// without changing what it reads - into the dwords StageParams::lds_address
+// points at (a stage with no LDS of its own), kOobKinds per program
+// (TranslateResult::oob_slot): [kOobPastRecords] a typed load by index from a
+// bound buffer at or past the V#'s num_records (what set_index_bounds makes
+// 0), [kOobPastBinding] the same load reaching past the buffer's binding (what
+// robust buffer access would clamp), [kOobWalkPastRecords] a buffer access
+// walked through the page table by index at or past num_records (GCN reads 0
+// and drops a store there); and of the image accesses at integer coordinates,
+// against the view the host binds (what robust image access acts on):
+// [kOobImageLoadSize] an image_load(_mip) with a coordinate at or past the
+// view's size at the level read (negative ones too), [kOobImageLoadLevel] an
+// image_load_mip at or past the view's level count, [kOobImageLoadLayer] an
+// arrayed load (a 2D array's, a cube's face) at or past its layer count,
+// [kOobImageStoreSize] and [kOobImageStoreLayer] the same of an
+// image_store(_mip) (lanes set_image_store_bounds skips), [kOobImageStoreLevel]
+// an image_store_mip at a level other than 0 (mimg writes level 0 of the view);
+// and of those loads and stores against the T#'s own size at the level
+// (width, height, a 3D image's depth: the game's image), where the view and
+// the T# disagree - [kOobViewSmaller] inside the T#'s size but outside the
+// view's (the host bound a smaller view than the game's image: what GCN
+// reads or writes, the host does not), [kOobViewLarger] outside the T#'s but
+// inside the view's (GCN reads 0 or drops it, the host reads or writes). Only
+// lanes EXEC holds count. Set
+// once before the first translation; part of every key while on.
+void set_oob_count(bool on);
+bool oob_count();
+// The counters' control (BBHOST_OOB_COUNT=2): every limit halved - a typed
+// load by index counts as past the records from half of them on, an image
+// access past half the view's size, levels or layers - and of those accesses
+// one in 256 counted (by a hash of the index or the first coordinate), so a
+// run shows each kind reaches the host where the game reads nothing past
+// them, at a small part of the draws' time. Keyed with the rest.
+void set_oob_control(bool on);
+bool oob_control();
+constexpr std::uint32_t kOobSlots = 4096, kOobKinds = 11;
+constexpr std::uint32_t kOobPastRecords = 0, kOobPastBinding = 1, kOobWalkPastRecords = 2;
+constexpr std::uint32_t kOobImageLoadSize = 3, kOobImageLoadLevel = 4, kOobImageLoadLayer = 5;
+constexpr std::uint32_t kOobImageStoreSize = 6, kOobImageStoreLayer = 7, kOobImageStoreLevel = 8;
+constexpr std::uint32_t kOobViewSmaller = 9, kOobViewLarger = 10;
+// The Vulkan stage a translation or lift with these options runs in.
+std::uint32_t vk_stage_of(const TranslateOptions& o);
+inline bool subgroup_ops_in(const TranslateOptions& o) { return (subgroup_stages() & vk_stage_of(o)) != 0; }
+
+// The ps_input_map entry of an input whose SPI_PS_INPUT_CNTL_n is `cntl`: the
+// param register OFFSET names (bits 0-4) or, with `defaults`, GCN's default
+// constant where OFFSET has bit 5 (TranslateOptions::kPsInputDefault |
+// DEFAULT_VAL, bits 8-9).
+inline std::uint8_t ps_input_map_entry(std::uint32_t cntl, bool defaults) {
+    if (defaults && (cntl & 0x20)) return static_cast<std::uint8_t>(TranslateOptions::kPsInputDefault | ((cntl >> 8) & 3));
+    return static_cast<std::uint8_t>(cntl & 0x1f);
+}
 
 struct TranslateResult {
     std::vector<std::uint32_t> spirv;
@@ -390,6 +552,20 @@ struct TranslateResult {
     // trace to user data.
     std::vector<ResourcePath> store_buffers;
     std::uint32_t untraced_stores = 0;
+    // The bases the program reads through the page table (the walked loads:
+    // vector memory loads through a V#, typed loads no binding serves, scalar
+    // loads through a V# or a 64-bit pointer): each path once, so the host can
+    // make what they reach GPU-visible before the program runs (window imports,
+    // gpu.cpp host_gpu_dispatch). A pointer's max_dw is the highest dword a
+    // load at a known offset reads past it (0: not known). untraced_reads
+    // counts walked load sites whose base does not trace to user data.
+    struct BufferRead {
+        ResourcePath path;
+        bool pointer = false;
+        std::uint32_t max_dw = 0;
+    };
+    std::vector<BufferRead> read_buffers;
+    std::uint32_t untraced_reads = 0;
     std::uint32_t unnormalized_samples = 0;  // MIMG unorm=1: texel coordinates
     // Page-table walks the shader keeps, by reason (a load's instruction and
     // why it is not a storage-buffer read): sites in the program.
@@ -399,6 +575,9 @@ struct TranslateResult {
     std::vector<std::uint32_t> ps_inputs;  // pixel stage: the inputs the shader reads (input k at location k without ps_input_map)
     int vs_clip_count = 0;
     bool vs_point_size = false;
+    // gcn::set_oob_count: the program's counters in the host's buffer (its
+    // four dwords from oob_slot x kOobKinds); kOobSlots when it counts nothing.
+    std::uint32_t oob_slot = kOobSlots;
     // Why the program needs the 64-lane subgroup GCN wrote it for (gcn/wave.h
     // kWave64*): 0 = a pixel shader that computes the same in a 32-lane one,
     // kWave64NotPixel for every other stage (not analysed) - and for a result
@@ -457,9 +636,10 @@ struct StageParams {
         // [0..4] as the draw's control points instead (kTess*).
         std::uint32_t vertex_formats[16];
         // TranslateOptions::gds_counters, a compute dispatch (no vertex input):
-        // the guest address of the word each of GDS dwords gds_base.. counts
-        // in, 0 for none - its ds_append / ds_consume then do nothing and
-        // return 0.
+        // the device address of the word each of GDS dwords gds_base.. counts
+        // in (the host's: the guest word's place in its import or in a
+        // device-local copy of its buffer), 0 for none - its ds_append /
+        // ds_consume then do nothing and return 0.
         std::uint64_t gds_counter[8];
     };
     // TessRole::Domain: the row of the domain shader's projection that gives

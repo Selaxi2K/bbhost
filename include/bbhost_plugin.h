@@ -1,4 +1,4 @@
-/* bbhost plugin API, version 10.
+/* bbhost plugin API, version 12.
  *
  * A plugin is a shared library (.so on Linux, .dll on Windows) in
  * <exe dir>/plugins or <data>/plugins. The host loads every one at start and
@@ -23,7 +23,10 @@
  *
  * Addresses are Binary Ninja's for the 1.09 eboot (the image at its preferred
  * base 0x400000). guest_addr() turns one into the runtime address; the read,
- * write, patch and hook calls take Binary Ninja addresses themselves.
+ * write, patch and hook calls take Binary Ninja addresses themselves. read()
+ * also takes the runtime address of any guest memory outside the image - the
+ * pointers a plugin reads out of the game's heaps. Under Windows the image
+ * may be slid (to 0x300000000), and the heaps lie below it as well as above.
  */
 #ifndef BBHOST_PLUGIN_H
 #define BBHOST_PLUGIN_H
@@ -35,7 +38,7 @@
 extern "C" {
 #endif
 
-#define BB_PLUGIN_API_VERSION 11
+#define BB_PLUGIN_API_VERSION 12
 
 #if defined(_WIN32)
 #define BB_PLUGIN_EXPORT __declspec(dllexport)
@@ -188,8 +191,9 @@ typedef struct BbHostApi {
     /* Runtime address of a Binary Ninja address, 0 when not the 1.09 build
      * or outside the image. */
     uint64_t (*guest_addr)(uint64_t bn_addr);
-    /* Copies n bytes at a Binary Ninja address (any mapped guest memory when
-     * the address is a runtime one above the image). 0 on success. */
+    /* Copies n bytes from a Binary Ninja address inside the image, or from a
+     * runtime address the guest has mapped (its heaps, above the image or,
+     * under Windows, below the slid image) or above the image. 0 on success. */
     int (*read)(uint64_t bn_addr, void* out, size_t n);
     /* Writes n bytes to a data page. 0 on success. */
     int (*write)(uint64_t bn_addr, const void* data, size_t n);
@@ -300,7 +304,8 @@ typedef struct BbHostApi {
     int (*param_ids)(const char* table, uint32_t* ids, size_t max, size_t* count);
     /* fn(block, user) on the main thread each time the player is placed in a
      * map - a load, a warp, a death, a lamp - with the block player_block
-     * packs, once the world holds them. */
+     * packs, once the world holds them: for a load, while its screen is
+     * still up (loading_screen, version 12). */
     int (*on_world_load)(void (*fn)(uint32_t block, void* user), void* user);
     /* The characters WorldChrMan holds: up to max into out, the total into
      * *count. From the main thread; the pointers are good until the next
@@ -375,6 +380,18 @@ typedef struct BbHostApi {
      * references moved, or -1 outside the image phase or for another eboot.
      * A string the code reaches some other way keeps its text. */
     int (*replace_text)(const BbText* texts, size_t count);
+
+    /* Version 12: the loading screen. */
+    /* 1 while a loading screen is up - the game's NowLoading request with no
+     * in-game frame run since, the host's own test, which its log's
+     * "loading:" lines come from - and 0 in the world, at the title and in
+     * its menus. The host reads it once a frame, after the on_frame
+     * callbacks: they see the frame before's. A plugin that moves the player
+     * waits for 0: on_world_load comes as soon as a load has built the
+     * player, with its screen still up, and a warp asked then lands before
+     * the world is ready, a lamp travel is refused once the load replaces
+     * the player. Any thread. */
+    int (*loading_screen)(void);
 } BbHostApi;
 
 #ifdef __cplusplus

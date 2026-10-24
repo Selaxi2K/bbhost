@@ -29,10 +29,11 @@ to run on a PC - it needs a place to live. bbhost provides that place:
 - **Graphics are being moved from emulation to native code.** The game's
   renderer was written for the PS4's GPU: it builds command buffers for an AMD
   GCN GPU and ships GCN shader programs. bbhost hooks FromSoftware's own
-  graphics layer instead, so draws are built directly from the engine's objects,
-  and decompiles the shaders to typed, structured SPIR-V. The
-  status table below shows what is native today and what still goes through
-  the emulated GPU command processor.
+  graphics layer instead, so draws, dispatches, clears and copies are built
+  directly from the engine's objects, and decompiles the shaders to typed,
+  structured SPIR-V, which it prints as HLSL for the player's PC to compile.
+  The status table below shows what is native today and what the GPU command
+  processor still emulates.
 - **Game functions are being rewritten as source**, one at a time, each checked
   against the original, so the game can be fixed and extended where a patch
   would not reach.
@@ -42,11 +43,11 @@ to run on a PC - it needs a place to live. bbhost provides that place:
 | | |
 |---|---|
 | ![Yharnam in 21:9](docs/images/yharnam-ultrawide.jpg) | **Any resolution, ultrawide included.** 21:9 and 32:9 with a wider field of view and the HUD where it belongs, and the resolution can be changed while playing. FSR 1 upscaling for slower GPUs. |
-| ![PC Graphics settings](docs/images/pc-graphics.jpg) | **Settings in the game's own menus.** The System menu gains PC Settings, PC Graphics, PC Effects, PC Controls, PC Camera and Key Bindings, drawn in the game's style: anti-aliasing, ambient occlusion, shadow distance, fog, motion blur, field of view, frame cap and more. |
+| ![PC Graphics settings](docs/images/pc-graphics.jpg) | **Settings in the game's own menus.** The System menu gains PC Settings, PC Graphics, PC Effects, PC Controls, PC Camera and Key Bindings, drawn in the game's style: anti-aliasing, ambient occlusion, shadow distance, fog, motion blur, field of view, frame rate and more. |
 
-- **60 fps**, with the game's timing corrected so physics, animation and
-  cutscenes run at the right speed. Higher frame caps keep the game's logic at
-  60.
+- **60 fps and beyond**: 30, 60, 90, 120 or uncapped, with the game's timing
+  corrected so physics, animation and cutscenes run at the right speed at each,
+  and its effects keeping the pace they have at 30 while they move smoothly.
 - **Keyboard and mouse**: mouse camera, a pointer in every menu, rebindable
   keys, and button prompts that show the keys.
 - **PC enhancements** that can be switched off for the game as it shipped: the
@@ -57,7 +58,8 @@ to run on a PC - it needs a place to live. bbhost provides that place:
 - **Online play** through a private server: co-op, invasions, messages,
   bloodstains and summon signs between bbhost players.
 - **Mods** without touching the game files: replacement files, param tables
-  edited by field name, byte patches as data, and native plugins - a
+  edited by field name, byte patches as data (the community's among them, each
+  with a switch in the setup window), and native plugins - a
   randomizer (items, shops and enemies), a boss rush, gameplay mutators and
   the developers' own debug menu ship with it.
 - **A setup window** that finds and checks your game files, and the Steam Deck
@@ -79,21 +81,29 @@ sessions. What runs on native code and what is still emulated:
 | Draws | native: each draw is built from the engine's graphics objects; the command buffer only marks its place in the stream |
 | Post-processing (YEBIS) | native: every stage's resources built by bbhost |
 | Tessellation | native: the host GPU's own tessellation stages, all three stages lifted; the game's mesh hulls draw as one native pipeline, without the PS4's on-chip ring |
-| Shaders | decompiled ("lifted") from GCN to typed, structured SPIR-V when the game creates them: every shader the game ships except compute (3,206 of 3,209 pixel shader programs, all vertex and tessellation programs; 100% of draws at the 12 measured places, see [docs/rendering.md](docs/rendering.md#shader-lifting)). Compute shaders and the few programs the lifter refuses are still translated by bbhost's GCN compiler |
+| Shaders | decompiled ("lifted") from GCN to typed, structured SPIR-V when the game creates them, every stage: 3,206 of the 3,209 pixel shader programs, all the vertex, tessellation and compute programs in the game's bundles, and the GPU particles' geometry shaders; 100% of the draws and dispatches at the 12 measured places (see [docs/rendering.md](docs/rendering.md#shader-lifting)). The lifts are printed as HLSL and compiled with DXC on the player's PC, behind the game; the few programs the lifter refuses are translated by bbhost's GCN compiler |
 | Frame pacing | native: the game's frame-time manager runs as bbhost source; 30, 60, 90, 120 or uncapped, with the game's per-frame steps following real time |
-| Compute dispatches, labels, fences | still emulated: run through bbhost's command processor, which walks the game's PM4 command buffers; GPU particle counters are kept natively, as per-buffer counters |
-| Texture memory | the game's tiled textures are detiled on the GPU; changes are tracked by watching the game's writes |
+| Compute dispatches, clears, copies | native: built from the engine's calls, like the draws; the command processor puts them in order from host command lists recorded per command buffer |
+| Labels and fences | still emulated: recorded by the command processor and written by the host once their submission has run (GPU fills on Windows for now); GPU particle counters are kept natively, as per-buffer counters |
+| Textures and buffers | the game's tiled textures are detiled on the GPU; textures belong to the engine's own objects (GX's, YEBIS's, Scaleform's), and vertex and index data is told by GX's calls; only memory no call tells of is tracked by watching the game's writes |
 
 Known issues:
 
-- Compute work still goes through the emulated command processor, and the
-  game's GPU-visible memory (about 5 GB) stays imported into Vulkan, because
-  some shaders still read it through page-table walks.
+- On a GPU of its own and under Linux, the game's GPU-visible memory (about
+  4 GB in the world) is still imported into Vulkan whole, because some shaders
+  read it through a page table; an integrated GPU under Windows and the Steam
+  Deck kit import it a window at a time. Windows counts the imported memory as
+  the process's shared GPU memory (see [docs/running.md](docs/running.md)).
 - A new GPU particle system's counter can start uninitialized; bbhost clamps
   such a dispatch to nothing rather than hang.
-- Slow poison runs twice as fast at 60 fps.
-- A new area compiles its pipelines on first sight, which can cause short
-  hitches the first time it is visited.
+- Status effects with a 0.1 s tick run slightly slow above 30 fps, never fast;
+  slow poison keeps real time.
+- A place that neither an earlier run nor the release's pipeline list has
+  drawn compiles some of its pipelines when they first come into view, which
+  can cause short hitches. Every pipeline drawn is remembered, and later
+  starts build the remembered ones and the list's while the title is up (or
+  all at once with Compile shaders now in the setup window), so what has been
+  seen before does not compile again.
 - About one in four first summons fail and have to be repeated.
 - The cause of a GPU hang reported on an AMD RX 580 (Polaris) under Windows is
   not yet known.
@@ -160,16 +170,16 @@ patches/         byte patches as data
 res/             the Windows exe's icon and version details
 tests/           unit tests (ctest)
 tools/           shader tools, format tools, test drivers and packaging scripts
-third_party/     LibAtrac9, Dear ImGui, Monocypher
+third_party/     LibAtrac9, Dear ImGui, Monocypher, and the licences of the DXC the packages carry
 ```
 
 ## Roadmap
 
-- **Graphics, native throughout**: compute dispatches, clears and copies built
-  from the engine's objects like the draws, so the PM4 command processor can be
-  retired; resources identified by the engine's own objects rather than guest
-  addresses; compute shaders lifted too; the lifted SPIR-V emitted as HLSL and
-  compiled with DXC.
+- **Graphics, native throughout**: the completions the game waits on taken
+  from the host's own submission timeline rather than labels, so the PM4
+  command processor only orders work; and the game's memory off the GPU -
+  copy sources through staging, the buffers the GPU writes held by the host -
+  so it no longer has to be imported whole.
 - **Decompilation**: more of the engine rewritten as source, starting with the
   systems mods and fixes need most.
 - **Performance**: a steady 60 fps everywhere on mid-range hardware, and
@@ -192,12 +202,14 @@ game's code or data.
 ## Acknowledgements
 
 - Community work bbhost builds on: illusion's Skip Intro, Lance McDonald's
-  Restore Debug Camera and Kyo's The Old Hunters patch (shipped as patch
-  files), and Kyo's 60 FPS++ timing list (built into the frame-rate code).
+  Restore Debug Camera, stagvant's Restore Debug Dash, and Kyo's The Old
+  Hunters patch and his graphics and gameplay patches (shipped as patch files),
+  and Kyo's 60 FPS++ timing list and yogesh1239's high-FPS fixes (built into
+  the frame-rate code).
 - [shadPS4](https://github.com/shadps4-emu/shadPS4), a reference for the PS4's
   system behaviour and a working run to compare against.
-- SDL3, Vulkan, FFmpeg, SPIRV-Tools, LibAtrac9, Dear ImGui, Monocypher and
-  AMD FidelityFX Super Resolution 1.
+- SDL3, Vulkan, FFmpeg, SPIRV-Tools, the DirectX Shader Compiler (DXC),
+  LibAtrac9, Dear ImGui, Monocypher and AMD FidelityFX Super Resolution 1.
 - Thanks to the many contributors and testers, incomplete and in no 
   particular order: Metr1k, Kyo, Schorched Knight, ancat, Nox-, Astrelle, 
   BlitzWOLF, CrunchyCheese, foxyhooligans, gkberk, sen, Ultra, droogie

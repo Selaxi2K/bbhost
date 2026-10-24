@@ -155,7 +155,7 @@ void note_time() {
     std::uint64_t ts[2] = {};
     if (vkGetQueryPoolResults(g.device, g_fsr.queries, 0, 2, sizeof(ts), ts, sizeof(ts[0]), VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) return;
     g_fsr.total_us += static_cast<double>(ts[1] - ts[0]) * g.timestamp_period_ns / 1000.0;
-    if (++g_fsr.frames % 300 == 0) {
+    if (++g_fsr.frames % 300 == 0 && host_tooling()) {
         host_log("present: FSR 1 took %.2f ms of GPU time a frame (%ux%u)", g_fsr.total_us / 300.0 / 1000.0, g_fsr.width, g_fsr.height);
         g_fsr.total_us = 0;
     }
@@ -185,6 +185,7 @@ bool make_target(Target& t, std::uint32_t w, std::uint32_t h, VkImageUsageFlags 
     VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     mai.allocationSize = req.size;
     mai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    MemOwner own_mem("FSR images");
     if (mai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(g.device, &mai, nullptr, &t.memory) != VK_SUCCESS) return false;
     vkBindImageMemory(g.device, t.image, t.memory, 0);
     VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};

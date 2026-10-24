@@ -24,6 +24,15 @@
 
 #define BBHOST_CONFIG_VERSION BBHOST_VERSION
 
+// tests/config_test.cpp's mutants of the play-log migration (CONFIG_MUTANTS
+// there only).
+#ifdef CONFIG_MUTANTS
+int g_config_mutant = 0;
+#define CONFIG_MUTANT(n) (g_config_mutant == (n))
+#else
+#define CONFIG_MUTANT(n) false
+#endif
+
 namespace {
 
 HostConfig g_cfg;
@@ -156,10 +165,15 @@ void apply_values(const std::map<std::string, std::string>& kv, HostConfig* c) {
     str("video.resolution", &c->resolution);
     str("video.window_mode", &c->window_mode);
     str("video.model_detail", &c->model_detail);
+    str("video.shaders", &c->shaders);
     num("video.vblank_hz", &c->vblank_hz);
     {
         auto it = kv.find("startup.setup_window");
         if (it != kv.end()) c->setup_always = it->second == "true" || it->second == "1";
+    }
+    {
+        auto it = kv.find("debug.tooling");
+        if (it != kv.end()) c->tooling = it->second == "true" || it->second == "1";
     }
     {
         auto it = kv.find("startup.skip_intro");
@@ -470,6 +484,34 @@ void move_ime_to_type(const std::string& path) {
              path.c_str());
 }
 
+// The play log went out every 5 s, the default bbhost.example.toml spelled
+// out, until the server asked for 30 s or more (every upload is a file it
+// keeps). A 5 in the per-user file below config_version 5 is that copy (the
+// first-start template never wrote the key): it is rewritten to 30, so the
+// file shows what is in effect and the setup window's next save, which writes
+// the version, finds nothing to bless.
+void move_playlog_to_default(const std::string& path) {
+    std::map<std::string, std::string> kv;
+    std::string err;
+    if (!parse_file(path, &kv, &err)) return;
+    const auto get = [&](const std::string& k) {
+        auto it = kv.find(k);
+        return it == kv.end() ? std::string() : unquote(it->second);
+    };
+    const std::string ver = get("bbhost.config_version");
+    const int version = ver.empty() ? 1 : std::atoi(ver.c_str());
+    if (CONFIG_MUTANT(1) ? version > 5 : version >= 5) return;
+    if (get("online.playlog_upload_seconds") != "5") return;
+    if (CONFIG_MUTANT(2)) return;
+    if (!config_set_values(path, {{"online", "playlog_upload_seconds", "30"}})) {
+        host_log("config: could not set online.playlog_upload_seconds to 30 in %s", path.c_str());
+        return;
+    }
+    host_log("config: %s: online.playlog_upload_seconds was the old example's 5; set to 30, the default now (the "
+             "server keeps every upload as a file)",
+             path.c_str());
+}
+
 // A bbhost.toml from before the per-user config (beside an older package's
 // exe, or in the working directory) that names the game: copied to the user
 // config once, its relative paths made absolute - the saves stay where they
@@ -598,6 +640,7 @@ bool config_load(int argc, char** argv, HostConfig* out, std::string* error) {
         upgrade_user_config(user_cfg);
         move_live_server_to_https(user_cfg);
         move_ime_to_type(user_cfg);
+        move_playlog_to_default(user_cfg);
     }
     std::map<std::string, std::string> merged;
     std::string layers;
@@ -622,6 +665,20 @@ bool config_load(int argc, char** argv, HostConfig* out, std::string* error) {
             const int v = ver == kv.end() ? 1 : std::atoi(unquote(ver->second).c_str());
             if (v < 2 && kv.erase("startup.setup_window"))
                 host_log("config: %s is from an older bbhost: its setup_window is set aside until the setup window saves it", f.c_str());
+        }
+        {
+            // The old example's play-log period in a file bbhost does not
+            // rewrite (beside the exe, --config), or a per-user one it could
+            // not: set aside below version 5 (move_playlog_to_default).
+            auto ver = kv.find("bbhost.config_version");
+            const int v = ver == kv.end() ? 1 : std::atoi(unquote(ver->second).c_str());
+            auto it = kv.find("online.playlog_upload_seconds");
+            if (v < 5 && it != kv.end() && unquote(it->second) == "5" && !CONFIG_MUTANT(3)) {
+                kv.erase(it);
+                host_log("config: %s: online.playlog_upload_seconds = 5 was the old example's; set aside, the default "
+                         "%d s stands (config_version 5 in the file keeps a 5)",
+                         f.c_str(), HostConfig{}.playlog_upload_seconds);
+            }
         }
         for (auto& [k, v] : kv) merged[k] = v;
         layers += (layers.empty() ? "" : " <- ") + f;
@@ -730,8 +787,15 @@ bool config_load(int argc, char** argv, HostConfig* out, std::string* error) {
         if (std::strcmp(e, "1") == 0) c.setup_always = true;
         else if (std::strcmp(e, "0") == 0) c.setup_always = false;
     }
+    if (const char* e = std::getenv("BBHOST_TOOLING")) {
+        if (std::strcmp(e, "1") == 0) c.tooling = true;
+        else if (std::strcmp(e, "0") == 0) c.tooling = false;
+    }
     if (const char* e = std::getenv("BBHOST_IME")) {
         if (std::strcmp(e, "type") == 0 || std::strcmp(e, "auto") == 0) c.ime_mode = e;
+    }
+    if (const char* e = std::getenv("BBHOST_PLAYLOG_UPLOAD_SECONDS"); e && *e && !CONFIG_MUTANT(4)) {
+        c.playlog_upload_seconds = std::atoi(e);
     }
     g_cfg = c;
     *out = c;
@@ -1069,4 +1133,16 @@ void config_value_set(const std::string& key, const std::string& raw) { g_values
 std::string config_value(const std::string& key) {
     auto it = g_values.find(key);
     return it == g_values.end() ? std::string() : unquote(it->second);
+}
+
+std::string config_effect_steps() {
+    if (const char* e = std::getenv("BBHOST_SFX_STEP"); e && *e) return e;
+    const std::string v = config_value("video.effect_steps");
+    return v.empty() ? "smooth" : v;
+}
+
+std::string config_effect_emission() {
+    if (const char* e = std::getenv("BBHOST_SFX_EMISSION"); e && *e) return e;
+    const std::string v = config_value("video.effect_emission");
+    return v.empty() ? "60" : v;
 }

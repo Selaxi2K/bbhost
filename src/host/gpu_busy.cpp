@@ -25,7 +25,15 @@
 // inside its command buffer (barriers draining, a pass waiting on the last);
 // the GPU is ours there too, as Windows would count it. Not counted: the
 // buffer shadow's upload command buffer that goes in the same submission
-// ahead of the game's (off on integrated GPUs) and the start-up one-shots.
+// ahead of the game's (off on integrated GPUs) - counted since an RTX 5080's
+// log read 64% here while Task Manager's 3D engine sat at 100%: its per-draw
+// vertex copies, 9-37 MiB a frame from host memory, ran there - and the
+// start-up one-shots. The uploads go in the same submission just ahead of the
+// game's command buffer, timed by a third timestamp they write, and count as a
+// source of their own (kUpload): the total is the union of all of them, the
+// game's figure is its command buffers alone, and the frame statistics say
+// the uploads' part (`gpu uploads N ms/s`) - so a build that counts them
+// compares with one that did not.
 // The presenter's blit waits for the swapchain image's semaphore; AMD's,
 // NVIDIA's and Mesa's drivers wait for a submission's semaphores before its
 // command buffers start, so its span does not hold the display's wait - and
@@ -72,7 +80,16 @@ namespace gpu {
 
 namespace {
 
-constexpr int kGame = 0, kPresenter = 1, kSources = 2;
+constexpr int kGame = 0, kPresenter = 1, kUpload = 2, kSources = 3;
+// The buffer shadow's uploads, ahead of the game's command buffer in the same
+// submission: a source of their own, so the game's figure is its command
+// buffers alone (what it was before the uploads were counted, 5d96724) and the
+// uploads have theirs; the union over all of them is what they add together.
+// BBHOST_BUSY_UPLOADS=0 leaves them out (the meter as it was: a measurement).
+const bool g_count_uploads = [] {
+    const char* e = std::getenv("BBHOST_BUSY_UPLOADS");
+    return !(e && e[0] == '0');
+}();
 // Spans held for order before the oldest are counted regardless: about a
 // second of command buffers at 60 frames a second.
 constexpr std::size_t kMaxPending = 1024;
@@ -188,7 +205,7 @@ VkQueryPool make_pair_pool() {
     VkQueryPoolCreateInfo qci{};
     qci.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
     qci.queryType = VK_QUERY_TYPE_TIMESTAMP;
-    qci.queryCount = 2;
+    qci.queryCount = 3;  // the pair, and the game's slots' upload start
     VkQueryPool pool = VK_NULL_HANDLE;
     if (vkCreateQueryPool(g.device, &qci, nullptr, &pool) != VK_SUCCESS) return VK_NULL_HANDLE;
     return pool;  // reset by each command buffer that writes it, before its first timestamp
@@ -204,8 +221,13 @@ bool read_pair(VkQueryPool pool, std::uint64_t (&ts)[2]) {
 
 void busy_init_locked() {
     g.busy = false;
-    if (const char* e = std::getenv("BBHOST_GPU_BUSY"); e && e[0] == '0') {
+    const char* e = std::getenv("BBHOST_GPU_BUSY");
+    if (e && e[0] == '0') {
         host_log("gpu: busy meter off (BBHOST_GPU_BUSY=0)");
+        return;
+    }
+    if (!host_tooling() && !(e && e[0] == '1')) {
+        host_log("gpu: busy meter off (tooling off; BBHOST_GPU_BUSY=1 turns it on)");
         return;
     }
     std::uint32_t nq = 0;
@@ -254,6 +276,7 @@ void busy_begin_locked(Gpu::Slot& sl) {
     // goes as unreadable.
     if (sl.busy_written) deliver(kGame, 0, 0, false);
     sl.busy_written = false;
+    sl.busy_upload = false;
     if (!g.busy || !sl.busy_pool) return;
     // Outside any render pass: nothing is recorded yet.
     if (stream_on()) {
@@ -273,6 +296,15 @@ void busy_end_locked(Gpu::Slot& sl) {
         vkCmdWriteTimestamp(g.cmd_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, sl.busy_pool, 1);
     }
     sl.busy_written = true;
+}
+
+// The buffer shadow's upload command buffer as it begins (buffer_shadow.cpp,
+// upload_cmd_locked): its start is the span's start when the slot retires.
+void busy_upload_begin_locked(Gpu::Slot& sl, VkCommandBuffer cmd) {
+    if (!g.busy || !sl.busy_pool || !cmd) return;
+    vkCmdResetQueryPool(cmd, sl.busy_pool, 2, 1);
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, sl.busy_pool, 2);
+    sl.busy_upload = true;
 }
 
 void busy_submitted_locked(Gpu::Slot& sl) {
@@ -305,6 +337,14 @@ void busy_retired_locked(Gpu::Slot& sl, bool ok) {
     sl.busy_written = false;
     std::uint64_t ts[2] = {0, 0};
     const bool have = ok && read_pair(sl.busy_pool, ts);
+    if (have && sl.busy_upload && g_count_uploads) {
+        std::uint64_t up = 0;
+        if (vkGetQueryPoolResults(g.device, sl.busy_pool, 2, 1, sizeof(up), &up, sizeof(up), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS &&
+            ((up - ts[0]) & g_meter.mask) > (g_meter.mask >> 1)) {  // earlier than the game's start, wrap-aware
+            deliver(kUpload, up, ts[0], true);  // the uploads, up to where the game's command buffer starts
+        }
+    }
+    sl.busy_upload = false;
     deliver(kGame, ts[0], ts[1], have);
 }
 
@@ -343,6 +383,7 @@ GpuBusy host_gpu_busy() {
     b.busy_ns = static_cast<std::uint64_t>(static_cast<double>(g_meter.busy) * k);
     b.game_ns = static_cast<std::uint64_t>(static_cast<double>(g_meter.src_busy[kGame]) * k);
     b.present_ns = static_cast<std::uint64_t>(static_cast<double>(g_meter.src_busy[kPresenter]) * k);
+    b.upload_ns = static_cast<std::uint64_t>(static_cast<double>(g_meter.src_busy[kUpload]) * k);
     b.cmdbufs = g_meter.spans[kGame];
     b.presents = g_meter.spans[kPresenter];
     return b;
@@ -368,10 +409,11 @@ std::string host_gpu_busy_report() {
         const double ms = static_cast<double>(now.busy_ns - last.busy_ns) / 1e6 / secs;
         char buf[320];
         std::snprintf(buf, sizeof(buf),
-                      "gpu busy: %.1f%% of %.1f s (%.0f ms/s; the game's command buffers %.0f ms/s, the presenter's %.1f ms/s; "
-                      "%llu command buffers, %llu presents; unreadable %llu, merged early %llu)",
+                      "gpu busy: %.1f%% of %.1f s (%.0f ms/s; the game's command buffers %.0f ms/s, the presenter's %.1f ms/s, "
+                      "the buffer shadow's uploads %.1f ms/s%s; %llu command buffers, %llu presents; unreadable %llu, merged early %llu)",
                       ms / 10.0, secs, ms, static_cast<double>(now.game_ns - last.game_ns) / 1e6 / secs,
                       static_cast<double>(now.present_ns - last.present_ns) / 1e6 / secs,
+                      static_cast<double>(now.upload_ns - last.upload_ns) / 1e6 / secs, g_count_uploads ? "" : " (not counted: BBHOST_BUSY_UPLOADS=0)",
                       static_cast<unsigned long long>(now.cmdbufs - last.cmdbufs),
                       static_cast<unsigned long long>(now.presents - last.presents), static_cast<unsigned long long>(unreadable),
                       static_cast<unsigned long long>(early));

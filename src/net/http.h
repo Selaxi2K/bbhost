@@ -6,6 +6,7 @@
 
 #include "replay/json.h"
 
+#include <functional>
 #include <string>
 
 namespace net {
@@ -14,7 +15,23 @@ struct HttpResult {
     long status = 0;      // HTTP status, 0 when the transport failed
     std::string body;
     std::string error;    // transport error text, empty on success
+    bool abandoned = false;  // HttpCall::abandon ended it
     bool ok() const { return error.empty() && status >= 200 && status < 300; }
+};
+
+// A request with its own limits, for the one that waits (the event poller's
+// long poll, net/session.cpp); every other request is a timeout alone.
+struct HttpCall {
+    int timeout_ms = 5000;  // the whole exchange
+    // The connection within it - name lookup, TCP, TLS - apart from the wait
+    // for the answer; 0: timeout_ms, as for every other request.
+    int connect_ms = 0;
+    // Asked about once a second while the request is out; true gives it up.
+    std::function<bool()> abandon;
+    // The calling thread's own connection, kept open for its next request
+    // that sets this too (HTTP keep-alive), instead of a new connection and
+    // TLS handshake every time.
+    bool keep_connection = false;
 };
 
 // online.np_server from the config, else "<online.scheme>://<online.host>:18671".
@@ -33,6 +50,10 @@ HttpResult http_post_json(const std::string& url, const json::Value& body, int t
 // that is not JSON; `out` holds the parsed object on success.
 bool np_post(const std::string& path, const json::Value& body, json::Value& out, std::string& error,
              int timeout_ms = 5000);
+// The same with a call's own limits; `status` gets the HTTP status (0: no
+// answer came). A request `call.abandon` gave up is not logged as a failure.
+bool np_post(const std::string& path, const json::Value& body, json::Value& out, std::string& error,
+             const HttpCall& call, long* status = nullptr);
 bool np_get(const std::string& path, json::Value& out, std::string& error, int timeout_ms = 5000);
 
 // Reads that never throw: the member or a default.

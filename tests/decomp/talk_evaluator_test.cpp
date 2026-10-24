@@ -54,12 +54,43 @@ using u64 = std::uint64_t;
 const char* const kTest = "decomp_talk_evaluator";
 
 // ---- The allocator the strings come from, and its record ----
+//
+// Its memory is an arena in one 4 GiB-aligned window, started over for each
+// case: both states' strings have the same high 32 bits. A string's address
+// outlives it in the slots it leaves - an int or a float is written 4 bytes
+// at a time, so a slot that held a string keeps its pointer's high half
+// (decomp/talk/evaluator.h) - and the environment logs and hashes a call's
+// values in full. From the process heap, which lies anywhere modulo 4 GiB,
+// the two states' strings could fall either side of a 4 GiB line, and the
+// same expression then gave its two runs different high halves to log.
 
 struct Heap {
     std::vector<void*> live;  // in allocation order
     std::vector<void*> freed;
 };
 Heap* g_heap = nullptr;  // the run's
+
+struct Arena {
+    std::uint8_t* base = nullptr;
+    std::size_t size = 0, used = 0;
+} g_arena;
+
+void arena_init() {
+    constexpr std::uint64_t kWindow = 1ull << 32;
+    constexpr std::size_t kSize = std::size_t{256} << 20;
+    void* r = mmap(nullptr, 2 * kWindow, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (r == MAP_FAILED) {
+        std::printf("decomp_talk_evaluator: no address space for the strings' arena\n");
+        std::exit(1);
+    }
+    auto* base = reinterpret_cast<std::uint8_t*>((reinterpret_cast<u64>(r) + kWindow - 1) & ~(kWindow - 1));
+    if (mprotect(base, kSize, PROT_READ | PROT_WRITE) != 0) {
+        std::printf("decomp_talk_evaluator: the strings' arena could not be made writable\n");
+        std::exit(1);
+    }
+    g_arena.base = base;
+    g_arena.size = kSize;
+}
 
 struct Allocator {
     void** vtable;
@@ -72,8 +103,14 @@ GUEST_ABI void* alloc_flags(void* out, Allocator*, int) {
     return out;
 }
 GUEST_ABI void* alloc_get(Allocator*, u64 size, u64 align) {
-    void* p = nullptr;
-    if (posix_memalign(&p, align < 16 ? 16 : align, size ? size : 1) != 0) return nullptr;
+    const u64 a = align < 16 ? 16 : align;
+    const u64 at = (g_arena.used + a - 1) & ~(a - 1);
+    if (at + (size ? size : 1) > g_arena.size) {
+        std::printf("decomp_talk_evaluator: one case's strings overran their arena (%zu bytes)\n", g_arena.size);
+        std::abort();
+    }
+    void* p = g_arena.base + at;
+    g_arena.used = at + (size ? size : 1);
     std::memset(p, 0xcd, size);
     g_heap->live.push_back(p);
     return p;
@@ -412,8 +449,7 @@ void check(const std::vector<u8>& code, u64 seed) {
         const Value rb = run(*b, false, code.data());
         ++g_cases;
         if (!compare(*a, ra, *b, rb, code)) ++g_bad;
-        for (void* q : a->heap.live) std::free(q);
-        for (void* q : b->heap.live) std::free(q);
+        g_arena.used = 0;  // both states' strings, freed or not
         delete a;
         delete b;
     }
@@ -633,6 +669,7 @@ std::vector<std::vector<u8>> corpus(int* scripts) {
 
 int main() {
     eboot_kit::load(kTest);
+    arena_init();
     // The fixes the image needs outside the game: strings' heap lookup and wcslen.
     fill_traps(std::make_integer_sequence<int, 32>{});
     g_alloc_vtable[4] = reinterpret_cast<void*>(&alloc_flags);   // +0x20

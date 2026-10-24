@@ -87,7 +87,8 @@ For each place the report says:
   the GPU's busy time (bbhost's busy meter, not `BBHOST_GPU_PROFILE`, which
   changes how draws are recorded), the main loop's work, the CPU, the draws by
   how their pixel shader ran - lifted, translated, the page-table fallback's
-  translation, none - and the draw failures by reason;
+  translation, none - and the draw failures by reason, and the compute
+  dispatches by how their shader ran, lifted or translated;
 - on arrival (the travel and the settle): the loads, pipeline compiles over
   30 ms, flip stalls over 40 ms, main-loop frames over 33 ms, and the pixel
   shaders met for the first time there, lifted or not and why;
@@ -155,7 +156,7 @@ These are for test runs and off by default.
 |---|---|
 | `BBHOST_FRAME_DETAIL=1` | with `BBHOST_FRAME_STATS=1`: after each second's `frames:` line, the second's draws by how their pixel shader ran, its draw failures and every flip interval |
 | `BBHOST_TEST_WARP=1` | lets plugins move the player (the probe) |
-| `BBHOST_TEST_REQUESTS=<dir>` | the game carries out requests a harness leaves there: a frame dump, a capture budget |
+| `BBHOST_TEST_REQUESTS=<dir>` | the game carries out requests a harness leaves there: a frame dump, a sequence of consecutive frames (`dumpseq <dir> <n>`: the next n flips, one file each), a capture budget |
 | `BBHOST_CAPTURE_DRAW=*ps` | a draw capture of the first draw of each pixel shader |
 | `BBHOST_CAPTURE_ARMED=1` | captures only while a request has allowed them |
 

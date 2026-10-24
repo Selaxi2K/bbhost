@@ -104,8 +104,25 @@ def area_lines(area, t, block, window_intervals, view=None, settle_events=(), du
 
 class TourTest(unittest.TestCase):
     def test_places_and_views(self):
-        self.assertEqual(len(ac.AREAS), 12)
-        self.assertEqual(len({a.id for a in ac.AREAS}), 12)
+        self.assertEqual(len(ac.AREAS), 16)
+        self.assertEqual(len({a.id for a in ac.AREAS}), 16)
+        # Cainhurst: the roof lamp is the arrival cutscene and says so; the courtyard's lamp is play, with the flag
+        # that skips that cutscene - set by the travel, so it comes after the roof in the list. The roof's travel
+        # turns that flag off, so the cutscene plays whatever the save says.
+        roof, court = ac.AREA_BY_ID["cainhurst-roof"], ac.AREA_BY_ID["cainhurst-courtyard"]
+        self.assertEqual((roof.return_point, roof.flags, roof.flags_off), (2502951, (), (12500000,)))
+        self.assertIn("cutscene", roof.name)
+        self.assertEqual((court.return_point, court.flags, court.flags_off), (2502950, (12500000,), ()))
+        ids = [a.id for a in ac.AREAS]
+        self.assertLess(ids.index("cainhurst-roof"), ids.index("cainhurst-courtyard"))
+        self.assertEqual(roof.as_dict()["flags_off"], [12500000])
+        lines = ac.tour([roof, court], dict(ac.DEFAULTS), "perf").splitlines()
+        self.assertEqual([l for l in lines if l.startswith("travel ")],
+                         ["travel 2502951 19000000 cainhurst-roof 12500000=0",
+                          "travel 2502950 19000000 cainhurst-courtyard 12500000"])
+        # The flag goes with the travel, the place's first step, which a failed travel before it skips to.
+        self.assertTrue(lines[lines.index("# cainhurst-roof: " + roof.name) + 1].startswith("travel 2502951 "))
+        self.assertNotIn("flags", "\n".join(l for l in lines if not l.startswith("#")).split())
         cy = ac.AREA_BY_ID["central-yharnam"]
         self.assertEqual(cy.block_hex(), "18010000")
         self.assertIsNone(cy.view())
@@ -172,11 +189,75 @@ class TourTest(unittest.TestCase):
         k = lines.index("mark central-yharnam:measure")
         self.assertEqual(lines[k + 1], "hold %.1f" % ac.DEFAULTS["measure"])
         self.assertEqual(lines[k + 2], "mark central-yharnam:measured")
+        # The settle waits frames past the loading screen too: a slow renderer's fade-out outlasts the seconds.
+        k = lines.index("hold %.1f" % ac.DEFAULTS["settle"])
+        self.assertEqual(lines[k + 1], "flips %d" % ac.DEFAULTS["settle_flips"])
+        self.assertLess(k + 1, lines.index("mark central-yharnam:measure"))
+        self.assertNotIn("flips", ac.tour(areas, dict(ac.DEFAULTS, settle_flips=0), "perf"))
+        self.assertIn("flips 60\ncapture 6 central-yharnam", ac.tour(areas[:1], dict(ac.DEFAULTS), "capture"))
         # A standpoint's warp comes right after the travel, as a fog wall's does.
         text = ac.tour(ac.pick_areas("laurence-staircase"), dict(ac.DEFAULTS), "perf")
         x, y, z, yaw = ac.AREA_BY_ID["laurence-staircase"].view()
         self.assertIn("travel 3402950 22000000 laurence-staircase\nwarp laurence-staircase:view %.3f %.3f %.3f %.4f 1.0\n"
                       % (x, y, z, yaw), text)
+
+    def test_chalice_place(self):
+        """A chalice place fills its altar slot before its travel, keeps its
+        enemies (no quiet; the player hidden and kept alive there, undone after
+        it - and again after the next place's travel, which a failed travel
+        skips to) and turns the camera after each extra view's warp."""
+        a = ac.AREA_BY_ID["chalice-aynbgu4m"]
+        self.assertNotIn(a, ac.AREAS)  # 'all' leaves it out
+        self.assertTrue(a.enemies)
+        self.assertTrue(a.as_dict()["enemies"])
+        text = ac.tour(ac.pick_areas("chalice-aynbgu4m,central-yharnam"), dict(ac.DEFAULTS), "perf")
+        lines = text.splitlines()
+        k = lines.index("chalice 1d140001 6 chalice-aynbgu4m")
+        self.assertIn("bits 94600128 32 00001838", lines[:k])  # slot 6's config id (6200) at +0x80
+        self.assertEqual(lines[k + 1], "god hide")
+        self.assertTrue(lines[k + 2].startswith("warp chalice-aynbgu4m:view 110.500 33.000 52.000 3.1416 "))
+        end = lines.index("mark chalice-aynbgu4m:end")
+        self.assertFalse([l for l in lines[k:end] if l.startswith("quiet")])
+        self.assertEqual(lines[end - 1], "god off")
+        for name in ("room-south", "hall"):
+            w = next(i for i, l in enumerate(lines) if l.startswith("warp chalice-aynbgu4m:%s " % name))
+            self.assertEqual(lines[w + 1], "camera")
+            self.assertIn("dump chalice-aynbgu4m-%s" % name, lines[w:w + 5])
+        # The Evil Labyrinth Spirit fades in and out: a timeline of five frames 2.5 s apart; its F12 only when the run
+        # asks for the views' F12s.
+        w = next(i for i, l in enumerate(lines) if l.startswith("warp chalice-aynbgu4m:spirit "))
+        self.assertEqual(lines[w + 1], "camera")
+        self.assertEqual([l for l in lines[w:end] if l.startswith("dump")], ["dump chalice-aynbgu4m-spirit-%d" % k for k in range(1, 6)])
+        self.assertEqual(lines[w:end].count("hold 2.5"), 4)
+        self.assertFalse([l for l in lines if l.startswith("f12")])
+        with_f12 = ac.tour(ac.pick_areas("chalice-aynbgu4m"), dict(ac.DEFAULTS, f12_looks=True), "perf").splitlines()
+        self.assertEqual([l for l in with_f12 if l.startswith("f12")], ["f12 chalice-aynbgu4m-spirit"])
+        self.assertLess(with_f12.index("f12 chalice-aynbgu4m-spirit"), with_f12.index("god off"))
+        self.assertGreater(ac.pass_budget([a], dict(ac.DEFAULTS, f12_looks=True), "perf"), ac.pass_budget([a], dict(ac.DEFAULTS), "perf"))
+        self.assertEqual(a.as_dict()["looks"][2], ["spirit", 53.5, 39.0, -33.0, 0.0, {"dumps": 5, "gap": 2.5, "f12": True}])
+        t = lines.index("travel 2412951 18010000 central-yharnam")
+        self.assertEqual(lines[t + 1], "god off")
+        self.assertIn("quiet %.0f" % ac.DEFAULTS["quiet"], lines[t:])
+        # A tour without such a place has no god steps.
+        self.assertNotIn("god", ac.tour(ac.pick_areas("central-yharnam,moonside-lake"), dict(ac.DEFAULTS), "perf"))
+
+    def test_rom_water_place(self):
+        """Rom's arena in the lake's water: moonside-lake's travel and doors, the
+        warp down into the water, the enemies kept, and the feet view with the
+        camera held looking down (released before the god step is undone)."""
+        a = ac.AREA_BY_ID["rom-water"]
+        self.assertNotIn(a, ac.AREAS)
+        self.assertTrue(a.enemies)
+        lines = ac.tour([a], dict(ac.DEFAULTS, f12_looks=True), "perf").splitlines()
+        self.assertEqual(lines[2:5], ["travel 3202950 20000000 rom-water 13200040 13200120", "god hide",
+                                      "warp rom-water:view -508.000 -270.500 378.000 1.0210 1.0"])
+        self.assertFalse([l for l in lines if l.startswith("quiet")])
+        w = lines.index(next(l for l in lines if l.startswith("warp rom-water:feet ")))
+        self.assertEqual(lines[w + 1:w + 3], ["camera", "pitch 0.9000"])
+        self.assertLess(lines.index("f12 rom-water-feet"), lines.index("pitch off"))
+        self.assertLess(lines.index("pitch off"), lines.index("god off"))
+        self.assertEqual(len([l for l in lines if l.startswith("dump rom-water-arena-")]), 5)
+        self.assertNotIn("pitch", ac.tour(ac.pick_areas("chalice-aynbgu4m"), dict(ac.DEFAULTS), "perf"))
 
     def test_capture_tour_and_settings(self):
         areas = ac.pick_areas("hunters-nightmare")
@@ -201,6 +282,25 @@ class TourTest(unittest.TestCase):
         self.assertEqual(ac.pass_settings(Path("/r"), areas, dict(opts, env=["BBHOST_X=1"]), "perf")["BBHOST_X"], "1")
         # No presses at fixed times: the title is passed with menutap requests (launch).
         self.assertNotIn("BBHOST_AUTOPRESS", perf)
+
+    def test_travel_limit(self):
+        """AREA_TRAVEL_S reaches the probe (BBHOST_MAPVAL_TRAVEL_S) and the pass budget; --env's value wins."""
+        areas = ac.pick_areas("central-yharnam")
+        opts = dict(ac.DEFAULTS, pipeline_cache=True, env=[])
+        with mock.patch.dict(ac.os.environ, {}, clear=False):
+            ac.os.environ.pop("AREA_TRAVEL_S", None)
+            self.assertNotIn("BBHOST_MAPVAL_TRAVEL_S", ac.pass_settings(Path("/r"), areas, opts, "perf"))
+            self.assertEqual(ac.travel_seconds(opts), 150)
+            seconds_only = dict(opts, settle_flips=0)
+            base = ac.pass_budget(areas, seconds_only, "perf")
+            ac.os.environ["AREA_TRAVEL_S"] = "600"
+            self.assertEqual(ac.pass_settings(Path("/r"), areas, opts, "perf")["BBHOST_MAPVAL_TRAVEL_S"], "600")
+            self.assertEqual(ac.pass_budget(areas, seconds_only, "perf"), base + 450)
+            given = dict(opts, env=["BBHOST_MAPVAL_TRAVEL_S=1500"])
+            self.assertEqual(ac.pass_settings(Path("/r"), areas, given, "perf")["BBHOST_MAPVAL_TRAVEL_S"], "1500")
+            self.assertEqual(ac.travel_seconds(given), 1500)
+            # a slow renderer's frames past the loading screen take seconds each: the budget allows for them
+            self.assertGreater(ac.pass_budget(areas, opts, "perf"), ac.pass_budget(areas, dict(opts, settle_flips=0), "perf") + 150)
 
     def test_title_taps_until_the_world(self):
         """launch() asks for the menus' confirm button until the world's first

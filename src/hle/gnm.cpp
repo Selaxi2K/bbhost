@@ -335,7 +335,18 @@ GUEST_ABI int hle_gnm_push_color_marker(std::uint32_t* cmd, unsigned size, const
 GUEST_ABI int hle_gnm_pop_marker(std::uint32_t* cmd, unsigned size) {
     return write_marker(cmd, size, kMarkerPop, nullptr, nullptr, 0);
 }
-GUEST_ABI int hle_gnm_wait_flip(void*, const void*, int, int) { return 0; }
+GUEST_ABI int hle_gnm_wait_flip(void* cmd, const void* dwords, int handle, int buffer) {
+    static std::atomic<std::uint64_t> calls{0};
+    const std::uint64_t n = calls.fetch_add(1);
+    if (n < 8 || (n & (n + 1)) == 0) {
+        const auto* p = static_cast<const std::uint32_t*>(cmd);
+        host_log("gnm: sceGnmInsertWaitFlipDone #%llu cmd=%p dwords=%llu handle=%d buffer=%d: %08x %08x %08x %08x %08x %08x %08x (flip %llu)",
+                 static_cast<unsigned long long>(n + 1), cmd, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(dwords)), handle,
+                 buffer, p ? p[0] : 0u, p ? p[1] : 0u, p ? p[2] : 0u, p ? p[3] : 0u, p ? p[4] : 0u, p ? p[5] : 0u, p ? p[6] : 0u,
+                 static_cast<unsigned long long>(hle_video_flip_count()));
+    }
+    return 0;
+}
 
 GUEST_ABI unsigned hle_gnm_cu_index(unsigned i) { return i; }
 GUEST_ABI unsigned hle_gnm_cu_mask(unsigned m) { return m; }
@@ -359,19 +370,76 @@ std::vector<std::pair<const void*, std::size_t>> collect_ce(unsigned count, void
     return cbs;
 }
 
+// BBHOST_FLIP_TIMELINE=1 (diagnostic): how each frame's work reaches the
+// command processor - per flip, when the game asked for it against the
+// previous flip and the vblank clock, how many submissions of its frame came
+// and how many of them in the 3 ms before it, how long the game waited to
+// hand it over (the backlog bound), when the command processor had recorded
+// it, and how long before the call the game first looked at the flip status
+// (its frame ready; the flip pacing's hold is the wait between). Two lines a
+// flip ("flip-tl" from the game's thread, "flip-tr" from the command
+// processor's), matched by number.
+const bool g_flip_tl = [] {
+    const char* e = std::getenv("BBHOST_FLIP_TIMELINE");
+    return e && e[0] == '1';
+}();
+std::mutex g_tl_mu;
+std::vector<std::uint64_t> g_tl_jobs;  // under g_tl_mu: the game's submission calls since the last flip
+std::uint64_t g_tl_last_call = 0, g_tl_flips = 0;
+std::uint64_t tl_now() {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+double tl_phase_ms(std::uint64_t t) {
+    const std::uint64_t tick = hle_video_last_tick_ns();
+    if (!tick || t < tick) return -1.0;
+    return static_cast<double>((t - tick) % 16666667ull) / 1e6;
+}
+
 GUEST_ABI int hle_gnm_submit(unsigned count, void** dcb, unsigned* dcb_bytes, void** ccb, unsigned* ccb_bytes) {
+    if (g_flip_tl) {
+        std::lock_guard<std::mutex> lk(g_tl_mu);
+        g_tl_jobs.push_back(tl_now());
+    }
     hle_gnm_submit_async(0, collect_submit(count, dcb, dcb_bytes), [] { post_gnm_eop(); },
                          collect_ce(count, ccb, ccb_bytes));
     return 0;
 }
 GUEST_ABI int hle_gnm_submit_flip(unsigned count, void** dcb, unsigned* dcb_bytes, void** ccb, unsigned* ccb_bytes,
                                  int handle, int buffer, unsigned, std::int64_t arg) {
+    const std::uint64_t tl_looked = hle_video_note_flip_call(arg);
+    const std::uint64_t tl_call = g_flip_tl ? tl_now() : 0;
+    std::uint64_t tl_n = 0;
+    if (g_flip_tl) {
+        std::lock_guard<std::mutex> lk(g_tl_mu);
+        tl_n = ++g_tl_flips;
+    }
     hle_gnm_submit_async(0, collect_submit(count, dcb, dcb_bytes),
-                         [handle, buffer, arg] {
+                         [handle, buffer, arg, tl_call, tl_n] {
+                             if (tl_call) {
+                                 const std::uint64_t t = tl_now();
+                                 host_log("flip-tr #%llu recorded %.2f ms after the call, at tick phase %.2f",
+                                          static_cast<unsigned long long>(tl_n), static_cast<double>(t - tl_call) / 1e6, tl_phase_ms(t));
+                             }
                              hle_video_finish_flip(handle, buffer, arg, true);  // the job's commands are recorded
                              post_gnm_eop();
                          },
                          collect_ce(count, ccb, ccb_bytes));
+    if (tl_call) {
+        const std::uint64_t t = tl_now();
+        std::lock_guard<std::mutex> lk(g_tl_mu);
+        unsigned late = 0;
+        for (const std::uint64_t j : g_tl_jobs) late += tl_call - j <= 3000000ull ? 1 : 0;
+        host_log("flip-tl #%llu call +%.2f ms (tick phase %.2f), %zu jobs since the last flip (%u in the 3 ms before), waited %.2f ms to hand "
+                 "over, backlog %llu, looked %.2f ms before the call (tick phase %.2f)",
+                 static_cast<unsigned long long>(tl_n), g_tl_last_call ? static_cast<double>(tl_call - g_tl_last_call) / 1e6 : 0.0,
+                 tl_phase_ms(tl_call), g_tl_jobs.size(), late, static_cast<double>(t - tl_call) / 1e6,
+                 static_cast<unsigned long long>(hle_gnm_cp_backlog()),
+                 tl_looked && tl_looked <= tl_call ? static_cast<double>(tl_call - tl_looked) / 1e6 : -1.0,
+                 tl_looked ? tl_phase_ms(tl_looked) : -1.0);
+        g_tl_jobs.clear();
+        g_tl_last_call = tl_call;
+    }
     // Diagnostic: watch the SprjScaleform singleton's resident-resource
     // loader (*(singleton+8)) and the "resident load complete" flag
     // (byte at 0x5962878+0x32) across the first flips, to see whether the
@@ -409,7 +477,7 @@ GUEST_ABI int hle_gnm_submit_flip(unsigned count, void** dcb, unsigned* dcb_byte
         const char* e = std::getenv("BBHOST_STALL_MS");
         return e ? std::strtoull(e, nullptr, 10) : 100ull;
     }();
-    if (stall_ms) {
+    if (stall_ms && host_tooling()) {
         static std::mutex stall_mu;
         std::lock_guard<std::mutex> stall_lock(stall_mu);
         const auto t = std::chrono::steady_clock::now();
@@ -419,11 +487,18 @@ GUEST_ABI int hle_gnm_submit_flip(unsigned count, void** dcb, unsigned* dcb_byte
         std::uint64_t tex_us[5], pl_us[5];
         host_gpu_texture_time_us(tex_us);
         host_gpu_pipeline_time_us(pl_us);
+        std::uint64_t work[14];
+        host_gpu_pipeline_work(work);
         static std::uint64_t prev_tex_us[5] = {tex_us[0], tex_us[1], tex_us[2], tex_us[3], tex_us[4]};
         static std::uint64_t prev_pl_us[5] = {pl_us[0], pl_us[1], pl_us[2], pl_us[3], pl_us[4]};
+        static std::uint64_t prev_work[14] = {work[0], work[1], work[2], work[3], work[4],  work[5],  work[6],
+                                              work[7], work[8], work[9], work[10], work[11], work[12], work[13]};
         static auto prev_t = t;
         static GpuStats prev = s;
         static std::uint64_t prev_uploads = uploads, prev_hashes = hashes, prev_hash_us = hash_us, prev_repl = repl, stalls = 0;
+        std::uint64_t import_n = 0, import_us = 0;  // guest memory imports the command processor waited for
+        host_gpu_import_waits(&import_n, &import_us);
+        static std::uint64_t prev_import_n = import_n, prev_import_us = import_us;
         const std::uint64_t gap_ms = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(t - prev_t).count());
         if (gap_ms >= stall_ms && stalls++ < 4000) {
             std::string ph;
@@ -436,7 +511,9 @@ GUEST_ABI int hle_gnm_submit_flip(unsigned count, void** dcb, unsigned* dcb_byte
             host_log("stall: flip #%d came %llu ms after the previous one (cp-backlog %llu); in between cp-thread ms:%s; graphics pipelines %llu, "
                      "draws %llu, dispatches %llu, texture uploads %llu, texture hashes %llu in %llu ms, surfaces replaced %llu; "
                      "texture ms: images %llu, staging %llu, untile %llu, record %llu, views %llu; pipeline ms: translate %llu, "
-                     "modules %llu, create %llu; stage translations %llu, stages reused %llu",
+                     "modules %llu, create %llu; stage translations %llu, stages reused %llu; pipeline work ms: shader libraries "
+                     "%llu (%llu), interface libraries %llu (%llu), links %llu (%llu), whole pipelines %llu (%llu), layouts %llu "
+                     "(%llu), waiting for a library %llu, compute pipelines %llu (%llu); imports waited for %llu in %llu ms",
                      n, static_cast<unsigned long long>(gap_ms), static_cast<unsigned long long>(hle_gnm_cp_backlog()), ph.c_str(),
                      static_cast<unsigned long long>(s.pipelines - prev.pipelines), static_cast<unsigned long long>(s.draws - prev.draws),
                      static_cast<unsigned long long>(s.dispatches - prev.dispatches), static_cast<unsigned long long>(uploads - prev_uploads),
@@ -448,8 +525,19 @@ GUEST_ABI int hle_gnm_submit_flip(unsigned count, void** dcb, unsigned* dcb_byte
                      static_cast<unsigned long long>((tex_us[4] - prev_tex_us[4]) / 1000),
                      static_cast<unsigned long long>((pl_us[0] - prev_pl_us[0]) / 1000), static_cast<unsigned long long>((pl_us[1] - prev_pl_us[1]) / 1000),
                      static_cast<unsigned long long>((pl_us[2] - prev_pl_us[2]) / 1000), static_cast<unsigned long long>(pl_us[3] - prev_pl_us[3]),
-                     static_cast<unsigned long long>(pl_us[4] - prev_pl_us[4]));
+                     static_cast<unsigned long long>(pl_us[4] - prev_pl_us[4]),
+                     static_cast<unsigned long long>((work[0] - prev_work[0]) / 1000), static_cast<unsigned long long>(work[6] - prev_work[6]),
+                     static_cast<unsigned long long>((work[1] - prev_work[1]) / 1000), static_cast<unsigned long long>(work[7] - prev_work[7]),
+                     static_cast<unsigned long long>((work[2] - prev_work[2]) / 1000), static_cast<unsigned long long>(work[8] - prev_work[8]),
+                     static_cast<unsigned long long>((work[3] - prev_work[3]) / 1000), static_cast<unsigned long long>(work[9] - prev_work[9]),
+                     static_cast<unsigned long long>((work[4] - prev_work[4]) / 1000), static_cast<unsigned long long>(work[10] - prev_work[10]),
+                     static_cast<unsigned long long>((work[5] - prev_work[5]) / 1000),
+                     static_cast<unsigned long long>((work[12] - prev_work[12]) / 1000), static_cast<unsigned long long>(work[13] - prev_work[13]),
+                     static_cast<unsigned long long>(import_n - prev_import_n), static_cast<unsigned long long>((import_us - prev_import_us) / 1000));
         }
+        prev_import_n = import_n;
+        prev_import_us = import_us;
+        std::copy(work, work + 14, prev_work);
         for (int i = 0; i < 5; ++i) {
             prev_tex_us[i] = tex_us[i];
             prev_pl_us[i] = pl_us[i];
@@ -461,7 +549,38 @@ GUEST_ABI int hle_gnm_submit_flip(unsigned count, void** dcb, unsigned* dcb_byte
         prev_hash_us = hash_us;
         prev_repl = repl;
     }
-    if (n < 8 || (n % 300) == 0) {
+    // The video memory lines (host_gpu_log_video_memory) come from a census of
+    // every image and mirror page that holds the GPU lock for 2-3 ms on an RTX
+    // 4070 at 1080p and 1440p, so they go with every sixth 300-flip report -
+    // every 1,800 flips, 30 s at 60 fps - not with each one.
+    // BBHOST_VRAM_REPORT_FLIPS=<n> sets it (a multiple of 300, 300 at least).
+    static const std::uint64_t vram_flips = [] {
+        const char* e = std::getenv("BBHOST_VRAM_REPORT_FLIPS");
+        const unsigned long long v = e && *e ? std::strtoull(e, nullptr, 10) : 1800ull;
+        return static_cast<std::uint64_t>(v >= 300 ? v / 300 * 300 : 300);
+    }();
+    // BBHOST_VRAM_REPORT_S=<s>: the video memory lines every s seconds as well,
+    // on the flips between those reports - lavapipe flips 300 times in a
+    // minute or more, a place's whole window. Off (0) by default.
+    if (host_tooling()) {
+        static const double every = [] {
+            const char* e = std::getenv("BBHOST_VRAM_REPORT_S");
+            return e && *e ? std::atof(e) : 0.0;
+        }();
+        static auto last_v = std::chrono::steady_clock::now();
+        if (every > 0 && n % vram_flips != 0) {
+            const auto tv = std::chrono::steady_clock::now();
+            if (std::chrono::duration<double>(tv - last_v).count() >= every) {
+                last_v = tv;
+                host_gpu_log_video_memory(false);
+            }
+        }
+    }
+    // With tooling off only what the report also did for the game: the
+    // pipeline cache written when it has grown.
+    if (!host_tooling()) {
+        if (n % 300 == 0) host_gpu_save_pipeline_cache();
+    } else if (n < 8 || (n % 300) == 0) {
         static GpuStats last{};
         static auto last_t = std::chrono::steady_clock::now();
         const GpuStats now = host_gpu_stats();
@@ -557,12 +676,24 @@ GUEST_ABI int hle_gnm_submit_flip(unsigned count, void** dcb, unsigned* dcb_byte
             host_log("  sync: %s", sync.c_str());
             host_log("  pacing: %s; %s", frame_rate_limiter_window().c_str(), hle_video_pacing_window().c_str());
         }
-        host_log("  %s", host_gpu_shadow_report().c_str());
+        {
+            // A line a call (host_log keeps 1 KiB of one): the shadow's main
+            // line, then its own lines after it (the in-place census).
+            const std::string r = host_gpu_shadow_report();
+            for (std::size_t at = 0; at <= r.size();) {
+                const std::size_t nl = r.find('\n', at);
+                host_log("  %s", r.substr(at, nl == std::string::npos ? std::string::npos : nl - at).c_str());
+                if (nl == std::string::npos) break;
+                at = nl + 1;
+            }
+        }
         if (const std::string r = host_gpu_recorder_report(); !r.empty()) host_log("  %s", r.c_str());
         if (const std::string r = host_gpu_occlusion_report(); !r.empty()) host_log("  %s", r.c_str());
         if (const std::string r = host_gpu_image_heap_report(); !r.empty()) host_log("  %s", r.c_str());
+        host_gpu_resources_report();
         if (const std::string r = host_gpu_ps_wave_report(); !r.empty()) host_log("  %s", r.c_str());
         if (const std::string r = host_gpu_memory_budget_report(); !r.empty()) host_log("  %s", r.c_str());
+        if (n % vram_flips == 0) host_gpu_log_video_memory(false);
         // What the PC enhancements and Bloom cost in these flips: the file
         // lookups that passed the generated overlays by, the frames that read
         // the altar's flags, the views that drew YEBIS's glare.

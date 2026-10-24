@@ -17,6 +17,11 @@ Requirements:
   libswscale, libswresample) and SPIRV-Tools are optional but needed for a
   usable build: networking, windowing, audio, movies and shader optimisation
   are compiled out without them
+- for the HLSL shader path, the default, DXC's `libdxcompiler.so`, which bbhost
+  loads at run time: the one `BBHOST_HLSL_DXC` names, else the one beside the
+  executable, else the system's. `tools/fetch_dxc.sh linux build` puts the
+  packages' pinned library beside `build/bbhost`. Without one, every shader
+  keeps the lifter's SPIR-V
 
 On Arch Linux the packages are `vulkan-headers vulkan-icd-loader sdl3 ffmpeg
 curl zlib spirv-tools`. On Ubuntu 24.04 the distribution's Vulkan headers and
@@ -41,14 +46,18 @@ sysroot (`x86_64-w64-mingw32`), and wine for running the tests and the smoke
 run.
 
 ```sh
-tools/win_deps.sh       # once: zlib, SDL3, libcurl (schannel) and ffmpeg for the target
+tools/win_deps.sh       # once: zlib, SDL3, libcurl (schannel), ffmpeg and SPIRV-Tools for the target
 cmake -S . -B build-win -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-toolchain.cmake \
       -DCMAKE_PREFIX_PATH=$PWD/build/win-deps/prefix -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build-win
 ```
 
 The result is `build-win/bbhost.exe`, a single static executable that needs
-only the system DLLs and the GPU driver's `vulkan-1.dll`. It is linked at a
+only the system DLLs and the GPU driver's `vulkan-1.dll` (and, for the HLSL
+shader path, `dxcompiler.dll` beside it, which the package carries).
+SPIRV-Tools gives it the SPIR-V validator the HLSL path uses; shader liveness,
+which the Linux build also takes from SPIRV-Tools, is left out of the Windows
+build until it has been run there. It is linked at a
 fixed base (`0x600000000`) because the game's memory windows are reserved at
 fixed addresses before anything else runs.
 
@@ -85,6 +94,18 @@ every shader in the game's shader bundles.
 | `tools/package_steamdeck.sh` | the Linux package with the Steam Deck's settings |
 | `tools/package_plugins.sh` | the official plugins with their signatures |
 | `tools/package_playtest.sh` | tester kits for a playtest on a dev server, built by hand |
+| `tools/package_hlsl_sweep.sh` | a kit that runs the HLSL path's driver-acceptance sweep (`gcn2hlsl --sweep`) on another machine's GPU, built by hand ([rendering.md](rendering.md)) |
+
+Every package carries the DirectX Shader Compiler for the HLSL shader path
+beside the executable: `libdxcompiler.so` (Linux, Steam Deck) or the x64
+`dxcompiler.dll` (Windows) from DXC's own GitHub release, unmodified, with its
+licences in `licenses/dxc` (`third_party/dxc`). `tools/fetch_dxc.sh` pins the
+release by tag and checks both the archive and the library by SHA-256; the
+CI tests compile the HLSL printer's tests with the same library, and
+`tools/check_release_bundle.sh` fails a release without it or with DXC's
+DXIL validator (`dxil.dll`, which SPIR-V does not need and whose licence is
+not open). A new DXC version is a new pin and the HLSL path's checks run
+again with it.
 
 The release workflow (`.github/workflows/release.yml`) builds the Windows,
 Linux and Steam Deck packages from a `v*` tag, signs `SHA256SUMS` and the
@@ -95,6 +116,18 @@ entry pointing at one keeps working when it is replaced. The packages pick no
 server, so they play on the live server (`https://thehuntersdream.com`),
 bbhost's default; `tools/check_release_bundle.sh` fails a release whose
 packages would go anywhere else, or that carries a playtest kit.
+
+The Windows and Linux packages (and so the Steam Deck kit) carry the pipeline
+list beside the executable, `pipeline-list.bin`: every pipeline a tour of the
+whole game drew, which a first start builds before the player reaches it
+([full-tour.md](full-tour.md)). It is an asset of its own release, and
+`tools/fetch_pipeline_list.sh` downloads it pinned by tag and SHA-256 (kept in
+`build/pipeline-list`). `BBHOST_PACKAGE_PIPELINE_LIST=<file>` packs a local
+list instead, `BBHOST_PIPELINE_LIST_FETCH=0` leaves it out (a development
+kit), and `tools/check_release_bundle.sh` fails a release whose packages lack
+the pinned list. The pin is `pipeline-list-v2`, a pre-release of its own with
+1,924 pipelines and 9 compute records; with the pin left empty, the packages
+carry no list and the check asks for none.
 
 ## Continuous integration
 

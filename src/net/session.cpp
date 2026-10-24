@@ -8,6 +8,7 @@
 #include "log.h"
 #include "net/account.h"
 #include "net/http.h"
+#include "net/poll_pacing.h"
 
 #if defined(_WIN32)
 #include <ws2tcpip.h>
@@ -111,36 +112,88 @@ std::uint32_t addr_of(const std::string& text) {
 
 // ---- the poller -----------------------------------------------------------
 
-std::mutex g_pollmu;
-std::thread g_pollthread;
-std::atomic<bool> g_pollrun{false};
-std::condition_variable g_pollcv;
+std::mutex g_pollmu;  // the handler, and poller_start/poller_stop
 std::function<void(const json::Value&)> g_handler;
-long long g_cursor = 0;
+// The poller's generations and its one request at a time (net/poll_pacing.h).
+// The keepalive thread runs with the poller and belongs to its generation too.
+poll_pacing::Gate g_gate;
 
-void poller_main() {
+bool np_trace() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_NP_TRACE");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
+
+// A draw in [0, 1) for the back-off's jitter (splitmix64).
+double jitter_unit(std::uint64_t* s) {
+    std::uint64_t z = (*s += 0x9e3779b97f4a7c15ull);
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+    z ^= z >> 31;
+    return static_cast<double>(z >> 11) / 9007199254740992.0;
+}
+
+// One generation's poller (poll_pacing.h has the pace). The cursor is its
+// own: a poller of an ended generation, back from a held poll, has nothing
+// of the next one's to touch, and gives up what its poll brought.
+void poller_main(std::uint64_t gen) {
     host_thread_set_name("bb-np-poll");
     const std::string me = online_id();
-    int interval_ms = 250;
-    while (g_pollrun.load()) {
+    long long cursor = 0;
+    poll_pacing::State st;  // WaitMs from the first poll
+    std::uint64_t rng = static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()) ^ gen;
+    int held = -1;              // what the server said last: 1 it holds polls, 0 it answers at once
+    int failed = 0;             // polls failed in a row
+    std::int64_t failed_since = 0;
+    for (;;) {
+        if (!g_gate.begin(gen)) break;  // one poll out at a time; a stop ends the thread
         json::Value body = json::Value::make_object();
         body.set("OnlineId", me);
-        body.set("Cursor", static_cast<long long>(g_cursor));
+        body.set("Cursor", static_cast<long long>(cursor));
         json::Value cats = json::Value::make_array();
         cats.push("matching2");
         body.set("Categories", std::move(cats));
+        if (st.wait_ms > 0) body.set("WaitMs", st.wait_ms);
+        HttpCall call;
+        call.timeout_ms = poll_pacing::timeout_for(st.wait_ms);
+        call.connect_ms = poll_pacing::connect_for(st.wait_ms);
+        call.abandon = [gen] { return !g_gate.live(gen); };
+        call.keep_connection = true;
         json::Value reply;
         std::string err;
-        if (np_post("/np/events/poll", body, reply, err, 4000)) {
-            interval_ms = 250;
-            const long long next = int_of(reply, "NextCursor", g_cursor);
-            if (int_of(reply, "HasEvent", 0) != 0) {
+        long status = 0;
+        const std::int64_t t0 = now_ms();
+        const bool ok = np_post("/np/events/poll", body, reply, err, call, &status);
+        poll_pacing::Outcome o;
+        o.elapsed_ms = now_ms() - t0;
+        if (!g_gate.live(gen)) {
+            // Stopped while the poll was out (and maybe started again): what
+            // it brought is the next poller's, which gets it again since
+            // nothing acked it.
+            g_gate.end();
+            break;
+        }
+        if (ok) {
+            o.answered = true;
+            o.wait_max_ms = reply.type == json::Value::Type::Object && reply.find("WaitMaxMs") ? int_of(reply, "WaitMaxMs", 0) : -1;
+            o.event = int_of(reply, "HasEvent", 0) != 0;
+            const long long next = int_of(reply, "NextCursor", cursor);
+            if (o.event) {
                 std::function<void(const json::Value&)> h;
+                bool mine = false;
                 {
                     std::lock_guard<std::mutex> lk(g_pollmu);
-                    h = g_handler;
+                    mine = g_gate.live(gen);
+                    if (mine) h = g_handler;
                 }
-                host_log("np: event #%lld %s", int_of(reply, "EventId", 0), str_of(reply, "Name").c_str());
+                if (!mine) {
+                    g_gate.end();
+                    break;
+                }
+                host_log("np: event #%lld %s%s", int_of(reply, "EventId", 0), str_of(reply, "Name").c_str(),
+                         np_trace() ? (" after " + std::to_string(o.elapsed_ms) + " ms of the poll").c_str() : "");
                 if (h) {
                     h(reply);
                 }
@@ -149,22 +202,51 @@ void poller_main() {
                 ack.set("Cursor", next);
                 json::Value ackreply;
                 std::string ackerr;
-                np_post("/np/events/ack", ack, ackreply, ackerr, 4000);
-                g_cursor = next;
-                continue;  // drain without waiting when there was one
+                HttpCall ack_call;
+                ack_call.timeout_ms = 4000;
+                ack_call.keep_connection = true;
+                np_post("/np/events/ack", ack, ackreply, ackerr, ack_call);
+                cursor = next;
+            } else {
+                cursor = next > cursor ? next : cursor;
             }
-            g_cursor = next > g_cursor ? next : g_cursor;
-        } else if (account_refused()) {
-            // The server refused the sign-in (net/account.h): nothing will
-            // arrive until it is linked again, so ask once a minute, not every
-            // 4 s - a refused poller ran on dev for days, ~900 requests an hour.
-            interval_ms = 60000;
         } else {
-            // Back off while the server is unreachable; the game keeps running.
-            interval_ms = interval_ms < 4000 ? interval_ms * 2 : 4000;
+            o.status = status;
+            o.refused = account_refused();
         }
-        std::unique_lock<std::mutex> lk(g_pollmu);
-        g_pollcv.wait_for(lk, std::chrono::milliseconds(interval_ms), [] { return !g_pollrun.load(); });
+        g_gate.end();
+        const poll_pacing::Next n = poll_pacing::next(st, o, jitter_unit(&rng));
+        if (np_trace()) {
+            host_log("np: poll: WaitMs %d, %lld ms, %s -> WaitMs %d, the next in %d ms", st.wait_ms,
+                     static_cast<long long>(o.elapsed_ms),
+                     o.answered ? (o.event ? "an event" : "empty") : (status ? ("HTTP " + std::to_string(status)).c_str() : err.c_str()),
+                     n.state.wait_ms, n.sleep_ms);
+        }
+        if (o.answered) {
+            if (failed) {
+                host_log("np: events: the server answers again (%d polls failed in %lld s)", failed,
+                         static_cast<long long>((now_ms() - failed_since) / 1000));
+                failed = 0;
+            }
+            const int holds = n.state.wait_ms > 0 ? 1 : 0;
+            if (holds != held) {
+                if (holds) {
+                    host_log("np: events: the server holds polls (WaitMaxMs %lld): each asks for %d ms and the next "
+                             "goes out as the last is answered", o.wait_max_ms, n.state.wait_ms);
+                } else {
+                    host_log("np: events: the server answers polls at once (no WaitMaxMs): a poll every %d ms",
+                             poll_pacing::kPaceMs);
+                }
+                held = holds;
+            }
+        } else if (!o.refused && failed++ == 0) {
+            failed_since = now_ms();
+            host_log("np: events: no answer (%s); asking again in %.1f s, then backing off up to %d s",
+                     status ? ("HTTP " + std::to_string(status)).c_str() : err.c_str(), n.sleep_ms / 1000.0,
+                     poll_pacing::kBackoffMaxMs / 1000);
+        }
+        st = n.state;
+        if (n.sleep_ms > 0 && !g_gate.sleep(gen, n.sleep_ms)) break;
     }
 }
 
@@ -584,24 +666,17 @@ void server_signaling_update() {
 // to a few minutes, and then nothing the relay sends gets in) and the
 // relay port alive (released after 10 idle minutes - after which peers
 // resolved us to 127.0.0.1, dev 2026-10-05). A changed address goes to the
-// server at once.
-std::atomic<bool> g_keeprun{false};
-std::condition_variable g_keepcv;
-std::mutex g_keepmu;
-
-void keepalive_main() {
+// server at once. It runs with the poller, for the same generation: a stop
+// and a start within its 15 s leave one keepalive, not two.
+void keepalive_main(std::uint64_t gen) {
     host_thread_set_name("bb-np-keep");
     std::string last;
     {
         std::lock_guard<std::mutex> lk(g_mapped.mu);
         last = g_mapped.addr + ":" + std::to_string(g_mapped.port);
     }
-    while (g_keeprun.load()) {
-        {
-            std::unique_lock<std::mutex> lk(g_keepmu);
-            g_keepcv.wait_for(lk, std::chrono::seconds(15), [] { return !g_keeprun.load(); });
-        }
-        if (!g_keeprun.load()) break;
+    for (;;) {
+        if (!g_gate.sleep(gen, 15000)) break;
         mapped_refresh(true);
         std::string now;
         {
@@ -626,32 +701,21 @@ void room_set(const std::string& session_id, int member_id) {
 void room_clear() { room_set("", 0); }
 int stun_rtt_us() { return g_stun_rtt_us.load(); }
 
+// A new generation's poller and keepalive. The threads are detached and no
+// one waits for them: a stop ends their sleeps at once and a held poll within
+// about a second, and the process's exit (main.cpp, _exit) waits for neither.
 void poller_start(std::function<void(const json::Value& event)> handler) {
     std::lock_guard<std::mutex> lk(g_pollmu);
     g_handler = std::move(handler);
-    if (g_pollrun.load()) return;
-    g_pollrun.store(true);
-    g_cursor = 0;
-    g_pollthread = std::thread(poller_main);
-    g_pollthread.detach();
-    if (!g_keeprun.exchange(true)) {
-        std::thread t(keepalive_main);
-        t.detach();
-    }
+    if (g_gate.running()) return;  // running: the new handler is its
+    const std::uint64_t gen = g_gate.start();
+    std::thread(poller_main, gen).detach();
+    std::thread(keepalive_main, gen).detach();
 }
 
 void poller_stop() {
-    {
-        std::lock_guard<std::mutex> lk(g_keepmu);
-        g_keeprun.store(false);
-        g_keepcv.notify_all();
-    }
-    {
-        std::lock_guard<std::mutex> lk(g_pollmu);
-        if (!g_pollrun.load()) return;
-        g_pollrun.store(false);
-        g_pollcv.notify_all();
-    }
+    std::lock_guard<std::mutex> lk(g_pollmu);
+    g_gate.stop();
 }
 
 }  // namespace net

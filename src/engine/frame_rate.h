@@ -24,13 +24,24 @@
 //    frame time every frame; code immediates and frame counts take the rate's
 //    value. Above 60 the cloth's six constraint caves (ninety_fps_sites.inc)
 //    scale its stiffness by (60 dt)^2. The play time adds each frame's
-//    milliseconds with the remainder carried (the game truncates them). The
-//    follow camera keeps Kyo's 60 fps retune (Camera tuning FPS++, the
+//    milliseconds with the remainder carried (the game truncates them), and
+//    the effects - the lamps' flicker among them - and the wind on grass and
+//    trees step in whole 1/30 s the same way, 30 times a second as at 30, the
+//    frames between holding what the effects count in updates
+//    (decomp/sfx/step_gate.cpp, BBHOST_SFX_GATE; [video] effect_steps or
+//    BBHOST_SFX_STEP: smooth, the default, for 30 with what the effects move
+//    by time moved by the frame's own time in the effects converted for it,
+//    30 for whole steps alone, 60 for the effects in whole 1/60 s and the wind
+//    by the frame's time, frame for both by the frame's time).
+//    The follow camera keeps Kyo's 60 fps retune (Camera tuning FPS++, the
 //    default) or runs the game's own values (Original), either converted to
 //    each frame's length.
 //  - uncapped: the same, with a target of the display's refresh rate with
 //    V-Sync on and 1/240 s with it off (BBHOST_UNCAPPED_FPS=N sets it); code
-//    immediates and counts at 120's values.
+//    immediates and counts at 120's values. With V-Sync off at the title and
+//    the main menu (no world loaded, no loading screen, not character
+//    creation) there is no target at all: nothing there counts frames, and
+//    what follows the frame's time takes it whole.
 // Above 60 and uncapped flips complete as soon as they are recorded (the game
 // paces itself; hle/video.cpp). The one-shot overrides (+0x2bc, +0x2c0,
 // +0x271, +0x272, +0x2c4) are cleared so nothing drops the game back to 30.
@@ -47,6 +58,11 @@ void frame_rate_install(ElfImage* image);
 
 // The pace the game was started at: 30, 60, 90, 120, or 0 for uncapped.
 int frame_rate_game_fps();
+
+// AtkParam_Pc new or reloaded (engine/params.cpp): at a converted rate the
+// Bloodletter's L2 self-hit gets the reach its frenzy aura needs above 30
+// (frame_rate.cpp, kBloodletterSelfHit).
+void frame_rate_atk_params_loaded();
 
 // Game time against real time (plugins' set_time_scale): 0.5 is half speed,
 // 2 double, clamped to 0.1-4. At 30 the game steps a fixed amount a frame, so

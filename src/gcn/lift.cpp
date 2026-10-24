@@ -106,9 +106,11 @@
 #include "gcn/wave.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <map>
 #include <set>
@@ -160,6 +162,17 @@ struct Val {
     // Lifter::sym_masks[sym_where - 1] is set - a VGPR written under a varying
     // EXEC is a select, and holds the written word only there.
     std::uint32_t sym_where = 0;
+    // compute: a part of GCN's append idiom (Lifter::gds_counter, mbcnt),
+    // which the lift keeps apart until the two parts are added together - 1
+    // the base a ds_append step gives the wave, 2 a ds_consume's, 3 a lane's
+    // rank among a mask's lanes (v_mbcnt over the mask), 4 a rank's high half
+    // (v_mbcnt_hi alone). Its word is the invocation's own slot (a base) or 0
+    // (a rank), so base + rank is the slot; any other use of a part rejects.
+    // `part_mask`: the lane mask the step or rank was taken over (constant:
+    // part_mask_set), which the parts must share.
+    std::uint8_t wave_part = 0;
+    Id part_mask = 0;
+    bool part_mask_constant = false, part_mask_set = false;
 };
 
 // Register keys: SGPRs 0..103, TTMPs 200..211, VGPRs 256.., and the scalar
@@ -168,6 +181,9 @@ constexpr int kKeyM0 = 124;
 constexpr int kKeyScc = 1000;
 constexpr int kKeyExec = 1001;
 constexpr int kKeyVcc = 1002;
+// GsLift's GSVS array: the invocation's emit counter, a register of the lift's
+// own so that ifs join it as they join the program's.
+constexpr int kKeyGsCount = 1003;
 // A spill cell (gcn/wave.h): the scalar a v_writelane_b32 parked in lane L of
 // VGPR N, kept as a register of its own.
 constexpr int kKeyCell = 4096;
@@ -198,9 +214,28 @@ struct Region {
     bool disabled = false;  // an s_cbranch_scc0 whose SCC was a scalar condition: an if, not a kill region
     std::uint64_t seq = 0;  // opening order among regions and ifs
     std::set<int> in_mask0;  // Lifter::in_mask where the region begins
+    // Run as a branch on the pixel's EXEC bit (Lifter::region_branch_open):
+    // its merge and skip blocks, and the lift's state at the branch.
+    bool branched = false;
+    spv::Id rb_merge = 0, rb_skip = 0;
+    std::map<int, Val> rb_reg0, rb_lanes0;
+    std::map<spv::Id, spv::Id> rb_to_float0, rb_to_word0;
+    Val rb_scc0;
+    bool rb_scc_uniform0 = false, rb_scc_valid0 = true;
+    std::set<int> rb_poisoned0, rb_in_mask0;
+    // A compute lift's region as a selection on the invocation's EXEC bit
+    // (Lifter::branch_region): an invocation whose bit is clear skips it, as
+    // GCN's wave skips it where no lane's is set. (The pixel lift's own branch
+    // on the pixel's bit is `branched` above, Lifter::region_branch_open.)
+    bool selected = false;
 };
 
 bool is_branch(const Inst& in) { return in.enc == Enc::SOPP && (in.op == 2 || (in.op >= 4 && in.op <= 9)); }
+
+// GsLift: the most dwords an ES ring vertex (the geometry stage's inputs a
+// vertex: maxGeometryInputComponents is 64 on AMD's drivers) and a GSVS
+// vertex may hold.
+constexpr std::uint32_t kEsgsDwords = 64, kGsvsDwords = 64;
 
 // A module's outputs as TranslateResult reports a vertex stage's: the
 // locations of its Output variables, its ClipDistance array's length (0:
@@ -266,15 +301,24 @@ public:
     // coming back to the header with helper lanes GCN may hold differently
     // (Val::helper_inexact); they are inexact at the header from the start.
     using LoopPhis = std::set<std::pair<std::uint32_t, int>>;
+    // `loop_nonuniform` (compute): VGPRs (loop header, key) an earlier attempt
+    // found coming back to the header with a value lanes may hold differently;
+    // the others that enter a loop alike are taken to stay alike, as scalars are.
     Lifter(const Program& p, const TranslateOptions& o, const TranslateResult& r, const LoopPhis& loop_phis = {}, const LoopPhis& loop_inexact = {},
-           const TessLift* tess_lift = nullptr)
-        : prog(p), opt(o), ref(r), tess(tess_lift), lane_phi_hints(loop_phis), inexact_hints(loop_inexact) {}
+           const TessLift* tess_lift = nullptr, const LoopPhis& loop_nonuniform = {}, const GsLift* gs_lift = nullptr)
+        : prog(p), opt(o), ref(r), tess(tess_lift), gs(gs_lift), lane_phi_hints(loop_phis), inexact_hints(loop_inexact),
+          nonuniform_hints(loop_nonuniform) {}
     LoopPhis more_lane_phis;  // set when a lift failed only because a lane mask needs a phi
     LoopPhis more_inexact;    // ... or because helper lanes came back around a loop less exact than they left
+    LoopPhis more_nonuniform;  // ... or because a VGPR came back to a loop header holding values lanes may not hold alike
 
     LiftResult run() {
         check_program();
         if (res.rejections.empty()) emit();
+        if (res.rejections.empty() && !more_nonuniform.empty()) {
+            cur = prog.insts.empty() ? 0 : prog.insts.back().offset;
+            reject("a VGPR comes back to a loop header holding values lanes may not hold alike (assumed alike there: another attempt)");
+        }
         if (res.rejections.empty()) {
             res.spirv = m.assemble();
             finish_proof();
@@ -293,11 +337,40 @@ private:
     bool tess_ls() const { return tess && opt.tess_role == TranslateOptions::TessRole::LsVertex; }
     bool tess_ds() const { return tess && opt.tess_role == TranslateOptions::TessRole::DomainTes; }
     bool tess_hs() const { return tess && opt.tess_role == TranslateOptions::TessRole::HullTcs; }
+    // A draw's export shader or geometry shader on stage I/O (lift.h GsLift), or null.
+    const GsLift* gs = nullptr;
+    bool gs_es() const { return gs && opt.gs_role == TranslateOptions::GsRole::EsVertex; }
+    bool gs_geom() const { return gs && opt.gs_role == TranslateOptions::GsRole::Geometry; }
+    // Words tracked in their affine form (Val::sym): a tessellation stage's LDS
+    // addresses, the geometry shader's ESGS ring offsets.
+    bool sym_on() const { return tess || gs_geom(); }
     // TessLift::window: the game's own hull's patch window as stage I/O.
     bool window() const { return tess && tess->window; }
     // A stage that exports a position and params: a vertex shader, or the
     // domain shader as the evaluation stage.
     bool vertex_like() const { return opt.stage == Stage::Vertex || opt.stage == Stage::TessEval; }
+    // A compute shader of a dispatch (no tessellation role): one invocation a
+    // lane of GCN's wave, every buffer reached through the page table as the
+    // reference reaches it (lift_compute_shader).
+    bool compute() const { return opt.stage == Stage::Compute && opt.tess_role == TranslateOptions::TessRole::None; }
+    // gcn::set_oob_count: a vertex, pixel or compute stage whose reference
+    // counts counts as it does - its typed loads by index, a compute shader's
+    // walks by index, its image loads and stores at integer coordinates (a
+    // graphics lift walks nothing) - through the same counters
+    // (TranslateResult::oob_slot).
+    bool oob_counting() const {
+        return oob_count() &&
+               (compute() || ((opt.stage == Stage::Vertex || opt.stage == Stage::Pixel) && opt.tess_role == TranslateOptions::TessRole::None &&
+                              opt.gs_role == TranslateOptions::GsRole::None)) &&
+               ref.oob_slot < kOobSlots;
+    }
+    Id oob_base64 = 0;  // the counters' device address (StageParams::lds_address), at the entry
+    // Threads in the dispatch's workgroup, and whether GCN's waves of it are
+    // all whole (every lane of each 64 runs an invocation).
+    std::uint32_t workgroup_threads() const {
+        return std::max<std::uint32_t>(1, opt.cs_threads[0]) * std::max<std::uint32_t>(1, opt.cs_threads[1]) *
+               std::max<std::uint32_t>(1, opt.cs_threads[2]);
+    }
     LiftResult res;
     spv::Module m;
     std::uint32_t cur = 0;
@@ -307,12 +380,22 @@ private:
     Id t_void = 0, t_bool = 0, t_u32 = 0, t_i32 = 0, t_u64 = 0, t_f32 = 0, t_v2f = 0, t_v3f = 0, t_v4f = 0, t_v2i = 0, t_v3i = 0;
     Id p_uni_u32 = 0, p_in_v4f = 0, p_in_bool = 0, p_out_v4f = 0, p_ssbo_u32 = 0, p_in_u32 = 0, p_in_v4u = 0, t_v4u = 0;
     Id ubo_var = 0, fn_main = 0;
+    // compute(): guest memory through the page table at StageParams::l1_table,
+    // as the reference's xlate() walks it - physical storage buffer pointers to
+    // a dword, and the helper function.
+    Id p_psb_u32 = 0, p_psb_block = 0, p_psb_block64 = 0, p_psb_u64 = 0, p_uni_u64 = 0, fn_xlate = 0;
+    Id in_local_id = 0, in_workgroup_id = 0, in_subgroup_lane = 0;
+    // StageParams::gds_counter's member (0: the program counts nothing in GDS).
+    std::uint32_t gds_member = 0;
     std::vector<Id> interface;
     std::vector<Id> image_vars, image_types, sampler_vars, buffer_vars;
     std::map<int, Id> in_params, out_params, attr_loads;
     std::map<std::uint32_t, Id> in_location_vars;  // PS: location -> the Input vec4 there (attr)
     Id in_frag_coord = 0, in_front_facing = 0, in_vertex_index = 0, in_instance_index = 0, out_pos = 0, in_helper = 0;
     Id in_tess_coord = 0, in_invocation_id = 0;
+    // GsLift: the ring vertex - the ES's output, the GS's input (es_gs[1][..]
+    // for a point) - and the GS's primitive id.
+    Id es_gs = 0, in_primitive_id = 0;
     // TessLift::window: the hull's outputs and the domain shader's inputs -
     // the output control points (uvec4[control points][cp_stride / 16]) and
     // the patch constants (uvec4[patch_constants], Patch) - and the
@@ -368,10 +451,12 @@ private:
         std::uint32_t join = 0;
     };
     std::vector<Construct> constructs;
+    std::deque<Construct> region_ifs;  // the branched regions' selections (open_region_arm), stable for Arm::c
     std::vector<std::uint32_t> threaded_joins;  // ifs of an else-if chain joined at the enclosing then arm's s_branch
     struct Arm {  // an open if
         Construct* c = nullptr;
         std::uint64_t seq = 0;
+        bool region = false;  // a branched region's selection (open_region_arm): its condition differs between lanes
         // VCC was a uniform condition ANDed with EXEC, at the start of the
         // region beginning here (0: the bit itself was uniform).
         std::uint32_t split_region = 0;
@@ -409,6 +494,10 @@ private:
     std::size_t descriptor_loads = 0;
     bool descriptor(const Val& v) const { return !v.constant && v.kind == Kind::Word && descriptor_words.count(v.id) != 0; }
     void reject_descriptor_read(const Val& v) {
+        if (ring_words.count(v.id)) {
+            reject("a ring's V# is read as data (the lift's rings are its stages' inputs and outputs)");
+            return;
+        }
         const std::uint32_t at = descriptor_words.at(v.id);
         const Inst* load = inst_at(at);
         reject("data from a scalar load the reference walks the page table for (only its descriptors are lifted): " +
@@ -440,13 +529,20 @@ private:
     // VGPR write included): so are its word and float results.
     bool inst_helper_inexact = false;
     bool uniform(const Val& v) const { return v.constant || uniform_ids.count(v.id) != 0; }
+    // compute(): values computed from the workgroup's id - the same in every
+    // lane of a wave, but not in every wave of the dispatch, so no loop GCN
+    // may skip with a region takes its trip count from one (draw_wide_exit).
+    std::set<Id> wg_ids;
+    bool inst_wg = false;
     Val note_read(const Val& v) {
         if (!uniform(v)) inst_uniform = false;
         if (v.helper_inexact) inst_helper_inexact = true;
+        if (!v.constant && wg_ids.count(v.id)) inst_wg = true;
         return v;
     }
     void note_result(const Val& v) {
         if (inst_uniform && !v.constant) uniform_ids.insert(v.id);
+        if (inst_wg && !v.constant) wg_ids.insert(v.id);
     }
     bool needs_kill = false;                // EXEC not known set at s_endpgm
     Val kill_exec;
@@ -459,9 +555,68 @@ private:
 
     // ---- program checks ------------------------------------------------------------
     void check_program() {
-        if (opt.stage != Stage::Pixel && opt.stage != Stage::Vertex && !tess_ds() && !tess_hs()) reject("only pixel and vertex shaders are lifted");
+        if (opt.stage != Stage::Pixel && opt.stage != Stage::Vertex && !tess_ds() && !tess_hs() && !compute()) {
+            reject(opt.stage == Stage::Compute ? "a compute stage with a tessellation role (the LS pass) is not lifted"
+                                               : "only pixel and vertex shaders are lifted");
+        }
+        if (compute()) {
+            // The lift reads memory as its reference does, so it binds what the
+            // reference binds: a dispatch's translation walks the page table for
+            // every buffer; its lean one (ComputeLean: cb_ssbo, cb_no_fallback)
+            // reads the accesses it bound (TranslateResult::buffer_at) from
+            // their storage buffers and walks the rest, and so does the lift.
+            if (opt.cb_ssbo && !opt.cb_no_fallback) {
+                reject("a compute reference with constant buffers bound and a page-table fallback (cb_ssbo without cb_no_fallback) is not lifted");
+            }
+            if (opt.fetch || !opt.vertex_input.empty()) reject("a compute stage with vertex inputs");
+            if (!ref.ok()) reject("the reference translation failed");
+            if (!prog.errors.empty()) reject("the program has decode errors");
+            if (prog.insts.empty()) reject("empty program");
+            if ((opt.rsrc2 >> 10) & 1) reject("TG_SIZE in an SGPR: the reference gives 0 for it, GCN the workgroup's wave count");
+            if (((opt.rsrc2 >> 15) & 0x1ff) || ref.lds_bytes) {
+                for (const Inst& in : prog.insts) {
+                    if (in.enc == Enc::DS && !(in.op == 53) && !((in.op == 61 || in.op == 62) && in.gds)) {
+                        cur = in.offset;
+                        reject(std::string(mnemonic(in) ? mnemonic(in) : "an LDS access") + ": LDS (groupshared memory) is not lifted");
+                        break;
+                    }
+                }
+            }
+            if (!res.rejections.empty()) return;
+        }
         if (opt.tess_role != TranslateOptions::TessRole::None && !tess_ls() && !tess_ds() && !tess_hs()) {
             reject("a tessellation stage is lifted only as the LS on vertex input, the hull as the control stage or the domain shader as the evaluation stage");
+        }
+        if (opt.gs_role != TranslateOptions::GsRole::None && !gs_es() && !gs_geom()) {
+            reject("a geometry-shader role is lifted only as the ES or the GS, with their GsLift");
+        }
+        if (gs) {
+            if (opt.gs_role == TranslateOptions::GsRole::None) reject("a GsLift without a geometry-shader role");
+            if (opt.stage != Stage::Vertex || opt.tess_role != TranslateOptions::TessRole::None)
+                reject("the ES and the GS lift with a vertex stage's options and no tessellation role");
+            if (!opt.vertex_input.empty()) reject("the ES and the GS are lifted without vertex input");
+            if (opt.vs_out_cntl) reject("PA_CL_VS_OUT_CNTL is set for the ES or the GS (their copy shader's is what draws)");
+            if (!gs->es_dwords || gs->es_dwords > kEsgsDwords) {
+                reject("an ES ring vertex of " + std::to_string(gs->es_dwords) + " dwords (1-" + std::to_string(kEsgsDwords) +
+                       ": the geometry stage's inputs a vertex)");
+            }
+            if (gs_geom()) {
+                if (!gs->max_vertices || gs->max_vertices > 256) reject("a GS of " + std::to_string(gs->max_vertices) + " vertices (1-256)");
+                if (gs->out_prim != 1 && gs->out_prim != 2) {
+                    reject("a GS whose output primitive is " + std::to_string(gs->out_prim) + " (line and triangle strips are lifted)");
+                }
+                if (gs->copy.empty()) reject("a GS without its copy shader's exports");
+                if (!gs->vertex_dwords || gs->vertex_dwords > kGsvsDwords) {
+                    reject("a GSVS vertex of " + std::to_string(gs->vertex_dwords) + " dwords (1-" + std::to_string(kGsvsDwords) + ")");
+                }
+                for (const GsCopyOut& c : gs->copy) {
+                    if (c.comp > 3 || (c.target != 12 && (c.target < 32 || c.target >= 64)) || (!c.constant && c.value >= gs->vertex_dwords)) {
+                        reject("a copy-shader export the lift does not take (target " + std::to_string(c.target) + ", component " +
+                               std::to_string(c.comp) + ")");
+                        break;
+                    }
+                }
+            }
         }
         if (tess && !window() && !opt.tess_lds_attributes) reject("a tessellation stage is lifted with its control point as stage attributes or in a hull's window");
         if (tess_hs() && !window()) reject("only the game's own hull (a window a patch) is lifted as a control stage");
@@ -471,7 +626,7 @@ private:
             reject("a window layout with strides that are not whole vec4s, or no control points");
         }
         if (tess_ls() && opt.vertex_formats_from_params) reject("the LS takes its user data where vertex formats from the params would be");
-        if (!opt.cb_no_fallback) reject("the reference must be the no-fallback translation (every storage buffer bound)");
+        if (!opt.cb_no_fallback && !compute()) reject("the reference must be the no-fallback translation (every storage buffer bound)");
         if (opt.debug_ps) reject("debug pixel-output modes are not lifted");
         if (opt.fetch) reject("an inlined fetch shader is not lifted (vertex shaders are lifted on vertex input)");
         if (!ref.ok()) reject("the reference translation failed");
@@ -636,13 +791,24 @@ private:
     static Val flt(Id id) { return {Kind::Float, id, false, 0, false}; }
     static Val lane(Id id) { return {Kind::Lane, id, false, 0, false}; }
 
+    // A part of the append idiom read as a number other than by adding the
+    // two parts (Val::wave_part).
+    void reject_wave_part(const Val& v) {
+        static const char* const kPart[5] = {"", "a ds_append step's wave base", "a ds_consume step's wave base", "a lane's rank (v_mbcnt)",
+                                             "a rank's high half (v_mbcnt_hi)"};
+        reject(std::string(kPart[v.wave_part < 5 ? v.wave_part : 0]) +
+               " is used other than added to its lanes' ranks: GCN's base and rank are the wave's, the lift's the invocation's own slot");
+    }
+    Val part_mask_val(const Val& p) { return p.part_mask_constant ? lane_const(p.part_mask_set) : lane(p.part_mask); }
     Id as_f(const Val& v) {
+        if (v.wave_part) reject_wave_part(v);
         if (v.kind == Kind::Float) return v.id;
         if (v.kind == Kind::Lane) {
             reject("a lane mask is used as a number");
             return cf(0.0f);
         }
         if (descriptor(v)) reject_descriptor_read(v);
+        if (ring_offset_read(v)) return cf(0.0f);
         if (v.constant) return cf(std::bit_cast<float>(v.bits));
         if (auto it = to_float.find(v.id); it != to_float.end()) return it->second;
         const Id r = m.emit(spv::OpBitcast, t_f32, {v.id});
@@ -651,7 +817,9 @@ private:
         return r;
     }
     Id as_u(const Val& v) {
+        if (v.wave_part) reject_wave_part(v);
         if (descriptor(v)) reject_descriptor_read(v);
+        if (ring_offset_read(v)) return cu(0);
         if (v.kind == Kind::Word) return v.id;
         if (v.kind == Kind::Lane) {
             reject("a lane mask is used as a number");
@@ -845,6 +1013,31 @@ private:
             const Id p = m.access_chain(p_uni_u32, ubo_var, {cu(member), cu(static_cast<std::uint32_t>(key / 4)), cu(static_cast<std::uint32_t>(key % 4))});
             return word(m.load(t_u32, p));
         }
+        if (compute() && key < 104) {
+            // The SGPRs after the user data, as the reference fills them
+            // (translate.cpp run()): the workgroup id's enabled components, in
+            // order. The same in every lane of a wave (a wave is one
+            // workgroup's), but not in every wave of the dispatch (wg_ids).
+            int s = static_cast<int>((opt.rsrc2 >> 1) & 0x1f);
+            for (std::uint32_t k = 0; k < 3; ++k) {
+                if (!((opt.rsrc2 >> (7 + k)) & 1)) continue;
+                if (key == s++) {
+                    if (!in_workgroup_id) in_workgroup_id = builtin(m.type_pointer(spv::ScInput, m.type_vector(t_u32, 3)), spv::BiWorkgroupId);
+                    const Val v = word(extract(t_u32, m.load(m.type_vector(t_u32, 3), in_workgroup_id), k));
+                    wg_ids.insert(v.id);
+                    return v;
+                }
+            }
+            return word_const(0);  // as the reference: an SGPR nothing filled reads 0
+        }
+        if (key >= 256 && compute()) {
+            // v0 the invocation's x in the workgroup, v1 and v2 its y and z up
+            // to TIDIG_COMP_CNT (translate.cpp run()).
+            const int comp = static_cast<int>((opt.rsrc2 >> 11) & 3);
+            if (key - 256 > comp || key - 256 > 2) return word_const(0);
+            if (!in_local_id) in_local_id = builtin(m.type_pointer(spv::ScInput, m.type_vector(t_u32, 3)), spv::BiLocalInvocationId);
+            return word(extract(t_u32, m.load(m.type_vector(t_u32, 3), in_local_id), static_cast<std::uint32_t>(key - 256)));
+        }
         if (key >= 256 && tess_ls()) {
             // As the vertex stage of a patch draw: v0 the control point's vertex
             // id, its slot in the patch (v1) 0 - the invocation writes only its
@@ -890,6 +1083,23 @@ private:
             if (key > 257) return word_const(0);
             if (!in_tess_coord) in_tess_coord = builtin(m.type_pointer(spv::ScInput, t_v3f), spv::BiTessCoord);
             return flt(extract(t_f32, m.load(t_v3f, in_tess_coord), static_cast<std::uint32_t>(key - 256)));
+        }
+        if (key >= 256 && gs_geom()) {
+            // As GCN fills a GS's VGPRs for a point: v0 the ES vertex's offset
+            // in the ESGS ring (ring_offset), v2 the primitive's id, v7 the
+            // instance (VGT_GS_INSTANCE_CNT 0: one); v1 and v3-v6 are the
+            // offsets of vertices a point does not have.
+            if (key == 256) return ring_offset();
+            if (key == 258) {
+                if (!in_primitive_id) in_primitive_id = builtin(p_in_u32, spv::BiPrimitiveId);
+                return word(m.load(t_u32, in_primitive_id));
+            }
+            if (key == 257 || (key >= 259 && key <= 262)) {  // offsets of vertices a point does not have: never data, nothing to address
+                Val v = ring_offset();
+                v.sym = false;
+                return v;
+            }
+            return word_const(0);
         }
         if (key >= 256 && opt.stage == Stage::Vertex) {
             // The vertex index in v0, the instance index in v1 up to VGPR_COMP_CNT (translate.cpp, run()).
@@ -1125,6 +1335,27 @@ private:
             note += " v" + std::to_string(idx) + (e.set ? (v.kind == Kind::Float ? ":f32" : ":u32") : ":masked-off");
             return;
         }
+        if (gs_geom()) {
+            const auto it = reg.find(key);
+            const Val cur = it != reg.end() ? it->second : initial_value(key);
+            if (!cur.constant && ring_offsets.count(cur.id)) {
+                // Over a ring offset: GCN keeps the offset where EXEC is clear,
+                // which the lift never computes with - the register holds the
+                // value written, exact only where EXEC is set (as a spill's
+                // register below), and a read that needs it elsewhere rejects.
+                if (!v.constant && ring_offsets.count(v.id)) {
+                    reject("v" + std::to_string(idx) + ": a ring offset written under a varying EXEC");
+                    return;
+                }
+                const Where at = meet(read, Where{true, Exact{false, e}});
+                reg[key] = v;
+                reg[key].helper_inexact = v.helper_inexact || inst_helper_inexact;
+                partial[key] = at.at;
+                note_result(reg[key]);
+                note += " v" + std::to_string(idx) + ":exact-under-exec";
+                return;
+            }
+        }
         if (poisoned.count(key)) {
             // The VGPR's lanes hold words a v_writelane_b32 put there (a spill
             // the program has read back), or what each lane held before: where
@@ -1142,6 +1373,35 @@ private:
             ++spill_reuses;
             return;
         }
+        if (v.wave_part || (reg.count(key) && reg.at(key).wave_part)) {
+            // A part of the append idiom (Val::wave_part) under a varying
+            // EXEC: written where EXEC is the mask it was taken over, it holds
+            // in that mask's lanes; a write over one must cover every lane it
+            // held in.
+            const Val old = value(key);
+            if (v.wave_part && !same_lane(e, part_mask_val(v))) {
+                reject("v" + std::to_string(idx) + " takes a part of the append idiom under another EXEC than its mask");
+                return;
+            }
+            if (old.wave_part && !implies(part_mask_val(old), e)) {
+                reject("v" + std::to_string(idx) + " holds a part of the append idiom and is overwritten only in some of its lanes");
+                return;
+            }
+            reads = read;
+            note_exact_write(key, read, e);
+            ++masked_writes;
+            const Id vn = v.wave_part ? v.id : as_u(v), on = old.wave_part ? old.id : as_u(old);
+            Val r = word(m.emit(spv::OpSelect, t_u32, {e.id, vn, on}));
+            if (v.wave_part) {
+                r.wave_part = v.wave_part;
+                r.part_mask = v.part_mask;
+                r.part_mask_constant = v.part_mask_constant;
+                r.part_mask_set = v.part_mask_set;
+            }
+            reg[key] = r;
+            note += " v" + std::to_string(idx) + (v.wave_part ? ":part" : ":select");
+            return;
+        }
         const Val old = value(key);
         reads = read;
         note_exact_write(key, read, e);
@@ -1151,7 +1411,7 @@ private:
         } else {
             reg[key] = word(m.emit(spv::OpSelect, t_u32, {e.id, as_u(v), as_u(old)}));
         }
-        if (tess && sym_holds(v, e)) {  // TessLift: the written word's form, where EXEC is set
+        if (sym_on() && sym_holds(v, e)) {  // TessLift, GsLift: the written word's form, where EXEC is set
             reg[key].sym = true;
             reg[key].sym_base = v.sym_base;
             reg[key].sym_coef = v.sym_coef;
@@ -1190,6 +1450,13 @@ private:
     }
     Id attr(int a) {
         if (auto it = attr_loads.find(a); it != attr_loads.end()) return it->second;
+        // GCN's default constant where the input map gives it (translate.cpp
+        // in_value): no input variable.
+        if (const std::uint8_t entry = static_cast<std::size_t>(a) < opt.ps_input_map.size() ? opt.ps_input_map[a] : static_cast<std::uint8_t>(a);
+            TranslateOptions::ps_input_is_default(entry)) {
+            const Id rgb = m.const_f32((entry & 3) >= 2 ? 1.0f : 0.0f), alpha = m.const_f32((entry & 1) ? 1.0f : 0.0f);
+            return attr_loads[a] = m.const_composite(t_v4f, {rgb, rgb, rgb, alpha});
+        }
         Id var;
         if (auto it = in_params.find(a); it != in_params.end()) {
             var = it->second;
@@ -1258,13 +1525,17 @@ private:
     // One 16-bit half, decoded exactly as the translator decodes it (gcn/half.h).
     Id unpack_half(Id h) { return emit_unpack_half16(m, {t_bool, t_u32, t_i32, t_f32}, h); }
     Id mul_legacy(Id a, Id b) {  // as the translator writes it (translate.cpp mul_legacy)
+        // x * x: one operand is zero only when both are, so the zero rule
+        // never decides (a dot product's squares, a third of the light pass's).
+        if (legacy_mul_plain() || a == b) return fmul(a, b);
         if (legacy_mul_min_form()) return fsel(feq(ext(spv::GlslNMin, {ext(spv::GlslFAbs, {a}), ext(spv::GlslFAbs, {b})}), cf(0.0f)), cf(0.0f), fmul(a, b));
         const Id zero = m.emit(spv::OpLogicalOr, t_bool, {feq(a, cf(0.0f)), feq(b, cf(0.0f))});
         return fsel(zero, cf(0.0f), fmul(a, b));
     }
-    Id clamp_inf(Id v) {
+    Id clamp_inf(Id v) {  // as the translator writes it (translate.cpp clamp_inf): the sign onto FLT_MAX's bits
         const Id inf = m.emit(spv::OpIsInf, t_bool, {v});
-        return fsel(inf, fmul(ext(spv::GlslFSign, {v}), cf(3.4028235e38f)), v);
+        const Id sign = ibin(spv::OpBitwiseAnd, m.emit(spv::OpBitcast, t_u32, {v}), cu(0x80000000u));
+        return fsel(inf, m.emit(spv::OpBitcast, t_f32, {ibin(spv::OpBitwiseOr, sign, cu(0x7f7fffffu))}), v);
     }
 
     // `mask`: v_cndmask's select or the carry in, from src2 (VOP3); VCC otherwise.
@@ -1350,7 +1621,9 @@ private:
         case 33: return out_f(ext(spv::GlslFma, {F0(), F1(), as_f(word_const(in.literal))}));  // v_madak_f32
         case 34: return out_u(ibin(spv::OpIAdd, m.emit(spv::OpBitCount, t_u32, {as_u(s0)}), as_u(s1)));  // v_bcnt_u32_b32
         case 37: case 38: case 39: {  // v_add_i32 / v_sub_i32 / v_subrev_i32 with carry out
-            Id a = as_u(s0), b = as_u(s1);
+            Val x = s0, y = s1;
+            if ((x.wave_part || y.wave_part) && !combine_wave_parts(op, x, y)) return true;
+            Id a = as_u(x), b = as_u(y);
             if (op == 39) std::swap(a, b);
             const Id r = m.emit(op == 37 ? spv::OpIAddCarry : spv::OpISubBorrow, m.type_struct({t_u32, t_u32}), {a, b});
             const Id c = m.emit(spv::OpINotEqual, t_bool, {extract(t_u32, r, 1), cu(0)});
@@ -1708,7 +1981,8 @@ private:
 
     // ---- affine words (Val::sym, TessLift) -------------------------------------------
     // Invocations a word may differ between: a hull's control points, else 1.
-    std::uint32_t sym_invocations() const { return tess_hs() ? std::max<std::uint32_t>(1, tess->control_points) : 1u; }
+    // A GS's ring offsets: the offset itself (coef 1), as two.
+    std::uint32_t sym_invocations() const { return tess_hs() ? std::max<std::uint32_t>(1, tess->control_points) : gs_geom() ? 2u : 1u; }
     std::vector<Val> sym_masks;  // Val::sym_where
     std::uint32_t sym_where_of(const Val& e) {
         if (e.constant && e.set) return 0;
@@ -1859,9 +2133,10 @@ private:
     }
 
     void valu(const Inst& in) {
+        if (gs_geom() && ring_offset_arith(in)) return;
         // TessLift: the operands as they were, for the result's affine form.
         std::vector<Val> sym_ops;
-        if (tess && (in.enc == Enc::VOP2 || in.enc == Enc::VOP3)) {
+        if (sym_on() && (in.enc == Enc::VOP2 || in.enc == Enc::VOP3)) {
             std::uint32_t probe = 0;
             if (int_op(in, 0, 0, 0, probe)) {
                 sym_ops.push_back(peek(in.src0, in));
@@ -1878,10 +2153,12 @@ private:
         const auto unsupported = [&] { reject(std::string("unsupported ") + mnemonic(in)); };
         if (in.enc == Enc::VOP2) {
             if (in.op == 1 || in.op == 2) return lane_op(in);  // v_readlane_b32 / v_writelane_b32
+            if (compute() && (in.op == 35 || in.op == 36)) return mbcnt(in, in.op == 36, in.src0, in.src1);
             if (!vop2(in.op, in, read(in.src0, in), read(in.src1, in), md, nullptr, kVccLo)) unsupported();
             return;
         }
         if (in.enc == Enc::VOP1) {
+            if (in.op == 2 && compute()) return readfirstlane(in);
             if (!vop1(in.op, in, read(in.src0, in), md)) unsupported();
             return;
         }
@@ -1901,6 +2178,13 @@ private:
         if (in.op < 0x140) {
             const std::uint32_t op = in.op - 0x100;
             if (op == 1 || op == 2) return lane_op(in);
+            if (compute() && (op == 35 || op == 36)) {
+                if (in.abs || in.neg || in.omod || in.clamp) {
+                    unsupported();
+                    return;
+                }
+                return mbcnt(in, op == 36, in.src0, in.src1);
+            }
             const Val s0 = read(in.src0, in), s1 = read(in.src1, in);
             const bool takes_mask = op == 0 || (op >= 40 && op <= 42);  // v_cndmask's select, the carry in
             Val mask;
@@ -1915,7 +2199,23 @@ private:
             if (!vop3_only(in.op, in, s0, s1, s2, md)) unsupported();
             return;
         }
+        if (in.op == 0x182 && compute()) return readfirstlane(in);
         if (!vop1(in.op - 0x180, in, read(in.src0, in), md)) unsupported();
+    }
+    // v_readfirstlane_b32 (compute): the first EXEC lane's word, which is
+    // this invocation's where every lane holds it alike.
+    void readfirstlane(const Inst& in) {
+        const Val v = read(in.src0, in);
+        if (v.kind == Kind::Lane) {
+            reject("v_readfirstlane_b32 of a lane mask");
+            return;
+        }
+        if (!uniform(v)) {
+            reject("v_readfirstlane_b32 of a value lanes may hold differently: the first EXEC lane's is another invocation's");
+            return;
+        }
+        write_scalar(in.dst, v);
+        ++first_lane_reads;
     }
 
     void sop1(const Inst& in) {
@@ -2201,6 +2501,7 @@ private:
         switch (in.op) {
         case 0: return;
         case 1: {
+            if (compute()) return;  // a dispatch exports nothing: its stores were made under EXEC already
             const Val e = exec_lane();
             if (tess_hs() || tess_ls()) return;  // outputs written under EXEC already; nothing to discard
             if (vertex_like()) {
@@ -2225,6 +2526,18 @@ private:
         }
         case 2: case 4: case 5: case 6: case 7: case 8: exec_lane(); return;  // region and if bookkeeping happens in emit()
         case 10:  // s_barrier: the patch's control points meet (translate.cpp: a control barrier in a control stage)
+            if (compute()) {
+                // The workgroup's invocations meet, their memory made visible to
+                // each other (the reference names workgroup memory only; the
+                // buffers and images a dispatch shares are uniform and image
+                // memory). Every invocation must reach it: not inside a loop
+                // invocations leave at different iterations.
+                if (!require_converged("s_barrier")) return;
+                m.emit_void(spv::OpControlBarrier, {cu(spv::ScopeWorkgroup), cu(spv::ScopeWorkgroup),
+                                                    cu(spv::MsAcquireRelease | spv::MsUniformMemory | spv::MsWorkgroupMemory | spv::MsImageMemory)});
+                ++barriers;
+                return;
+            }
             if (!tess_hs()) {
                 reject("s_barrier outside a hull shader");
                 return;
@@ -2244,7 +2557,10 @@ private:
                 pending.clear();
             }
             return;
-        case 13: case 14: case 15: case 16: case 17: case 19: case 20: case 21: case 22: return;
+        case 16:  // s_sendmsg: a GS's emit, cut and done (gs_message); nothing in another stage
+            if (gs_geom()) gs_message(in);
+            return;
+        case 13: case 14: case 15: case 17: case 19: case 20: case 21: case 22: return;
         default: reject(std::string("unsupported ") + mnemonic(in));
         }
     }
@@ -2275,8 +2591,569 @@ private:
         ++descriptor_loads;
     }
 
+    // ---- guest memory (compute) ------------------------------------------------------
+    // A dispatch's translation binds no buffer: every load, store and atomic
+    // walks the page table at StageParams::l1_table (translate.cpp xlate,
+    // guest_ptr), V#s and pointers read as data. The lift reads and writes the
+    // same guest memory the same way, each access as the reference makes it:
+    // the address from the same words, the same dwords loaded (a run of them
+    // in one page with one walk), the same format conversions, and stores,
+    // atomics and partial-dword writes made only where the invocation's EXEC
+    // bit is set, as GCN performs them only for the lanes EXEC holds.
+    std::size_t guest_loads = 0, guest_stores = 0, guest_atomics = 0, image_stores = 0;
+    void declare_guest_memory() {
+        p_uni_u64 = m.type_pointer(spv::ScUniform, t_u64);
+        const Id t_block = m.type_struct({t_u32});
+        m.decorate(t_block, spv::DecBlock);
+        m.member_decorate(t_block, 0, spv::DecOffset, {0});
+        p_psb_block = m.type_pointer(spv::ScPhysicalStorageBuffer, t_block);
+        p_psb_u32 = m.type_pointer(spv::ScPhysicalStorageBuffer, t_u32);
+        const Id t_block64 = m.type_struct({t_u64});
+        m.decorate(t_block64, spv::DecBlock);
+        m.member_decorate(t_block64, 0, spv::DecOffset, {0});
+        p_psb_block64 = m.type_pointer(spv::ScPhysicalStorageBuffer, t_block64);
+        p_psb_u64 = m.type_pointer(spv::ScPhysicalStorageBuffer, t_u64);
+        // xlate(va): l1[va >> 32] -> the L2 table; l2[(va >> 16) & 0xffff] ->
+        // the 64 KiB page's device address (translate.h StageParams).
+        fn_xlate = m.begin_function(t_u64, m.type_function(t_u64, {t_u64}));
+        const Id va = m.emit(spv::OpFunctionParameter, t_u64, {});
+        m.label();
+        const Id l1 = m.load(t_u64, m.access_chain(p_uni_u64, ubo_var, {cu(0)}));
+        const Id i1 = ext(spv::GlslUMin, {m.emit(spv::OpShiftRightLogical, t_u64, {va, m.const_u64(32)}), m.const_u64(kL1Entries - 1)}, t_u64);
+        const Id l1_at = m.emit(spv::OpIAdd, t_u64, {l1, m.emit(spv::OpShiftLeftLogical, t_u64, {i1, m.const_u64(3)})});
+        const Id l2 = m.emit(spv::OpLoad, t_u64, {m.access_chain(p_psb_u64, m.emit(spv::OpConvertUToPtr, p_psb_block64, {l1_at}), {cu(0)}), 2u, 8u});
+        const Id i2 = m.emit(spv::OpBitwiseAnd, t_u64, {m.emit(spv::OpShiftRightLogical, t_u64, {va, m.const_u64(kPageShift)}), m.const_u64(kL2Entries - 1)});
+        const Id l2_at = m.emit(spv::OpIAdd, t_u64, {l2, m.emit(spv::OpShiftLeftLogical, t_u64, {i2, m.const_u64(3)})});
+        const Id page = m.emit(spv::OpLoad, t_u64, {m.access_chain(p_psb_u64, m.emit(spv::OpConvertUToPtr, p_psb_block64, {l2_at}), {cu(0)}), 2u, 8u});
+        const Id within = m.emit(spv::OpBitwiseAnd, t_u64, {va, m.const_u64((1ull << kPageShift) - 1)});
+        m.emit_void(spv::OpReturnValue, {m.emit(spv::OpIAdd, t_u64, {page, within})});
+        m.end_function();
+        m.name(fn_xlate, "xlate");
+    }
+    Id make_u64(Id lo, Id hi) {
+        return m.emit(spv::OpBitwiseOr, t_u64, {m.emit(spv::OpUConvert, t_u64, {lo}),
+                                                m.emit(spv::OpShiftLeftLogical, t_u64, {m.emit(spv::OpUConvert, t_u64, {hi}), m.const_u64(32)})});
+    }
+    Id addr_add(Id base64, Id off32) { return m.emit(spv::OpIAdd, t_u64, {base64, m.emit(spv::OpUConvert, t_u64, {off32})}); }
+    Id addr_addc(Id base64, std::uint32_t off) { return off ? m.emit(spv::OpIAdd, t_u64, {base64, m.const_u64(off)}) : base64; }
+    Id host_dword(Id host) { return m.access_chain(p_psb_u32, m.emit(spv::OpConvertUToPtr, p_psb_block, {host}), {cu(0)}); }
+    Id guest_ptr(Id va) { return host_dword(m.emit(spv::OpFunctionCall, t_u64, {fn_xlate, va})); }
+    Id load_u32_at(Id va) { return m.emit(spv::OpLoad, t_u32, {guest_ptr(va), 2u /* Aligned */, 4u}); }
+    void store_u32_at(Id va, Id v) { m.emit_void(spv::OpStore, {guest_ptr(va), v, 2u, 4u}); }
+    // A selection on `cond` whose arms compute `n` words each; their values
+    // joined at the merge (cur_label follows the blocks emitted).
+    std::vector<Id> select_words(Id cond, std::size_t n, const std::function<std::vector<Id>()>& then_arm,
+                                 const std::function<std::vector<Id>()>& else_arm) {
+        const Id l_then = m.fresh(), l_else = m.fresh(), l_merge = m.fresh();
+        m.emit_void(spv::OpSelectionMerge, {l_merge, 0u});
+        m.emit_void(spv::OpBranchConditional, {cond, l_then, l_else});
+        cur_label = m.label(l_then);
+        const std::vector<Id> a = then_arm();
+        const Id end_a = cur_label;
+        m.emit_void(spv::OpBranch, {l_merge});
+        cur_label = m.label(l_else);
+        const std::vector<Id> b = else_arm();
+        const Id end_b = cur_label;
+        m.emit_void(spv::OpBranch, {l_merge});
+        cur_label = m.label(l_merge);
+        std::vector<Id> out;
+        for (std::size_t k = 0; k < n; ++k) out.push_back(m.emit(spv::OpPhi, t_u32, {a[k], end_a, b[k], end_b}));
+        return out;
+    }
+    // translate.cpp load_u32_run: n dwords with one walk when they sit in one page.
+    std::vector<Id> load_u32_run(Id va, int n) {
+        ++guest_loads;
+        if (n == 1) return {load_u32_at(va)};
+        const Id within = m.emit(spv::OpBitwiseAnd, t_u64, {va, m.const_u64((1ull << kPageShift) - 1)});
+        const Id end = m.emit(spv::OpIAdd, t_u64, {within, m.const_u64(static_cast<std::uint64_t>(n) * 4)});
+        const Id one_page = m.emit(spv::OpULessThanEqual, t_bool, {end, m.const_u64(1ull << kPageShift)});
+        return select_words(
+            one_page, static_cast<std::size_t>(n),
+            [&] {
+                const Id host = m.emit(spv::OpFunctionCall, t_u64, {fn_xlate, va});
+                std::vector<Id> w;
+                for (int k = 0; k < n; ++k) {
+                    const Id at = k ? m.emit(spv::OpIAdd, t_u64, {host, m.const_u64(static_cast<std::uint64_t>(k) * 4)}) : host;
+                    w.push_back(m.emit(spv::OpLoad, t_u32, {host_dword(at), 2u, 4u}));
+                }
+                return w;
+            },
+            [&] {
+                std::vector<Id> w;
+                for (int k = 0; k < n; ++k) w.push_back(load_u32_at(addr_addc(va, static_cast<std::uint32_t>(k) * 4)));
+                return w;
+            });
+    }
+    // translate.cpp load_u32_any: n dwords from a byte address of any
+    // alignment, the aligned dwords that cover them shifted together.
+    std::vector<Id> load_u32_any(Id va, int n) {
+        const Id low = m.emit(spv::OpUConvert, t_u32, {m.emit(spv::OpBitwiseAnd, t_u64, {va, m.const_u64(3)})});
+        const Id aligned = m.emit(spv::OpBitwiseAnd, t_u64, {va, m.const_u64(~3ull)});
+        return select_words(
+            ieq(low, cu(0)), static_cast<std::size_t>(n), [&] { return load_u32_run(aligned, n); },
+            [&] {
+                const std::vector<Id> w = load_u32_run(aligned, n + 1);
+                const Id sh = shift(spv::OpShiftLeftLogical, low, cu(3));
+                const Id rsh = ibin(spv::OpISub, cu(32), sh);
+                std::vector<Id> out;
+                for (int k = 0; k < n; ++k) {
+                    out.push_back(ibin(spv::OpBitwiseOr, shift(spv::OpShiftRightLogical, w[static_cast<std::size_t>(k)], sh),
+                                       shift(spv::OpShiftLeftLogical, w[static_cast<std::size_t>(k) + 1], rsh)));
+                }
+                return out;
+            });
+    }
+    // `body` where cond holds, as a selection; nothing joins.
+    void if_then(Id cond, const std::function<void()>& body) {
+        const Id l_then = m.fresh(), l_merge = m.fresh();
+        m.emit_void(spv::OpSelectionMerge, {l_merge, 0u});
+        m.emit_void(spv::OpBranchConditional, {cond, l_then, l_merge});
+        cur_label = m.label(l_then);
+        body();
+        m.emit_void(spv::OpBranch, {l_merge});
+        cur_label = m.label(l_merge);
+    }
+    // translate.cpp store_masked_any: the bytes of (v0, v1) the mask selects,
+    // at a byte address of any alignment - a dword covered whole a plain
+    // store, one covered in part an atomic and/or, so the neighbouring bytes
+    // other invocations store survive. Inside the caller's EXEC guard.
+    void store_masked_any(Id va, Id v0, Id v1, Id m0, Id m1) {
+        const Id low = m.emit(spv::OpUConvert, t_u32, {m.emit(spv::OpBitwiseAnd, t_u64, {va, m.const_u64(3)})});
+        const Id aligned = m.emit(spv::OpBitwiseAnd, t_u64, {va, m.const_u64(~3ull)});
+        const Id sh = shift(spv::OpShiftLeftLogical, low, cu(3));
+        const Id rsh = ibin(spv::OpISub, cu(32), sh);
+        const Id whole = ieq(sh, cu(0));
+        const auto sel = [&](Id c, Id a, Id b) { return m.emit(spv::OpSelect, t_u32, {c, a, b}); };
+        const auto shl = [&](Id a, Id b) { return shift(spv::OpShiftLeftLogical, a, b); };
+        const auto shr = [&](Id a, Id b) { return shift(spv::OpShiftRightLogical, a, b); };
+        const Id dv[3] = {shl(v0, sh), sel(whole, v1, ibin(spv::OpBitwiseOr, shl(v1, sh), shr(v0, rsh))), sel(whole, cu(0), shr(v1, rsh))};
+        const Id dm[3] = {shl(m0, sh), sel(whole, m1, ibin(spv::OpBitwiseOr, shl(m1, sh), shr(m0, rsh))), sel(whole, cu(0), shr(m1, rsh))};
+        for (int k = 0; k < 3; ++k) {
+            const Id at = addr_addc(aligned, static_cast<std::uint32_t>(k) * 4);
+            const Id full = ieq(dm[k], cu(0xffffffffu));
+            if_then(full, [&] { store_u32_at(at, dv[k]); });
+            if_then(m.emit(spv::OpLogicalAnd, t_bool, {m.emit(spv::OpINotEqual, t_bool, {dm[k], cu(0)}), m.emit(spv::OpLogicalNot, t_bool, {full})}), [&] {
+                const Id p = guest_ptr(at);
+                m.emit(spv::OpAtomicAnd, t_u32, {p, cu(spv::ScopeDevice), cu(spv::MsNone), m.emit(spv::OpNot, t_u32, {dm[k]})});
+                m.emit(spv::OpAtomicOr, t_u32, {p, cu(spv::ScopeDevice), cu(spv::MsNone), ibin(spv::OpBitwiseAnd, dv[k], dm[k])});
+            });
+        }
+    }
+    // A value computed where the invocation's EXEC bit is set (an atomic's
+    // result), 0 elsewhere - where the VGPR write that takes it is masked off.
+    Id where_exec_value(const Val& e, const std::function<Id()>& body) {
+        if (e.constant) return e.set ? body() : cu(0);
+        const Id from = cur_label;
+        const Id l_then = m.fresh(), l_merge = m.fresh();
+        m.emit_void(spv::OpSelectionMerge, {l_merge, 0u});
+        m.emit_void(spv::OpBranchConditional, {e.id, l_then, l_merge});
+        cur_label = m.label(l_then);
+        const Id v = body();
+        const Id end = cur_label;
+        m.emit_void(spv::OpBranch, {l_merge});
+        cur_label = m.label(l_merge);
+        return m.emit(spv::OpPhi, t_u32, {v, end, cu(0), from});
+    }
+    // Scalar loads (s_load_dword*, s_buffer_load_dword*): translate.cpp smrd
+    // without a binding - the pointer, or the V#'s 40-bit base, plus the
+    // offset (dwords as an immediate or literal, bytes in an SGPR), its dwords
+    // read with one walk where they share a page. Stored at once and again at
+    // the next s_waitcnt on lgkmcnt, as the reference lands them; every lane
+    // reads the same address, so the words are what every lane holds alike.
+    void guest_scalar_load(const Inst& in, int count) {
+        const Val lo = read(in.src0, in), hi = read(static_cast<std::uint16_t>(in.src0 + 1), in);
+        const Id base = in.op < 8 ? make_u64(as_u(lo), as_u(hi)) : make_u64(as_u(lo), ibin(spv::OpBitwiseAnd, as_u(hi), cu(0xff)));
+        Id off;
+        if (in.imm_flag) {
+            off = cu(static_cast<std::uint32_t>(in.imm) * 4);
+        } else if (in.has_literal) {
+            off = cu(in.literal * 4);  // the CI literal form: dwords, like the immediate (translate.cpp smrd)
+        } else {
+            off = as_u(read(static_cast<std::uint16_t>(in.imm), in));
+        }
+        if (!res.rejections.empty()) return;
+        const std::vector<Id> w = load_u32_run(addr_add(base, off), count);
+        Pending p{in.sdst, {}};
+        for (int k = 0; k < count; ++k) {
+            const Val v = word(w[static_cast<std::size_t>(k)]);
+            write_scalar(static_cast<std::uint16_t>(in.sdst + k), v);
+            p.values.push_back(v);
+        }
+        pending.push_back(std::move(p));
+        ++buffer_loads;
+    }
+    // translate.cpp buffer_address: the V#'s 40-bit base, plus the
+    // instruction's offset, soffset, the index times the V#'s stride (idxen)
+    // and the offset VGPR (offen), as a 32-bit sum.
+    struct GuestAddr {
+        Id addr = 0, w3 = 0;
+    };
+    GuestAddr guest_buffer_address(const Inst& in) {
+        GuestAddr g;
+        if (in.addr64 || in.lds || in.tfe) {
+            reject(std::string(mnemonic(in) ? mnemonic(in) : "a buffer access") + (in.addr64 ? " with addr64" : in.lds ? " into LDS" : " with TFE") +
+                   " is not lifted");
+            return g;
+        }
+        const Id w0 = as_u(read(in.srsrc, in)), w1 = as_u(read(static_cast<std::uint16_t>(in.srsrc + 1), in));
+        const Id base = make_u64(w0, ibin(spv::OpBitwiseAnd, w1, cu(0xff)));
+        const Id stride = ibin(spv::OpBitwiseAnd, shift(spv::OpShiftRightLogical, w1, cu(16)), cu(0x3fff));
+        Id off = ibin(spv::OpIAdd, cu(in.offset12), as_u(read(in.soffset, in)));
+        int va = in.vaddr;
+        if (in.idxen) {
+            const Id index = as_u(value(256 + va++));
+            off = ibin(spv::OpIAdd, off, ibin(spv::OpIMul, index, stride));
+            if (oob_base64) {
+                // gcn::set_oob_count, as the reference's buffer_address: a walk
+                // by index at or past num_records (its stride not 0).
+                const Id records = as_u(read(static_cast<std::uint16_t>(in.srsrc + 2), in));
+                const Id inside = m.emit(spv::OpULessThan, t_bool, {index, records});
+                oob_note(m.emit(spv::OpLogicalAnd, t_bool, {m.emit(spv::OpINotEqual, t_bool, {stride, cu(0)}), m.emit(spv::OpLogicalNot, t_bool, {inside})}),
+                         kOobWalkPastRecords);
+            }
+        }
+        if (in.offen) off = ibin(spv::OpIAdd, off, as_u(value(256 + va)));
+        g.addr = addr_add(base, off);
+        return g;
+    }
+    // translate.cpp format_decode: a static format's components from the
+    // dwords of one element, 0, 0, 0, 1 past them.
+    std::vector<Id> format_decode(const std::vector<Id>& words, std::uint32_t dfmt, std::uint32_t nfmt) {
+        int count = 0, bits[4] = {};
+        std::vector<Id> out(4, cu(0));
+        if (!format_layout(dfmt, count, bits)) return out;
+        for (int k = 0, bit = 0; k < count; bit += bits[k], ++k) {
+            const Id w = words[static_cast<std::size_t>(bit / 32)];
+            const Id raw = bits[k] == 32 ? w : m.emit(spv::OpBitFieldUExtract, t_u32, {w, cu(static_cast<std::uint32_t>(bit % 32)), cu(static_cast<std::uint32_t>(bits[k]))});
+            out[static_cast<std::size_t>(k)] = convert_component(raw, bits[k], nfmt);
+        }
+        for (int k = count; k < 4; ++k) out[static_cast<std::size_t>(k)] = k == 3 ? (nfmt == 4 || nfmt == 5 ? cu(1) : as_u(float_const(1.0f))) : cu(0);
+        return out;
+    }
+    // translate.cpp format_load_dynamic: buffer_load_format_* with the format
+    // from the V#'s word 3, the 32-, 16- and 8-bit families, 0, 0, 0, 1 past
+    // the format's components.
+    std::vector<Id> format_load_dynamic(Id va, Id dfmt, Id nfmt, int want) { return format_decode_dynamic(load_u32_any(va, want), dfmt, nfmt, want); }
+    // translate.cpp format_decode_dynamic: the components from an element's first dwords.
+    std::vector<Id> format_decode_dynamic(const std::vector<Id>& words, Id dfmt, Id nfmt, int want) {
+        const Id w0 = words[0], w1 = want > 1 ? words[1] : w0, w2 = want > 2 ? words[2] : w0, w3 = want > 3 ? words[3] : w0;
+        const auto sel = [&](Id c, Id a, Id b) { return m.emit(spv::OpSelect, t_u32, {c, a, b}); };
+        const auto lor = [&](Id a, Id b) { return m.emit(spv::OpLogicalOr, t_bool, {a, b}); };
+        const Id cnt = sel(lor(lor(ieq(dfmt, cu(1)), ieq(dfmt, cu(2))), ieq(dfmt, cu(4))), cu(1),
+                           sel(lor(lor(ieq(dfmt, cu(3)), ieq(dfmt, cu(5))), ieq(dfmt, cu(11))), cu(2), sel(ieq(dfmt, cu(13)), cu(3), cu(4))));
+        const auto narrow = [&](Id raw, int bits, Id flt_bits) {
+            const Id sext = from_i(m.emit(spv::OpBitFieldSExtract, t_i32, {to_i(raw), cu(0), cu(static_cast<std::uint32_t>(bits))}));
+            const float maxu = static_cast<float>((1u << bits) - 1), maxs = static_cast<float>((1u << (bits - 1)) - 1);
+            const Id unorm = as_u(flt(fdiv(m.emit(spv::OpConvertUToF, t_f32, {raw}), cf(maxu))));
+            const Id snorm = as_u(flt(ext(spv::GlslNMax, {fdiv(m.emit(spv::OpConvertSToF, t_f32, {to_i(sext)}), cf(maxs)), cf(-1.0f)})));
+            const Id uscaled = as_u(flt(m.emit(spv::OpConvertUToF, t_f32, {raw}))), sscaled = as_u(flt(m.emit(spv::OpConvertSToF, t_f32, {to_i(sext)})));
+            return sel(ieq(nfmt, cu(0)), unorm,
+                       sel(lor(ieq(nfmt, cu(1)), ieq(nfmt, cu(6))), snorm,
+                           sel(ieq(nfmt, cu(2)), uscaled, sel(ieq(nfmt, cu(3)), sscaled, sel(ieq(nfmt, cu(4)), raw, sel(ieq(nfmt, cu(5)), sext, flt_bits))))));
+        };
+        std::vector<Id> out;
+        for (int k = 0; k < want; ++k) {
+            const Id word32 = k == 0 ? w0 : k == 1 ? w1 : k == 2 ? w2 : w3;
+            const Id raw16 = m.emit(spv::OpBitFieldUExtract, t_u32, {k < 2 ? w0 : w1, cu(static_cast<std::uint32_t>((k & 1) * 16)), cu(16)});
+            const Id half = as_u(flt(extract(t_f32, ext(spv::GlslUnpackHalf2x16, {raw16}, t_v2f), 0)));
+            const Id v16 = narrow(raw16, 16, half);
+            const Id raw8 = m.emit(spv::OpBitFieldUExtract, t_u32, {w0, cu(static_cast<std::uint32_t>(k * 8)), cu(8)});
+            const Id v8 = narrow(raw8, 8, raw8);
+            const Id is16 = lor(lor(ieq(dfmt, cu(2)), ieq(dfmt, cu(5))), ieq(dfmt, cu(12)));
+            const Id is8 = lor(ieq(dfmt, cu(1)), lor(ieq(dfmt, cu(3)), ieq(dfmt, cu(10))));
+            const Id loaded = sel(is16, v16, sel(is8, v8, word32));
+            const Id missing = k == 3 ? sel(lor(ieq(nfmt, cu(4)), ieq(nfmt, cu(5))), cu(1), as_u(float_const(1.0f))) : cu(0);
+            out.push_back(sel(m.emit(spv::OpULessThan, t_bool, {cu(static_cast<std::uint32_t>(k)), cnt}), loaded, missing));
+        }
+        return out;
+    }
+    // translate.cpp apply_dst_sel_rt: a V#'s DST_SEL over loaded components -
+    // 4..7 a component, 1 one (an integer 1 for an integer format), else 0.
+    // The reference writes the components as loaded and applies the select
+    // only where it is not the identity: the same values.
+    std::vector<Id> apply_dst_sel(const std::vector<Id>& comps, Id w3, Id integer_fmt) {
+        const auto sel = [&](Id c, Id a, Id b) { return m.emit(spv::OpSelect, t_u32, {c, a, b}); };
+        const Id one = sel(integer_fmt, cu(1), as_u(float_const(1.0f)));
+        std::vector<Id> out;
+        for (std::uint32_t k = 0; k < 4; ++k) {
+            const Id s3 = m.emit(spv::OpBitFieldUExtract, t_u32, {w3, cu(3 * k), cu(3)});
+            out.push_back(sel(ieq(s3, cu(4)), comps[0],
+                              sel(ieq(s3, cu(5)), comps[1], sel(ieq(s3, cu(6)), comps[2], sel(ieq(s3, cu(7)), comps[3], sel(ieq(s3, cu(1)), one, cu(0)))))));
+        }
+        return out;
+    }
+    // translate.cpp store_dst_sel_rt: what a format store writes through a
+    // descriptor's DST_SEL - memory component c takes the first data
+    // component whose select names it, 0 where none does. The reference
+    // selects only where the select is not the identity: the same values.
+    std::vector<Id> store_dst_sel(const std::vector<Id>& data, Id w3) {
+        const int n = static_cast<int>(data.size());
+        std::vector<Id> out;
+        for (int c = 0; c < n; ++c) {
+            Id v = cu(0);
+            for (int k = n - 1; k >= 0; --k) {
+                const Id s3 = m.emit(spv::OpBitFieldUExtract, t_u32, {w3, cu(3u * static_cast<std::uint32_t>(k)), cu(3)});
+                v = m.emit(spv::OpSelect, t_u32, {ieq(s3, cu(4u + static_cast<std::uint32_t>(c))), data[static_cast<std::size_t>(k)], v});
+            }
+            out.push_back(v);
+        }
+        return out;
+    }
+    // translate.cpp format_store_dynamic: data in the V#'s data format, the
+    // 32-, 16- (half or unorm16) and 8-bit (unorm8 or raw) families. Inside
+    // the caller's EXEC guard.
+    void format_store_dynamic(Id va, Id dfmt, Id nfmt, const std::vector<Id>& vals) {
+        const int n = static_cast<int>(vals.size());
+        const auto f_at = [&](int k) { return k < n ? as_f(word(vals[static_cast<std::size_t>(k)])) : cf(0.0f); };
+        const auto u_at = [&](int k) { return k < n ? vals[static_cast<std::size_t>(k)] : cu(0); };
+        const auto sel = [&](Id c, Id a, Id b) { return m.emit(spv::OpSelect, t_u32, {c, a, b}); };
+        const auto lor = [&](Id a, Id b) { return m.emit(spv::OpLogicalOr, t_bool, {a, b}); };
+        const auto f2u = [&](Id x) { return m.emit(spv::OpConvertFToU, t_u32, {x}); };
+        const Id is_float = ieq(nfmt, cu(7)), is_unorm = ieq(nfmt, cu(0));
+        const Id is32 = lor(lor(ieq(dfmt, cu(4)), ieq(dfmt, cu(11))), lor(ieq(dfmt, cu(13)), ieq(dfmt, cu(14))));
+        if_then(is32, [&] {
+            const Id cnt = sel(ieq(dfmt, cu(4)), cu(1), sel(ieq(dfmt, cu(11)), cu(2), sel(ieq(dfmt, cu(13)), cu(3), cu(4))));
+            for (int k = 0; k < n; ++k) {
+                if_then(m.emit(spv::OpULessThan, t_bool, {cu(static_cast<std::uint32_t>(k)), cnt}),
+                        [&] { store_u32_at(addr_addc(va, static_cast<std::uint32_t>(k) * 4), vals[static_cast<std::size_t>(k)]); });
+            }
+        });
+        const Id is16 = lor(lor(ieq(dfmt, cu(2)), ieq(dfmt, cu(5))), ieq(dfmt, cu(12)));
+        if_then(is16, [&] {
+            const auto pack16 = [&](int k) {
+                const Id half = ext(spv::GlslPackHalf2x16, {m.emit(spv::OpCompositeConstruct, t_v2f, {f_at(k), f_at(k + 1)})}, t_u32);
+                const auto un = [&](Id v) { return f2u(fadd(fmul(ext(spv::GlslFClamp, {v, cf(0.0f), cf(1.0f)}), cf(65535.0f)), cf(0.5f))); };
+                const Id unorm = ibin(spv::OpBitwiseOr, un(f_at(k)), shift(spv::OpShiftLeftLogical, un(f_at(k + 1)), cu(16)));
+                const Id raw = ibin(spv::OpBitwiseOr, ibin(spv::OpBitwiseAnd, u_at(k), cu(0xffff)), shift(spv::OpShiftLeftLogical, u_at(k + 1), cu(16)));
+                return sel(is_float, half, sel(is_unorm, unorm, raw));
+            };
+            const Id m0 = sel(ieq(dfmt, cu(2)), cu(0xffffu), cu(0xffffffffu));
+            const Id m1 = sel(ieq(dfmt, cu(12)), cu(0xffffffffu), cu(0));
+            store_masked_any(va, pack16(0), pack16(2), m0, m1);
+        });
+        const Id is8 = lor(lor(ieq(dfmt, cu(1)), ieq(dfmt, cu(3))), ieq(dfmt, cu(10)));
+        if_then(is8, [&] {
+            Id packed = cu(0);
+            for (int k = 0; k < 4; ++k) {
+                const Id un = f2u(fadd(fmul(ext(spv::GlslFClamp, {f_at(k), cf(0.0f), cf(1.0f)}), cf(255.0f)), cf(0.5f)));
+                const Id byte = sel(is_unorm, un, ibin(spv::OpBitwiseAnd, u_at(k), cu(0xff)));
+                packed = ibin(spv::OpBitwiseOr, packed, shift(spv::OpShiftLeftLogical, byte, cu(8u * static_cast<std::uint32_t>(k))));
+            }
+            const Id m0 = sel(ieq(dfmt, cu(1)), cu(0xffu), sel(ieq(dfmt, cu(3)), cu(0xffffu), cu(0xffffffffu)));
+            store_masked_any(va, packed, cu(0), m0, cu(0));
+        });
+    }
+    // MUBUF in a compute shader (translate.cpp mubuf, every access through the
+    // page table): format loads and stores through the V#'s word 3, dword,
+    // byte and short loads and stores, buffer_atomic_add.
+    void guest_mubuf(const Inst& in) {
+        const std::uint32_t op = in.op;
+        const char* name = mnemonic(in) ? mnemonic(in) : "unknown";
+        if (op == 112 || op == 113) return;  // cache writeback / invalidate
+        const bool load_format = op <= 3, store_format = op >= 4 && op <= 7, load_small = op >= 8 && op <= 11, load_dw = op >= 12 && op <= 15;
+        const bool store_small = op == 24 || op == 26, store_dw = op >= 28 && op <= 31, atomic_add = op == 50;
+        if (!load_format && !store_format && !load_small && !load_dw && !store_small && !store_dw && !atomic_add) {
+            reject(std::string(name) + " is not lifted");
+            return;
+        }
+        const GuestAddr ga = guest_buffer_address(in);
+        if (!res.rejections.empty()) return;
+        if (load_format) {
+            const Id w3 = as_u(read(static_cast<std::uint16_t>(in.srsrc + 3), in));
+            const Id dfmt = m.emit(spv::OpBitFieldUExtract, t_u32, {w3, cu(15), cu(4)}), nfmt = m.emit(spv::OpBitFieldUExtract, t_u32, {w3, cu(12), cu(3)});
+            const std::vector<Id> comps = format_load_dynamic(ga.addr, dfmt, nfmt, 4);
+            const Id is_int = m.emit(spv::OpLogicalOr, t_bool, {ieq(nfmt, cu(4)), ieq(nfmt, cu(5))});
+            const std::vector<Id> swz = apply_dst_sel(comps, w3, is_int);
+            for (std::uint32_t k = 0; k <= op; ++k) write_v(in.vdata + static_cast<int>(k), word(swz[k]));
+            ++guest_loads;
+            return;
+        }
+        if (load_small) {
+            const Id aligned = m.emit(spv::OpBitwiseAnd, t_u64, {ga.addr, m.const_u64(~3ull)});
+            const Id sh = shift(spv::OpShiftLeftLogical, m.emit(spv::OpUConvert, t_u32, {m.emit(spv::OpBitwiseAnd, t_u64, {ga.addr, m.const_u64(3)})}), cu(3));
+            const Id w = shift(spv::OpShiftRightLogical, load_u32_at(aligned), sh);
+            Id v;
+            if (op == 8) v = ibin(spv::OpBitwiseAnd, w, cu(0xff));
+            else if (op == 9) v = from_i(m.emit(spv::OpBitFieldSExtract, t_i32, {to_i(w), cu(0), cu(8)}));
+            else if (op == 10) v = ibin(spv::OpBitwiseAnd, w, cu(0xffff));
+            else v = from_i(m.emit(spv::OpBitFieldSExtract, t_i32, {to_i(w), cu(0), cu(16)}));
+            write_v(in.vdata, word(v));
+            ++guest_loads;
+            return;
+        }
+        if (load_dw) {
+            const int n = op == 12 ? 1 : op == 13 ? 2 : op == 14 ? 4 : 3;
+            const std::vector<Id> w = load_u32_run(ga.addr, n);
+            for (int k = 0; k < n; ++k) write_v(in.vdata + k, word(w[static_cast<std::size_t>(k)]));
+            return;
+        }
+        const Val e = exec_lane();
+        if (store_format) {
+            const Id w3 = as_u(read(static_cast<std::uint16_t>(in.srsrc + 3), in));
+            const Id dfmt = m.emit(spv::OpBitFieldUExtract, t_u32, {w3, cu(15), cu(4)}), nfmt = m.emit(spv::OpBitFieldUExtract, t_u32, {w3, cu(12), cu(3)});
+            std::vector<Id> vals;
+            for (std::uint32_t k = 0; k < op - 3; ++k) vals.push_back(as_u(value(256 + in.vdata + static_cast<int>(k))));
+            vals = store_dst_sel(vals, w3);
+            where_exec(e, [&] { format_store_dynamic(ga.addr, dfmt, nfmt, vals); });
+        } else if (store_small) {
+            const Id mask = cu(op == 24 ? 0xffu : 0xffffu);
+            const Id v = ibin(spv::OpBitwiseAnd, as_u(value(256 + in.vdata)), mask);
+            where_exec(e, [&] { store_masked_any(ga.addr, v, cu(0), mask, cu(0)); });
+        } else if (store_dw) {
+            const int n = op == 28 ? 1 : op == 29 ? 2 : op == 30 ? 4 : 3;
+            std::vector<Id> vals;
+            for (int k = 0; k < n; ++k) vals.push_back(as_u(value(256 + in.vdata + k)));
+            where_exec(e, [&] {
+                for (int k = 0; k < n; ++k) store_u32_at(addr_addc(ga.addr, static_cast<std::uint32_t>(k) * 4), vals[static_cast<std::size_t>(k)]);
+            });
+        } else {  // buffer_atomic_add: the value before the add where GLC is set
+            const Id v = as_u(value(256 + in.vdata));
+            const Id r = where_exec_value(e, [&] {
+                return m.emit(spv::OpAtomicIAdd, t_u32, {guest_ptr(ga.addr), cu(spv::ScopeDevice), cu(spv::MsNone), v});
+            });
+            if (in.glc) {
+                inst_uniform = false;
+                write_v(in.vdata, word(r));
+            }
+            ++guest_atomics;
+            note += " atomic";
+            return;
+        }
+        ++guest_stores;
+        note += " stored";
+    }
+    // MTBUF in a compute shader (translate.cpp mtbuf without a binding):
+    // typed loads by the instruction's format with the identity select (or
+    // the V#'s, BBHOST_TBUFFER_DST_SEL=1), typed stores of 32-bit components,
+    // halves and unorm8x4 - the forms the reference stores.
+    void guest_mtbuf(const Inst& in) {
+        const int n = (in.op & 3) + 1;
+        int count = 0, bits[4] = {};
+        if (!format_layout(in.dfmt, count, bits)) {
+            reject(std::string(mnemonic(in) ? mnemonic(in) : "a typed buffer access") + " with data format " + std::to_string(in.dfmt));
+            return;
+        }
+        const GuestAddr ga = guest_buffer_address(in);
+        if (!res.rejections.empty()) return;
+        if (in.op < 4) {
+            int total = 0;
+            for (int k = 0; k < count; ++k) total += bits[k];
+            const std::vector<Id> comps = format_decode(load_u32_any(ga.addr, (total + 31) / 32), in.dfmt, in.nfmt);
+            if (tbuffer_dst_sel()) {
+                const Id w3 = as_u(read(static_cast<std::uint16_t>(in.srsrc + 3), in));
+                const std::vector<Id> swz = apply_dst_sel(comps, w3, m.const_bool(in.nfmt == 4 || in.nfmt == 5));
+                for (int k = 0; k < n; ++k) write_v(in.vdata + k, word(swz[static_cast<std::size_t>(k)]));
+            } else {
+                for (int k = 0; k < n; ++k) write_v(in.vdata + k, word(k < count ? comps[static_cast<std::size_t>(k)] : cu(0)));
+            }
+            ++guest_loads;
+            return;
+        }
+        std::vector<Id> vals;
+        for (int k = 0; k < n; ++k) vals.push_back(as_u(value(256 + in.vdata + k)));
+        if (!(bits[0] == 32 || (bits[0] == 16 && in.nfmt == 7) || (bits[0] == 8 && count == 4 && in.nfmt == 0))) {
+            reject("tbuffer store of format " + std::to_string(in.dfmt) + "/" + std::to_string(in.nfmt) + ", which the reference does not store");
+            return;
+        }
+        const Val e = exec_lane();
+        where_exec(e, [&] {
+            if (bits[0] == 32) {
+                for (int k = 0; k < n && k < count; ++k) store_u32_at(addr_addc(ga.addr, static_cast<std::uint32_t>(k) * 4), vals[static_cast<std::size_t>(k)]);
+            } else if (bits[0] == 16) {
+                for (int k = 0; k < n && k < count; k += 2) {
+                    const Id a = as_f(word(vals[static_cast<std::size_t>(k)]));
+                    const Id b = k + 1 < n ? as_f(word(vals[static_cast<std::size_t>(k) + 1])) : cf(0.0f);
+                    const Id packed = ext(spv::GlslPackHalf2x16, {m.emit(spv::OpCompositeConstruct, t_v2f, {a, b})}, t_u32);
+                    store_masked_any(addr_addc(ga.addr, static_cast<std::uint32_t>(k / 2) * 4), packed, cu(0), cu(k + 1 < count ? 0xffffffffu : 0xffffu), cu(0));
+                }
+            } else {
+                Id packed = cu(0);
+                for (int k = 0; k < 4; ++k) {
+                    const Id v = k < n ? as_f(word(vals[static_cast<std::size_t>(k)])) : cf(0.0f);
+                    const Id b = m.emit(spv::OpConvertFToU, t_u32, {fadd(fmul(ext(spv::GlslFClamp, {v, cf(0.0f), cf(1.0f)}), cf(255.0f)), cf(0.5f))});
+                    packed = ibin(spv::OpBitwiseOr, packed, shift(spv::OpShiftLeftLogical, b, cu(8u * static_cast<std::uint32_t>(k))));
+                }
+                store_masked_any(ga.addr, packed, cu(0), cu(0xffffffffu), cu(0));
+            }
+        });
+        ++guest_stores;
+        note += " stored";
+    }
+    // image_store(_mip) in a compute shader (translate.cpp mimg): the
+    // texel at the integer coordinates, its components the VGPRs DMASK names
+    // (0 for the others) put through the inverse of the T#'s select, written
+    // where the invocation's EXEC bit is set. The reference writes level 0 of
+    // the view the host binds for the T# for image_store_mip too.
+    void guest_image_store(const Inst& in) {
+        const auto ii = ref.image_at.find(in.offset);
+        if (ii == ref.image_at.end() || ii->second >= image_vars.size() || !ref.images[ii->second].storage) {
+            reject(std::string("the reference has no storage image binding for this ") + (mnemonic(in) ? mnemonic(in) : "image store"));
+            return;
+        }
+        if (in.tfe || in.lwe) {
+            reject(std::string(mnemonic(in) ? mnemonic(in) : "an image store") + " with TFE or LWE");
+            return;
+        }
+        const ImageBinding& b = ref.images[ii->second];
+        const int ncoord = coord_count(b.dim, b.arrayed);
+        std::vector<Id> coords;
+        for (int k = 0; k < ncoord; ++k) coords.push_back(to_i(as_u(value(256 + in.vaddr + k))));
+        const Id coord = ncoord == 1 ? coords[0] : m.emit(spv::OpCompositeConstruct, ncoord == 2 ? t_v2i : ncoord == 3 ? t_v3i : m.type_vector(t_i32, 4), coords);
+        std::vector<Id> raws;
+        for (int k = 0, next = 0; k < 4; ++k) raws.push_back((in.dmask >> k) & 1 ? as_u(value(256 + in.vdata + next++)) : cu(0));
+        raws = store_dst_sel(raws, as_u(read(static_cast<std::uint16_t>(in.srsrc + 3), in)));
+        std::vector<Id> vals;
+        for (const Id r : raws) vals.push_back(b.kind == 1 ? r : b.kind == 2 ? to_i(r) : as_f(word(r)));
+        const Id texel = m.emit(spv::OpCompositeConstruct, b.kind == 1 ? t_v4u : b.kind == 2 ? m.type_vector(t_i32, 4) : t_v4f, vals);
+        if (!res.rejections.empty()) return;
+        if (oob_base64) oob_image(ii->second, b, coords, in.op == 9 ? to_i(as_u(value(256 + in.vaddr + ncoord))) : 0, true, in);  // gcn::set_oob_count
+        // gcn::set_image_store_bounds, as the reference: the lanes outside the
+        // view's size and layers skip the store, as GCN writes nothing there.
+        Id inside = 0;
+        if (image_store_bounds()) {
+            m.capability(spv::CapImageQuery);
+            const Id size = m.emit(spv::OpImageQuerySize, ncoord == 1 ? t_i32 : ncoord == 2 ? t_v2i : ncoord == 3 ? t_v3i : m.type_vector(t_i32, 4),
+                                   {image_only(ii->second)});
+            for (int k = 0; k < ncoord; ++k) {
+                const Id dim_k = from_i(ncoord == 1 ? size : extract(t_i32, size, static_cast<std::uint32_t>(k)));
+                const Id ok = m.emit(spv::OpULessThan, t_bool, {from_i(coords[static_cast<std::size_t>(k)]), dim_k});
+                inside = inside ? m.emit(spv::OpLogicalAnd, t_bool, {inside, ok}) : ok;
+            }
+        }
+        where_exec(exec_lane(), [&] {
+            const auto write = [&] { m.emit_void(spv::OpImageWrite, {image_only(ii->second), coord, texel}); };
+            if (inside) {
+                where_true(inside, write);
+            } else {
+                write();
+            }
+        });
+        ++image_stores;
+        note += " stored";
+    }
+
     void smrd(const Inst& in) {
         const int count = in.op < 8 ? (1 << in.op) : (in.op < 13 ? (1 << (in.op - 8)) : 0);
+        if (compute()) {
+            if (in.op == 30) {  // s_memtime: 0, as the reference
+                write_scalar(in.sdst, word_const(0));
+                write_scalar(static_cast<std::uint16_t>(in.sdst + 1), word_const(0));
+                return;
+            }
+            if (in.op == 31) return;  // s_dcache_inv
+            if (!count || count > 16) {
+                reject(std::string(mnemonic(in) ? mnemonic(in) : "a scalar memory instruction") + " is not lifted");
+                return;
+            }
+            // A load the lean reference bound reads its storage buffer (below);
+            // one it walks, the page table, as it does.
+            if (!opt.cb_ssbo || !ref.buffer_at.count(in.offset)) {
+                guest_scalar_load(in, count);
+                return;
+            }
+            ++cs_bound_loads;
+        }
+        if (gs && ring_descriptor_load(in)) return;
         const auto site = ref.buffer_at.find(in.offset);
         if (count && site == ref.buffer_at.end()) return descriptor_load(in, count);
         if (!count || site == ref.buffer_at.end() || site->second >= buffer_vars.size()) {
@@ -2311,7 +3188,7 @@ private:
             ++constant_loads;
             return;
         }
-        const Id bias = params_load(bias_loads, 4, index);
+        const Id bias = cb_bias(index);
         Pending p{in.sdst, {}};
         for (int k = 0; k < count; ++k) {
             const Id at = m.emit(spv::OpIAdd, t_u32, {bias, cu(off_dw + static_cast<std::uint32_t>(k))});
@@ -2332,7 +3209,7 @@ private:
     std::size_t ranged_loads = 0;
     void ranged_load(const Inst& in, int count, std::uint32_t index) {
         const Id first = shift(spv::OpShiftRightLogical, as_u(read(static_cast<std::uint16_t>(in.imm), in)), cu(2));
-        const Id bias = params_load(bias_loads, 4, index);
+        const Id bias = cb_bias(index);
         const Id range_dw = params_load(stride_loads, 5, index);
         Pending p{in.sdst, {}};
         for (int k = 0; k < count; ++k) {
@@ -2365,6 +3242,8 @@ private:
         const Id v = m.emit(spv::OpSelect, t_u32, {m.emit(spv::OpINotEqual, t_bool, {spec, cu(0)}), spec, loaded});
         return values.emplace(index, v).first->second;
     }
+    // buffers[index]'s dword bias inside its binding, as translate.cpp cb_bias reads it.
+    Id cb_bias(std::uint32_t index) { return opt.cb_bias_zero ? cu(0) : params_load(bias_loads, 4, index); }
     Id params_load(std::map<std::uint32_t, Id>& cache, std::uint32_t member, std::uint32_t index) {
         auto it = cache.find(index);
         if (it == cache.end()) {
@@ -2421,6 +3300,17 @@ private:
     // element at dword (offset12 + soffset) / 4 + index * stride / 4, decoded
     // by its static format, with the identity select (gcn::tbuffer_dst_sel).
     void mtbuf(const Inst& in) {
+        if (compute()) {
+            // What the lean reference bound reads or writes the binding; the rest walks.
+            const auto site = ref.buffer_at.find(in.offset);
+            if (!opt.cb_ssbo || site == ref.buffer_at.end()) return guest_mtbuf(in);
+            if (bound_element_shape(in)) return bound_element_cs(in, site->second);
+            if (in.op >= 4) {
+                reject(std::string(mnemonic(in)) + ": a store the reference binds in a shape the lift does not take");
+                return;
+            }
+            ++cs_bound_loads;
+        }
         if (in.op >= 4) {
             reject(std::string(mnemonic(in)) + " is not lifted");
             return;
@@ -2440,15 +3330,43 @@ private:
         }
         const std::uint32_t index = site->second;
         const Id stride_dw = shift(spv::OpShiftRightLogical, stride_value(index), cu(2));
-        const Id first = ibin(spv::OpIAdd, cu(static_cast<std::uint32_t>(off / 4)), ibin(spv::OpIMul, as_u(value(256 + in.vaddr)), stride_dw));
-        const Id bias = params_load(bias_loads, 4, index);
+        const Id vindex = as_u(value(256 + in.vaddr));
+        Id first = ibin(spv::OpIAdd, cu(static_cast<std::uint32_t>(off / 4)), ibin(spv::OpIMul, vindex, stride_dw));
+        if (oob_base64) {
+            // gcn::set_oob_count, as the reference: an index at or past
+            // num_records, and a read past the binding.
+            const Id records = as_u(read(static_cast<std::uint16_t>(in.srsrc + 2), in));
+            const Id limit = oob_control() ? shift(spv::OpShiftRightLogical, records, cu(1)) : records;  // gcn::set_oob_control
+            oob_note(oob_sampled(m.emit(spv::OpLogicalNot, t_bool, {m.emit(spv::OpULessThan, t_bool, {vindex, limit})}), vindex), kOobPastRecords);
+            int total_bits = 0;
+            for (int k = 0; k < count; ++k) total_bits += bits[k];
+            const Id length = m.emit(spv::OpArrayLength, t_u32, {buffer_vars[index], 0u});
+            const Id last = ibin(spv::OpIAdd, cb_bias(index), ibin(spv::OpIAdd, first, cu(static_cast<std::uint32_t>((total_bits + 31) / 32 - 1))));
+            oob_note(m.emit(spv::OpLogicalNot, t_bool, {m.emit(spv::OpULessThan, t_bool, {last, length})}), kOobPastBinding);
+        }
+        // gcn::set_index_bounds, as the reference: past num_records the
+        // binding's first element is read and the words are 0.
+        Id ok = 0;
+        if (index_bounds()) {
+            ok = m.emit(spv::OpULessThan, t_bool, {vindex, as_u(read(static_cast<std::uint16_t>(in.srsrc + 2), in))});
+            first = m.emit(spv::OpSelect, t_u32, {ok, first, cu(static_cast<std::uint32_t>(off / 4))});
+        }
+        const Id bias = cb_bias(index);
         int total = 0;
         for (int k = 0; k < count; ++k) total += bits[k];
         std::vector<Id> words;
         for (int k = 0; k < (total + 31) / 32; ++k) {
             const Id at = ibin(spv::OpIAdd, bias, ibin(spv::OpIAdd, first, cu(static_cast<std::uint32_t>(k))));
-            words.push_back(m.load(t_u32, m.access_chain(p_ssbo_u32, buffer_vars[index], {cu(0), at})));
+            const Id w = m.load(t_u32, m.access_chain(p_ssbo_u32, buffer_vars[index], {cu(0), at}));
+            words.push_back(ok ? m.emit(spv::OpSelect, t_u32, {ok, w, cu(0)}) : w);
         }
+        typed_load_result(in, words, count, bits);
+        ++buffer_loads;
+    }
+    // A typed load's VGPRs from the dwords of its element, as the translator
+    // decodes them (format_decode) and writes them: the identity select, or
+    // the V#'s with BBHOST_TBUFFER_DST_SEL=1.
+    void typed_load_result(const Inst& in, const std::vector<Id>& words, int count, const int bits[4]) {
         const bool integer = in.nfmt == 4 || in.nfmt == 5;
         const Id one = integer ? cu(1) : as_u(float_const(1.0f));
         std::vector<Id> comps(4, cu(0));
@@ -2473,7 +3391,206 @@ private:
             for (int k = 0; k < (in.op & 3) + 1; ++k) out.push_back(word(k < count ? comps[static_cast<std::size_t>(k)] : cu(0)));
         }
         for (std::size_t k = 0; k < out.size(); ++k) write_v(in.vdata + static_cast<int>(k), out[k]);
-        ++buffer_loads;
+    }
+
+    // translate.cpp bound_compute_access, which a lean reference binds: an
+    // element at a VGPR index or offset through a V#'s storage buffer - typed
+    // loads at a VGPR offset, typed stores of 32-bit components,
+    // buffer_load_format_* with the V#'s format, buffer_atomic_add. The
+    // element's first dword (offset12 + soffset) / 4, plus index * stride / 4
+    // with idxen, plus the VGPR offset / 4 with offen; an index at or past
+    // num_records - or, with no index, a dword at or past the range in
+    // cb_stride - reads 0 and is not written; stores and the atomic only where
+    // the invocation's EXEC bit is set. The same expressions as the reference,
+    // in its order.
+    static bool bound_element_shape(const Inst& in) {
+        const bool mt = in.enc == Enc::MTBUF;
+        const int kind = mt ? (in.op < 4 ? 1 : in.op < 8 ? 2 : 0) : (in.op <= 3 ? 3 : in.op == 50 ? 4 : 0);
+        return kind && (in.idxen || in.offen) && !(kind == 1 && !in.offen);
+    }
+    std::size_t cs_bound_elements = 0;
+    void bound_element_cs(const Inst& in, std::uint32_t index) {
+        const std::string name = mnemonic(in) ? mnemonic(in) : "a buffer access";
+        const bool mt = in.enc == Enc::MTBUF;
+        const bool typed_load = mt && in.op < 4, typed_store = mt && in.op >= 4, format_load = !mt && in.op <= 3, atomic_add = !mt && in.op == 50;
+        if (index >= buffer_vars.size()) {
+            reject(name + " is not read through a storage buffer the reference binds");
+            return;
+        }
+        const BufferBinding& b = ref.buffers[index];
+        const std::int32_t constant = in.soffset <= 192 ? static_cast<std::int32_t>(in.soffset) - 128 : 192 - static_cast<std::int32_t>(in.soffset);
+        const std::int32_t off = static_cast<std::int32_t>(in.offset12) + constant;
+        int count = 0, bits[4] = {};
+        if ((in.idxen ? !b.indexed : !b.ranged) || ((typed_store || atomic_add) && !b.written) || in.addr64 || in.lds || in.tfe || in.soffset < 128 ||
+            in.soffset > 208 || off < 0 || off % 4 != 0 || (mt && (!format_layout(in.dfmt, count, bits) || bits[0] != 32))) {
+            reject(name + ": the reference's bound element has another shape");
+            return;
+        }
+        int va = in.vaddr;
+        Id first = cu(static_cast<std::uint32_t>(off / 4));
+        Id index_ok = 0, vindex = 0, voffset = 0, records = 0;
+        bool index_zero = false;
+        if (in.idxen) {
+            const Val vi = value(256 + va++);
+            vindex = as_u(vi);
+            // An index the lift knows is 0 adds nothing: no stride is read
+            // (DXC would drop the stride's specialization constant, which
+            // the HLSL path's interface check then misses).
+            index_zero = vi.constant && vi.bits == 0;
+            if (!index_zero) {
+                const Id stride_dw = shift(spv::OpShiftRightLogical, stride_value(index), cu(2));
+                first = ibin(spv::OpIAdd, first, ibin(spv::OpIMul, vindex, stride_dw));
+            }
+            records = as_u(read(static_cast<std::uint16_t>(in.srsrc + 2), in));
+            index_ok = m.emit(spv::OpULessThan, t_bool, {vindex, records});
+        }
+        if (in.offen) {
+            voffset = as_u(value(256 + va));
+            first = ibin(spv::OpIAdd, first, shift(spv::OpShiftRightLogical, voffset, cu(2)));
+        }
+        if (!res.rejections.empty()) return;
+        const Id bias = cb_bias(index);
+        const Id range_dw = in.idxen ? 0 : params_load(stride_loads, 5, index);
+        const auto ok_at = [&](Id at) { return in.idxen ? index_ok : m.emit(spv::OpULessThan, t_bool, {at, range_dw}); };
+        const auto word_ptr = [&](Id at) { return m.access_chain(p_ssbo_u32, buffer_vars[index], {cu(0), ibin(spv::OpIAdd, bias, at)}); };
+        const auto load_at = [&](Id at) {
+            const Id ok = ok_at(at);
+            const Id w = m.load(t_u32, word_ptr(m.emit(spv::OpSelect, t_u32, {ok, at, cu(0)})));
+            return m.emit(spv::OpSelect, t_u32, {ok, w, cu(0)});
+        };
+        // `body` where `cond` holds, as the reference's if_then.
+        const auto where = [&](Id cond, const std::function<void()>& body) {
+            const Id l_then = m.fresh(), l_merge = m.fresh();
+            m.emit_void(spv::OpSelectionMerge, {l_merge, 0u});
+            m.emit_void(spv::OpBranchConditional, {cond, l_then, l_merge});
+            cur_label = m.label(l_then);
+            body();
+            m.emit_void(spv::OpBranch, {l_merge});
+            cur_label = m.label(l_merge);
+        };
+        ++cs_bound_elements;
+        if (typed_load) {
+            std::vector<Id> words;
+            for (int k = 0; k < count; ++k) words.push_back(load_at(ibin(spv::OpIAdd, first, cu(static_cast<std::uint32_t>(k)))));
+            typed_load_result(in, words, count, bits);
+            return;
+        }
+        if (format_load) {
+            const Id w3 = as_u(read(static_cast<std::uint16_t>(in.srsrc + 3), in));
+            const Id dfmt = m.emit(spv::OpBitFieldUExtract, t_u32, {w3, cu(15), cu(4)}), nfmt = m.emit(spv::OpBitFieldUExtract, t_u32, {w3, cu(12), cu(3)});
+            const auto sel = [&](Id c, Id a, Id x) { return m.emit(spv::OpSelect, t_u32, {c, a, x}); };
+            std::vector<Id> words;
+            if (in.idxen) {
+                // translate.cpp: at a byte offset, the element's dwords funnel-shifted
+                // out of the binding's (any stride; past the records 0).
+                const Id stride = index_zero ? cu(0) : stride_value(index);
+                Id at_byte = ibin(spv::OpIAdd, cu(static_cast<std::uint32_t>(off)), ibin(spv::OpIMul, vindex, stride));
+                if (in.offen) at_byte = ibin(spv::OpIAdd, at_byte, voffset);
+                const Id d0 = shift(spv::OpShiftRightLogical, at_byte, cu(2));
+                const Id sh = shift(spv::OpShiftLeftLogical, ibin(spv::OpBitwiseAnd, at_byte, cu(3)), cu(3));
+                const Id end_dw = shift(spv::OpShiftRightLogical, ibin(spv::OpIAdd, ibin(spv::OpIMul, records, index_zero ? stride_value(index) : stride), cu(3)), cu(2));
+                std::vector<Id> raw;
+                for (std::uint32_t k = 0; k < 5; ++k) {
+                    const Id at = ibin(spv::OpIAdd, d0, cu(k));
+                    const Id ok = m.emit(spv::OpLogicalAnd, t_bool, {index_ok, m.emit(spv::OpULessThan, t_bool, {at, end_dw})});
+                    const Id w = m.load(t_u32, word_ptr(sel(ok, at, cu(0))));
+                    raw.push_back(sel(ok, w, cu(0)));
+                }
+                const Id aligned = ieq(sh, cu(0));
+                const Id back = ibin(spv::OpISub, cu(32), sh);
+                for (std::uint32_t k = 0; k < 4; ++k) {
+                    words.push_back(sel(aligned, raw[k],
+                                        ibin(spv::OpBitwiseOr, shift(spv::OpShiftRightLogical, raw[k], sh), shift(spv::OpShiftLeftLogical, raw[k + 1], back))));
+                }
+            } else {
+                const Id last = sel(m.emit(spv::OpLogicalOr, t_bool, {ieq(dfmt, cu(11)), ieq(dfmt, cu(12))}), cu(1),
+                                    sel(ieq(dfmt, cu(13)), cu(2), sel(ieq(dfmt, cu(14)), cu(3), cu(0))));
+                for (std::uint32_t k = 0; k < 4; ++k) {
+                    const Id kk = k ? ext(spv::GlslUMin, {cu(k), last}, t_u32) : cu(0);
+                    words.push_back(load_at(ibin(spv::OpIAdd, first, kk)));
+                }
+            }
+            const std::vector<Id> comps = format_decode_dynamic(words, dfmt, nfmt, 4);
+            const Id is_int = m.emit(spv::OpLogicalOr, t_bool, {ieq(nfmt, cu(4)), ieq(nfmt, cu(5))});
+            const std::vector<Id> swz = apply_dst_sel(comps, w3, is_int);
+            for (std::uint32_t k = 0; k <= in.op; ++k) write_v(in.vdata + static_cast<int>(k), word(swz[k]));
+            return;
+        }
+        const Val e = exec_lane();
+        if (typed_store) {
+            const int n = (in.op & 3) + 1;
+            std::vector<Id> vals;
+            for (int k = 0; k < n; ++k) vals.push_back(as_u(value(256 + in.vdata + k)));
+            where_exec(e, [&] {
+                for (int k = 0; k < n && k < count; ++k) {
+                    const Id at = ibin(spv::OpIAdd, first, cu(static_cast<std::uint32_t>(k)));
+                    where(ok_at(at), [&] { m.store(word_ptr(at), vals[static_cast<std::size_t>(k)]); });
+                }
+            });
+            note += " stored";
+            return;
+        }
+        // buffer_atomic_add: the value before the add where GLC is set, 0 where it did not run.
+        const Id v = as_u(value(256 + in.vdata));
+        const Id r = where_exec_value(e, [&] {
+            const Id ok = ok_at(first);
+            const Id from = cur_label;
+            const Id l_then = m.fresh(), l_merge = m.fresh();
+            m.emit_void(spv::OpSelectionMerge, {l_merge, 0u});
+            m.emit_void(spv::OpBranchConditional, {ok, l_then, l_merge});
+            cur_label = m.label(l_then);
+            const Id added = m.emit(spv::OpAtomicIAdd, t_u32, {word_ptr(first), cu(spv::ScopeDevice), cu(spv::MsNone), v});
+            const Id end = cur_label;
+            m.emit_void(spv::OpBranch, {l_merge});
+            cur_label = m.label(l_merge);
+            return m.emit(spv::OpPhi, t_u32, {added, end, cu(0), from});
+        });
+        if (in.glc) {
+            inst_uniform = false;
+            write_v(in.vdata, word(r));
+        }
+        note += " atomic";
+    }
+
+    // buffer_store_dword* a compute shader's lean reference makes through a
+    // binding (translate.cpp store_bound): dword (soffset + offset12) >> 2 + k
+    // of the V#'s binding, each written where it is inside the V#'s range in
+    // dwords (StageParams::cb_stride) and the invocation's EXEC bit is set, as
+    // the reference's exec_guard and range check have it. A dispatch has no
+    // helper invocations, and a store in a loop runs in each iteration the
+    // invocation runs, as the guest stores do.
+    std::size_t cs_bound_loads = 0, cs_bound_stores = 0;
+    void bound_store_cs(const Inst& in, std::uint32_t index) {
+        if (index >= buffer_vars.size() || !ref.buffers[index].written) {
+            reject(std::string(mnemonic(in)) + " is not a store the reference makes through a binding");
+            return;
+        }
+        if (in.idxen || in.offen || in.addr64) {
+            reject(std::string(mnemonic(in)) + ": the reference's bound store has another shape");
+            return;
+        }
+        const int n = in.op == 28 ? 1 : in.op == 29 ? 2 : in.op == 30 ? 4 : 3;
+        const Id first = shift(spv::OpShiftRightLogical, ibin(spv::OpIAdd, cu(in.offset12), as_u(read(in.soffset, in))), cu(2));
+        const Id bias = cb_bias(index);
+        const Id range_dw = params_load(stride_loads, 5, index);
+        std::vector<Id> vals;
+        for (int k = 0; k < n; ++k) vals.push_back(as_u(value(256 + in.vdata + k)));
+        if (!res.rejections.empty()) return;
+        where_exec(exec_lane(), [&] {
+            for (int k = 0; k < n; ++k) {
+                const Id at = ibin(spv::OpIAdd, first, cu(static_cast<std::uint32_t>(k)));
+                const Id in_range = m.emit(spv::OpULessThan, t_bool, {at, range_dw});
+                const Id l_store = m.fresh(), l_merge = m.fresh();
+                m.emit_void(spv::OpSelectionMerge, {l_merge, 0u});
+                m.emit_void(spv::OpBranchConditional, {in_range, l_store, l_merge});
+                m.label(l_store);
+                m.store(m.access_chain(p_ssbo_u32, buffer_vars[index], {cu(0), ibin(spv::OpIAdd, bias, at)}), vals[static_cast<std::size_t>(k)]);
+                m.emit_void(spv::OpBranch, {l_merge});
+                cur_label = m.label(l_merge);
+            }
+        });
+        note += " stored";
+        ++cs_bound_stores;
     }
 
     // buffer_store_dword* the reference makes through a binding (translate.cpp
@@ -2485,6 +3602,15 @@ private:
     // runs once per invocation where the translation's runs.
     std::size_t buffer_stores = 0;
     void mubuf(const Inst& in) {
+        if (compute()) {
+            const auto site = ref.buffer_at.find(in.offset);
+            if (!opt.cb_ssbo || site == ref.buffer_at.end()) return guest_mubuf(in);
+            if (bound_element_shape(in)) return bound_element_cs(in, site->second);
+            if (in.op >= 28 && in.op <= 31) return bound_store_cs(in, site->second);
+            reject(std::string(mnemonic(in)) + ": the reference binds it in a shape the lift does not take");
+            return;
+        }
+        if (gs && ring_access(in)) return;
         if (in.op < 28 || in.op > 31) {
             reject(std::string(mnemonic(in)) + " is not lifted");
             return;
@@ -2511,7 +3637,7 @@ private:
         const int n = in.op == 28 ? 1 : in.op == 29 ? 2 : in.op == 30 ? 4 : 3;
         const std::uint32_t index = site->second;
         const Id first = shift(spv::OpShiftRightLogical, ibin(spv::OpIAdd, cu(in.offset12), as_u(read(in.soffset, in))), cu(2));
-        const Id bias = params_load(bias_loads, 4, index);
+        const Id bias = cb_bias(index);
         const Id range_dw = params_load(stride_loads, 5, index);
         for (int k = 0; k < n; ++k) {
             const Id v = as_u(value(256 + in.vdata + k));
@@ -2556,8 +3682,11 @@ private:
             const Id count = ibin(spv::OpBitwiseAnd, ibin(spv::OpShiftRightLogical, d, cu(4)), cu(7));
             const Id integer = m.emit(spv::OpLogicalOr, t_bool, {ieq(kind, cu(2)), ieq(kind, cu(4))});
             const Id one = m.emit(spv::OpSelect, t_u32, {integer, cu(1), cu(std::bit_cast<std::uint32_t>(1.0f))});
+            const Id packing = ibin(spv::OpBitwiseAnd, ibin(spv::OpShiftRightLogical, d, cu(12)), cu(3));  // VertexElement::packed
             for (std::uint32_t k = 0; k < el.count && k < 4; ++k) {
-                const Id c = extract(t_u32, raw, k);
+                const Id byte = m.emit(spv::OpBitFieldUExtract, t_u32, {extract(t_u32, raw, 0), cu(8 * k), cu(8)});
+                const Id half = m.emit(spv::OpBitFieldUExtract, t_u32, {extract(t_u32, raw, k / 2), cu(16 * (k % 2)), cu(16)});
+                const Id c = m.emit(spv::OpSelect, t_u32, {ieq(packing, cu(1)), byte, m.emit(spv::OpSelect, t_u32, {ieq(packing, cu(2)), half, extract(t_u32, raw, k)})});
                 const Id unorm8 = m.emit(spv::OpBitcast, t_u32, {fdiv(m.emit(spv::OpConvertUToF, t_f32, {c}), cf(255.0f))});
                 const Id sint16 = from_i(m.emit(spv::OpBitFieldSExtract, t_i32, {to_i(c), cu(0), cu(16)}));
                 // kinds 1 and 2: the raw bits
@@ -2596,15 +3725,16 @@ private:
                 reject("vertex input: unsupported buffer data format " + std::to_string(dfmt));
                 return;
             }
-            const bool packed = dfmt >= 6 && dfmt <= 9;
+            // A packed format, or components the host packed (VertexElement::packed): taken from the input's dwords.
+            const bool packed = (dfmt >= 6 && dfmt <= 9) || (el.packed && el.packed == vertex_packed_bits(dfmt));
             const Id one = nfmt == 4 || nfmt == 5 ? cu(1) : as_u(float_const(1.0f));
             std::vector<Id> comps(4, cu(0));
             {
                 EntryScope entry(m);  // inputs and their conversions dominate every block
                 const Id raw = m.load(t_v4u, var);
                 for (int k = 0, bit = 0; k < count; bit += bits[k], ++k) {
-                    const Id c = packed ? m.emit(spv::OpBitFieldUExtract, t_u32, {extract(t_u32, raw, 0), cu(static_cast<std::uint32_t>(bit)),
-                                                                                  cu(static_cast<std::uint32_t>(bits[k]))})
+                    const Id c = packed ? m.emit(spv::OpBitFieldUExtract, t_u32, {extract(t_u32, raw, static_cast<std::uint32_t>(bit / 32)),
+                                                                                  cu(static_cast<std::uint32_t>(bit % 32)), cu(static_cast<std::uint32_t>(bits[k]))})
                                         : extract(t_u32, raw, static_cast<std::uint32_t>(k));
                     comps[static_cast<std::size_t>(k)] = convert_component(c, bits[k], nfmt);
                 }
@@ -3049,6 +4179,7 @@ private:
             ops.push_back(spv::IoLod);
             ops.push_back(to_i(as_u(vgpr(in.vaddr + ncoord))));
         }
+        if (oob_base64) oob_image(ii->second, b, coords, in.op == 1 ? ops.back() : 0, false, in);  // gcn::set_oob_count
         const Id texel_type = b.kind == 1 ? t_v4u : b.kind == 2 ? m.type_vector(t_i32, 4) : t_v4f;
         Id texel = m.emit(spv::OpImageFetch, texel_type, ops);
         if (b.kind) texel = m.emit(spv::OpBitcast, t_v4f, {texel});
@@ -3079,6 +4210,10 @@ private:
         }
         if (op == 0 || op == 1 || op == 14) {
             image_load_or_size(in);
+            return;
+        }
+        if ((op == 8 || op == 9) && compute()) {
+            guest_image_store(in);
             return;
         }
         if (!(op >= 32 && op < 64)) {
@@ -3301,6 +4436,10 @@ private:
             reject("an export in the LS, whose output is its LDS writes");
             return;
         }
+        if (gs) {
+            reject("an export in the ES or the GS, which write their rings (the copy shader exports)");
+            return;
+        }
         if (!open_loops.empty()) {
             reject("export inside a loop");
             return;
@@ -3428,6 +4567,7 @@ private:
     std::size_t swizzles = 0, block_swizzles = 0;  // block_swizzles: inside a whole-quad block over a varying EXEC
     Id quad_right = 0, quad_bottom = 0;  // this invocation's column and row in its quad
     void quad_caps() {
+        if (!subgroup_ops_in(opt)) reject("a quad operation in a stage the device runs no subgroup operations in");
         m.capability(spv::CapGroupNonUniform);
         m.capability(spv::CapGroupNonUniformQuad);
     }
@@ -3494,6 +4634,119 @@ private:
     }
     // `body` where the invocation's EXEC bit is set: GCN writes LDS only from
     // the lanes EXEC holds (translate.cpp exec_guard).
+    // gcn::set_oob_count: one more of `kind` for this program where `cond`
+    // holds in a lane EXEC holds.
+    void oob_note(Id cond, std::uint32_t kind) {
+        if (!oob_base64) return;
+        where_exec(exec_lane(), [&] {
+            const Id l_then = m.fresh(), l_merge = m.fresh();
+            m.emit_void(spv::OpSelectionMerge, {l_merge, 0u});
+            m.emit_void(spv::OpBranchConditional, {cond, l_then, l_merge});
+            cur_label = m.label(l_then);
+            const std::uint64_t at = (static_cast<std::uint64_t>(ref.oob_slot) * kOobKinds + kind) * 4;
+            const Id ptr = m.access_chain(p_psb_u32, m.emit(spv::OpConvertUToPtr, p_psb_block, {m.emit(spv::OpIAdd, t_u64, {oob_base64, m.const_u64(at)})}),
+                                          {cu(0)});
+            m.emit(spv::OpAtomicIAdd, t_u32, {ptr, cu(spv::ScopeDevice), cu(spv::MsNone), cu(1)});
+            m.emit_void(spv::OpBranch, {l_merge});
+            cur_label = m.label(l_merge);
+        });
+    }
+    // gcn::set_oob_control, as the reference's oob_sampled: of the accesses past
+    // a halved limit, those whose `key` hashes to 0 in its top eight bits.
+    Id oob_sampled(Id cond, Id key) {
+        if (!oob_control()) return cond;
+        const Id h = shift(spv::OpShiftRightLogical, ibin(spv::OpIMul, key, cu(0x9e3779b1u)), cu(24));
+        return m.emit(spv::OpLogicalAnd, t_bool, {cond, ieq(h, cu(0))});
+    }
+    // gcn::set_oob_count, as the reference's oob_image: an image access at
+    // integer coordinates (`coords`, signed, the layer last where `b` is
+    // arrayed) against the view bound for the reference's image `ii` - a load
+    // at `level` (0 for none) or a store (`level` the image_store_mip's) - and
+    // that view against the T# in.srsrc names.
+    void oob_image(std::uint32_t ii, const ImageBinding& b, const std::vector<Id>& coords, Id level, bool store, const Inst& in) {
+        if (!oob_base64 || coords.empty()) return;
+        m.capability(spv::CapImageQuery);
+        const Id image = image_only(ii);
+        const std::size_t n = coords.size();
+        const Id size_type = n == 1 ? t_i32 : n == 2 ? t_v2i : n == 3 ? t_v3i : m.type_vector(t_i32, 4);
+        const auto limit = [&](Id v) { return oob_control() ? shift(spv::OpShiftRightLogical, v, cu(1)) : v; };
+        const auto below = [&](Id v, Id lim) { return m.emit(spv::OpULessThan, t_bool, {v, lim}); };
+        const Id key = from_i(coords[0]);
+        const auto past = [&](Id v, Id lim) { return oob_sampled(m.emit(spv::OpLogicalNot, t_bool, {below(v, limit(lim))}), key); };
+        Id size, level_in = 0;
+        if (store) {
+            size = m.emit(spv::OpImageQuerySize, size_type, {image});
+            if (level) oob_note(m.emit(spv::OpINotEqual, t_bool, {from_i(level), cu(0)}), kOobImageStoreLevel);
+        } else {
+            Id at = cu(0);
+            if (level) {
+                const Id levels = from_i(m.emit(spv::OpImageQueryLevels, t_i32, {image}));
+                level_in = below(from_i(level), levels);
+                oob_note(past(from_i(level), levels), kOobImageLoadLevel);
+                at = m.emit(spv::OpSelect, t_u32, {level_in, from_i(level), cu(0)});
+            }
+            size = m.emit(spv::OpImageQuerySizeLod, size_type, {image, to_i(at)});
+        }
+        const std::size_t axes = b.arrayed ? n - 1 : n;
+        Id outside = 0;
+        for (std::size_t k = 0; k < axes; ++k) {
+            const Id s = from_i(n == 1 ? size : extract(t_i32, size, static_cast<std::uint32_t>(k)));
+            const Id bad = past(from_i(coords[k]), s);
+            outside = outside ? m.emit(spv::OpLogicalOr, t_bool, {outside, bad}) : bad;
+        }
+        if (outside) {
+            oob_note(level_in ? m.emit(spv::OpLogicalAnd, t_bool, {outside, level_in}) : outside, store ? kOobImageStoreSize : kOobImageLoadSize);
+        }
+        if (b.arrayed) {
+            const Id layers = from_i(extract(t_i32, size, static_cast<std::uint32_t>(n - 1)));
+            oob_note(past(from_i(coords[n - 1]), layers), store ? kOobImageStoreLayer : kOobImageLoadLayer);
+        }
+        // The game's image, as the reference reads it: the T#'s size at
+        // BASE_LEVEL plus the level read.
+        const Id w2 = as_u(read(static_cast<std::uint16_t>(in.srsrc + 2), in)), w3 = as_u(read(static_cast<std::uint16_t>(in.srsrc + 3), in));
+        Id rel = cu(0);
+        if (level && !store) rel = m.emit(spv::OpSelect, t_u32, {level_in, from_i(level), cu(0)});
+        const Id at_level = ibin(spv::OpIAdd, ibin(spv::OpBitwiseAnd, shift(spv::OpShiftRightLogical, w3, cu(12)), cu(0xf)), rel);
+        const auto shrink = [&](Id full) {
+            const Id v = shift(spv::OpShiftRightLogical, full, at_level);
+            return m.emit(spv::OpSelect, t_u32, {m.emit(spv::OpINotEqual, t_bool, {v, cu(0)}), v, cu(1)});
+        };
+        std::vector<Id> tsize = {shrink(ibin(spv::OpIAdd, ibin(spv::OpBitwiseAnd, w2, cu(0x3fff)), cu(1))),
+                                 shrink(ibin(spv::OpIAdd, ibin(spv::OpBitwiseAnd, shift(spv::OpShiftRightLogical, w2, cu(14)), cu(0x3fff)), cu(1)))};
+        if (b.dim == spv::Dim3D && !b.r128) {
+            const Id w4 = as_u(read(static_cast<std::uint16_t>(in.srsrc + 4), in));
+            tsize.push_back(shrink(ibin(spv::OpIAdd, ibin(spv::OpBitwiseAnd, w4, cu(0x1fff)), cu(1))));
+        }
+        const std::size_t taxes = std::min<std::size_t>(b.dim == spv::Dim1D ? 1 : b.dim == spv::Dim3D ? tsize.size() : 2, axes);
+        Id in_t = 0, in_v = 0;
+        for (std::size_t k = 0; k < taxes; ++k) {
+            const Id c = from_i(coords[k]);
+            const Id t = below(c, limit(tsize[k]));
+            const Id v = below(c, from_i(n == 1 ? size : extract(t_i32, size, static_cast<std::uint32_t>(k))));
+            in_t = in_t ? m.emit(spv::OpLogicalAnd, t_bool, {in_t, t}) : t;
+            in_v = in_v ? m.emit(spv::OpLogicalAnd, t_bool, {in_v, v}) : v;
+        }
+        if (in_t) {
+            Id smaller = m.emit(spv::OpLogicalAnd, t_bool, {in_t, m.emit(spv::OpLogicalNot, t_bool, {in_v})});
+            Id larger = m.emit(spv::OpLogicalAnd, t_bool, {m.emit(spv::OpLogicalNot, t_bool, {in_t}), in_v});
+            if (level_in) {
+                smaller = m.emit(spv::OpLogicalAnd, t_bool, {smaller, level_in});
+                larger = m.emit(spv::OpLogicalAnd, t_bool, {larger, level_in});
+            }
+            oob_note(oob_sampled(smaller, key), kOobViewSmaller);
+            oob_note(oob_sampled(larger, key), kOobViewLarger);
+        }
+    }
+    // `body` where `cond` holds (a selection, as where_exec's on a lane's EXEC bit).
+    void where_true(Id cond, const std::function<void()>& body) {
+        const Id l_then = m.fresh(), l_merge = m.fresh();
+        m.emit_void(spv::OpSelectionMerge, {l_merge, 0u});
+        m.emit_void(spv::OpBranchConditional, {cond, l_then, l_merge});
+        cur_label = m.label(l_then);
+        body();
+        m.emit_void(spv::OpBranch, {l_merge});
+        cur_label = m.label(l_merge);
+    }
     void where_exec(const Val& e, const std::function<void()>& body) {
         if (e.constant) {
             if (e.set) body();
@@ -3507,6 +4760,410 @@ private:
         m.emit_void(spv::OpBranch, {l_merge});
         cur_label = m.label(l_merge);
     }
+    // ---- GsLift: the rings as stage I/O -----------------------------------------------
+    // The ES vertex's offset in the ESGS ring (the GS's v0), which the lift
+    // knows only as its own vertex's: an OpUndef it never computes with (as_u
+    // and as_f refuse it), in its affine form (Val::sym) one unit an offset.
+    std::set<Id> ring_offsets;
+    Val ring_offset() {
+        Id undef;
+        {
+            EntryScope entry(m);
+            undef = m.emit(spv::OpUndef, t_u32, {});
+        }
+        ring_offsets.insert(undef);
+        Val v = word(undef);
+        v.sym = true;
+        v.sym_base = 0;
+        v.sym_coef = 1;
+        return v;
+    }
+    bool ring_offset_read(const Val& v) {
+        if (v.constant || !ring_offsets.count(v.id)) return false;
+        reject("an input vertex's ring offset (the GS's v0; v1 and v3-v6 a point has none of) is used as a number, not to address the ring");
+        return true;
+    }
+    // Integer arithmetic on a ring offset (v_lshlrev_b32 v0, 2, v0 makes its
+    // byte address): another ring offset in its affine form. Not on one: false.
+    bool ring_offset_arith(const Inst& in) {
+        if (in.enc != Enc::VOP1 && in.enc != Enc::VOP2 && in.enc != Enc::VOP3) return false;
+        std::vector<Val> ops{peek(in.src0, in)};
+        if (in.enc != Enc::VOP1) {
+            ops.push_back(peek(in.src1, in));
+            if (in.enc == Enc::VOP3 && in.op >= 0x140 && in.op < 0x160) ops.push_back(peek(in.src2, in));
+        }
+        if (std::none_of(ops.begin(), ops.end(), [&](const Val& v) { return !v.constant && ring_offsets.count(v.id); })) return false;
+        if (in.enc == Enc::VOP1 && in.op == 1) {  // v_mov_b32: the same offset
+            write_v(in.dst, ops[0]);
+            note += " v" + std::to_string(in.dst) + ":ring offset";
+            return true;
+        }
+        // No carry (v_add_i32, v_sub_i32, v_subrev_i32 write one), no modifier.
+        const bool carry = (in.enc == Enc::VOP2 && in.op >= 37 && in.op <= 39) || (in.enc == Enc::VOP3 && in.op >= 0x125 && in.op <= 0x127);
+        std::uint32_t probe = 0, base = 0, coef = 0;
+        if (in.enc == Enc::VOP1 || carry || (in.enc == Enc::VOP3 && (in.abs || in.neg || in.omod || in.clamp)) || !int_op(in, 0, 0, 0, probe) ||
+            !sym_eval(ops, [&](const std::vector<std::uint32_t>& x, std::uint32_t& r) {
+                return int_op(in, x[0], x.size() > 1 ? x[1] : 0, x.size() > 2 ? x[2] : 0, r);
+            }, base, coef)) {
+            reject(std::string(mnemonic(in) ? mnemonic(in) : "an instruction") + " computes with the ES vertex's ring offset other than as an address the lift follows");
+            return true;
+        }
+        Val v = ring_offset();
+        v.sym_base = base;
+        v.sym_coef = coef;
+        write_v(in.dst, v);
+        note += " v" + std::to_string(in.dst) + ":ring offset";
+        return true;
+    }
+    // The rings' V#s, as Gnm puts them in the global table the user data's
+    // s[0:1] points at (dword 8 the ESGS write ring, 12 its read, 16 the GSVS
+    // write ring): four words each, never read as data (descriptor_words);
+    // the accesses through them are the stages' inputs and outputs
+    // (ring_access). Not one: false.
+    enum Ring : std::uint8_t { kRingEsgsWrite = 1, kRingEsgsRead = 2, kRingGsvsWrite = 3 };
+    struct RingWord {
+        std::uint8_t ring = 0, word = 0;
+    };
+    std::map<Id, RingWord> ring_words;
+    std::size_t ring_descriptors = 0;
+    bool ring_descriptor_load(const Inst& in) {
+        if (in.op != 2 || !in.imm_flag || in.src0 != 0) return false;  // s_load_dwordx4 s[n:n+3], s[0:1], imm
+        const std::uint8_t ring = gs_es() ? (in.imm == 8 ? kRingEsgsWrite : 0) : (in.imm == 12 ? kRingEsgsRead : in.imm == 16 ? kRingGsvsWrite : 0);
+        if (!ring) return false;
+        if (peek(0, in).id != initial_value(0).id || peek(1, in).id != initial_value(1).id) {
+            reject("a ring's V# loaded through s[0:1] after the program wrote them (not the user data's table)");
+            return true;
+        }
+        Pending p{in.sdst, {}};
+        const std::size_t mark = note.size();
+        for (int k = 0; k < 4; ++k) {
+            Id undef;
+            {
+                EntryScope entry(m);
+                undef = m.emit(spv::OpUndef, t_u32, {});
+            }
+            descriptor_words[undef] = in.offset;
+            ring_words[undef] = {ring, static_cast<std::uint8_t>(k)};
+            write_scalar(static_cast<std::uint16_t>(in.sdst + k), word(undef));
+            p.values.push_back(word(undef));
+        }
+        note.resize(mark);
+        note += " " + operand_name(in.sdst, 0, 4) +
+                (ring == kRingEsgsWrite ? ":ESGS write ring" : ring == kRingEsgsRead ? ":ESGS read ring" : ":GSVS write ring");
+        pending.push_back(std::move(p));
+        ++ring_descriptors;
+        return true;
+    }
+    // A buffer access through a ring's V#: the ES's stores into the ESGS ring
+    // (es_ring_store), the GS's loads from it (gs_ring_load) and its stores
+    // into the GSVS ring (gs_ring_store). Not through a ring: false.
+    std::size_t es_ring_stores = 0, gs_ring_loads = 0, gs_ring_stores = 0;
+    bool ring_access(const Inst& in) {
+        const Val w0 = peek(in.srsrc, in);
+        const auto first = w0.constant ? ring_words.end() : ring_words.find(w0.id);
+        if (first == ring_words.end()) return false;
+        const char* name = mnemonic(in) ? mnemonic(in) : "a buffer instruction";
+        for (int k = 0; k < 4; ++k) {
+            const Val wk = peek(static_cast<std::uint16_t>(in.srsrc + k), in);
+            const auto it = wk.constant ? ring_words.end() : ring_words.find(wk.id);
+            if (it == ring_words.end() || it->second.ring != first->second.ring || it->second.word != k) {
+                reject(std::string(name) + ": its V# is not one ring's four words in order");
+                return true;
+            }
+        }
+        if (!open_loops.empty()) {
+            reject(std::string(name) + " through a ring inside a loop is not lifted");
+            return true;
+        }
+        if (in.idxen || in.addr64 || in.tfe || in.lds) {
+            reject(std::string(name) + ": a ring access with an index, a 64-bit address, TFE or LDS");
+            return true;
+        }
+        const Val so = read(in.soffset, in);
+        if (!so.constant) {
+            reject(std::string(name) + ": a ring access at an SGPR offset the lift does not know");
+            return true;
+        }
+        const std::uint32_t at = so.bits + in.offset12;
+        switch (first->second.ring) {
+        case kRingEsgsWrite: es_ring_store(in, at); break;
+        case kRingEsgsRead: gs_ring_load(in, at); break;
+        default: gs_ring_store(in, at); break;
+        }
+        return true;
+    }
+    // ES: buffer_store_dword* at soffset + offset 4 * k: dwords k.. of the vertex.
+    void es_ring_store(const Inst& in, std::uint32_t at) {
+        if (!gs_es() || in.op < 28 || in.op > 31 || in.offen) {
+            reject(std::string(mnemonic(in) ? mnemonic(in) : "a buffer instruction") + ": the ESGS write ring is written by the ES with buffer_store_dword* at constant offsets only");
+            return;
+        }
+        const std::uint32_t n = in.op == 28 ? 1 : in.op == 29 ? 2 : in.op == 30 ? 4 : 3;
+        if (at % 4 || at / 4 + n > gs->es_dwords) {
+            reject("an ESGS ring store at byte " + std::to_string(at) + ": not dwords of the ES's " + std::to_string(gs->es_dwords));
+            return;
+        }
+        const Val e = exec_lane();
+        if (e.constant && !e.set) return;
+        std::vector<Id> words;
+        for (std::uint32_t j = 0; j < n; ++j) words.push_back(as_u(value(256 + in.vdata + static_cast<int>(j))));
+        const Id p_out_u32 = m.type_pointer(spv::ScOutput, t_u32);
+        where_exec(e, [&] {
+            for (std::uint32_t j = 0; j < n; ++j) {
+                const std::uint32_t k = at / 4 + j;
+                m.store(m.access_chain(p_out_u32, es_gs, {cu(k / 4), cu(k % 4)}), words[j]);
+            }
+        });
+        es_ring_stores += n;
+        note += " es_gs[" + std::to_string(at / 4) + "]";
+    }
+    // GS: buffer_load_dword at the vertex's own offset (v0 << 2) and soffset +
+    // offset 256 * k: dword k of its ES vertex, es_gs[0][k / 4][k % 4].
+    std::map<std::uint32_t, Id> es_gs_loads;  // loaded once, in the entry block
+    void gs_ring_load(const Inst& in, std::uint32_t at) {
+        if (!gs_geom() || in.op != 12 || !in.offen) {
+            reject(std::string(mnemonic(in) ? mnemonic(in) : "a buffer instruction") + ": the ESGS read ring is read by the GS with buffer_load_dword at its vertex's offset only");
+            return;
+        }
+        const Val a = peek(static_cast<std::uint16_t>(256 + in.vaddr), in);
+        if (a.constant || !ring_offsets.count(a.id) || !sym_holds(a, current_exec()) || a.sym_base != 0 || a.sym_coef != 4) {
+            reject("an ESGS ring load at an address other than its vertex's own (v0 << 2)");
+            return;
+        }
+        if (at % 256 || at / 256 >= gs->es_dwords) {
+            reject("an ESGS ring load at byte " + std::to_string(at) + ": not a dword of the ES's " + std::to_string(gs->es_dwords));
+            return;
+        }
+        const std::uint32_t k = at / 256;
+        Id& v = es_gs_loads[k];
+        if (!v) {
+            EntryScope entry(m);
+            v = m.load(t_u32, m.access_chain(m.type_pointer(spv::ScInput, t_u32), es_gs, {cu(0), cu(k / 4), cu(k % 4)}));
+        }
+        inst_uniform = false;  // per primitive
+        write_v(in.vdata, word(v));
+        ++gs_ring_loads;
+        note += " es_gs[0][" + std::to_string(k) + "]";
+    }
+    // GS: buffer_store_dword at soffset + offset 4 * (max_vertices * d + v):
+    // dword d of the vertex in slot v, kept with the EXEC it was made under
+    // for the emit of that slot (gs_emit).
+    struct GsvsStore {
+        Val value, exec;
+    };
+    std::map<std::pair<std::uint32_t, std::uint32_t>, std::vector<GsvsStore>> gsvs;  // (slot, dword) -> its stores, in order
+    void gs_ring_store(const Inst& in, std::uint32_t at) {
+        if (!gs_geom() || in.op != 28 || (in.offen && !gsvs_array)) {
+            reject(std::string(mnemonic(in) ? mnemonic(in) : "a buffer instruction") + ": the GSVS write ring is written by the GS with buffer_store_dword only");
+            return;
+        }
+        if (gsvs_array) return gs_ring_store_array(in, at);
+        const std::uint32_t e_at = at / 4, d = e_at / gs->max_vertices, v = e_at % gs->max_vertices;
+        if (at % 4 || d >= kGsvsDwords) {
+            reject("a GSVS ring store at byte " + std::to_string(at) + ": not a dword of a vertex");
+            return;
+        }
+        const Val e = exec_lane();
+        if (e.constant && !e.set) return;
+        const Val data = value(256 + in.vdata);
+        if (!exact_in(where_reg(256 + in.vdata), e)) {
+            reject("a GSVS store of a value the lift may hold differently from GCN where EXEC is set");
+            return;
+        }
+        gsvs[{v, d}].push_back({data, e});
+        ++gs_ring_stores;
+        note += " gsvs[" + std::to_string(v) + "][" + std::to_string(d) + "]";
+    }
+    // s_sendmsg in the GS: GS emit (stream 0), cut, emit and cut; GS done.
+    struct GsEmit {
+        Val exec;
+        std::uint32_t slot = 0;
+    };
+    std::vector<GsEmit> gs_emits;
+    std::size_t gs_cuts = 0;
+    void gs_message(const Inst& in) {
+        const std::uint32_t imm = static_cast<std::uint32_t>(in.imm) & 0xffff, msg = imm & 0xf, op = (imm >> 4) & 3, stream = (imm >> 8) & 3;
+        if (msg == 3) return;  // GS done: the primitive's vertices are all out
+        if (msg != 2 || stream != 0) {
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), "s_sendmsg 0x%x: only stream 0's GS emit and cut and GS done are lifted", imm);
+            reject(buf);
+            return;
+        }
+        if (!open_loops.empty()) {
+            reject("a GS emit or cut inside a loop");
+            return;
+        }
+        if (op == 0) return;
+        const Val e = exec_lane();
+        if (e.constant && !e.set) return;
+        if (op & 2) gs_emit(e);
+        if (op & 1) {
+            where_exec(e, [&] { m.emit_void(spv::OpEndPrimitive, {}); });
+            ++gs_cuts;
+            note += " cut";
+        }
+    }
+    // No invocation has both bits set: one holds a mask the other holds the negation of.
+    bool disjoint(const Val& a, const Val& b) const {
+        if ((a.constant && !a.set) || (b.constant && !b.set)) return true;
+        if (a.constant || b.constant) return false;
+        std::vector<Id> ca{a.id}, cb{b.id};
+        if (const auto it = conjuncts.find(a.id); it != conjuncts.end()) ca.insert(ca.end(), it->second.begin(), it->second.end());
+        if (const auto it = conjuncts.find(b.id); it != conjuncts.end()) cb.insert(cb.end(), it->second.begin(), it->second.end());
+        for (const Id x : ca) {
+            for (const Id y : cb) {
+                if (negated(lane(x), lane(y))) return true;
+            }
+        }
+        return false;
+    }
+    // The emit of the invocation's next vertex: slot n for its nth emit, as
+    // GCN's emit counter gives it - known when each earlier emit was made by
+    // every invocation emitting here or by none of them - its outputs the
+    // copy shader's, each dword the last store into the slot every one of
+    // those invocations made.
+    void gs_emit(const Val& e) {
+        if (gsvs_array) return gs_emit_array(e);
+        std::uint32_t slot = 0;
+        for (const GsEmit& p : gs_emits) {
+            if (disjoint(p.exec, e)) continue;
+            if (!implies(e, p.exec)) {
+                reject("a GS emit whose invocations made different numbers of emits before it: the slot GCN's emit counter gives is not known");
+                return;
+            }
+            ++slot;
+        }
+        if (slot >= gs->max_vertices) {
+            reject("an emit of vertex " + std::to_string(slot) + ", past the GS's " + std::to_string(gs->max_vertices));
+            return;
+        }
+        std::map<std::uint8_t, std::array<Id, 4>> outs;
+        for (const GsCopyOut& c : gs->copy) {
+            const auto [it, fresh] = outs.try_emplace(c.target);
+            if (fresh) it->second.fill(cf(0.0f));
+            if (c.constant) {
+                it->second[c.comp] = cf(std::bit_cast<float>(c.value));
+                continue;
+            }
+            const GsvsStore* store = nullptr;
+            if (const auto st = gsvs.find({slot, c.value}); st != gsvs.end()) {
+                for (auto s = st->second.rbegin(); s != st->second.rend(); ++s) {
+                    if (disjoint(s->exec, e)) continue;
+                    if (implies(e, s->exec)) store = &*s;
+                    break;
+                }
+            }
+            if (!store) {
+                reject("an emit of vertex " + std::to_string(slot) + ": dword " + std::to_string(c.value) +
+                       " the copy shader exports was not stored into its slot by every invocation emitting it");
+                return;
+            }
+            it->second[c.comp] = as_f(store->value);
+        }
+        std::vector<std::pair<std::vector<Id>, std::array<Id, 4>>> stores;  // the outputs' variables, made before the branch
+        for (const auto& [t, comps] : outs) stores.push_back({t == 12 ? std::vector<Id>{out_position()} : param_outputs(t - 32), comps});
+        where_exec(e, [&] {
+            for (const auto& [vars, comps] : stores) {
+                const Id v4 = m.emit(spv::OpCompositeConstruct, t_v4f, {comps[0], comps[1], comps[2], comps[3]});
+                for (const Id var : vars) m.store(var, v4);
+            }
+            m.emit_void(spv::OpEmitVertex, {});
+        });
+        gs_emits.push_back({e, slot});
+        note += " emit " + std::to_string(slot);
+    }
+
+    // ---- GsLift: the GSVS ring as an array ------------------------------------------
+    // A GS that stores into the GSVS ring at a VGPR offset - the program's own
+    // vertex counter, a byte offset it steps after each emit and clamps past
+    // the last vertex to an address the ring's range drops - keeps the ring as
+    // GCN does: an array of max_vertices * vertex_dwords words in the
+    // invocation (element d * max_vertices + v), each store at the element its
+    // address names (dropped past the array), each emit reading the slot its
+    // emit counter names - the invocation's emits so far, stepped where it
+    // emits, as GCN's VGT counts them - and nothing past max_vertices.
+    Id gsvs_array = 0;
+    std::uint32_t gsvs_elements = 0;
+    std::size_t gs_dynamic_stores = 0;
+    void gs_ring_model() {
+        // The array where a store is at a VGPR offset, or an emit lies in an
+        // if's arm (the slots after it depend on the arm, which the stores'
+        // EXEC does not show).
+        bool dynamic = false;
+        for (const Inst& in : prog.insts) {
+            dynamic = dynamic || (in.enc == Enc::MUBUF && in.op >= 28 && in.op <= 31 && in.offen);
+            if (in.enc == Enc::SOPP && in.op == 16 && (in.imm & 0x2f) == 0x22) {
+                for (const Construct& c : constructs) dynamic = dynamic || (in.offset > c.branch && in.offset < c.join);
+            }
+        }
+        if (!dynamic) return;
+        reg[kKeyGsCount] = word_const(0);
+        gsvs_elements = gs->max_vertices * gs->vertex_dwords;
+        gsvs_array = m.local_variable(m.type_pointer(spv::ScFunction, m.type_array(t_u32, cu(gsvs_elements))));
+        m.name(gsvs_array, "gsvs");
+    }
+    void gs_ring_store_array(const Inst& in, std::uint32_t at) {
+        const Val e = exec_lane();
+        if (e.constant && !e.set) return;
+        const Val data = value(256 + in.vdata);
+        if (!exact_in(where_reg(256 + in.vdata), e)) {
+            reject("a GSVS store of a value the lift may hold differently from GCN where EXEC is set");
+            return;
+        }
+        const Id word_v = as_u(data);
+        Id element = cu(at >> 2), fits = 0;
+        if (in.offen) {
+            const Val a = value(256 + in.vaddr);
+            if (!exact_in(where_reg(256 + in.vaddr), e)) {
+                reject("a GSVS store at an offset the lift may hold differently from GCN where EXEC is set");
+                return;
+            }
+            element = ibin(spv::OpShiftRightLogical, ibin(spv::OpIAdd, cu(at), as_u(a)), cu(2));
+            fits = m.emit(spv::OpULessThan, t_bool, {element, cu(gsvs_elements)});
+            ++gs_dynamic_stores;
+        } else if ((at >> 2) >= gsvs_elements) {
+            return;  // past the ring: dropped
+        }
+        const Id p_fn_u32 = m.type_pointer(spv::ScFunction, t_u32);
+        const Val where = fits ? band(e, lane(fits)) : e;
+        where_exec(where, [&] { m.store(m.access_chain(p_fn_u32, gsvs_array, {element}), word_v); });
+        ++gs_ring_stores;
+        note += in.offen ? " gsvs[offset]" : " gsvs[" + std::to_string(at >> 2) + "]";
+    }
+    void gs_emit_array(const Val& e) {
+        const Id count = as_u(reg.at(kKeyGsCount));
+        std::map<std::uint8_t, std::array<Id, 4>> outs;
+        std::vector<std::pair<std::vector<Id>, std::uint8_t>> vars;
+        for (const GsCopyOut& c : gs->copy) {
+            if (outs.try_emplace(c.target).second) vars.push_back({c.target == 12 ? std::vector<Id>{out_position()} : param_outputs(c.target - 32), c.target});
+        }
+        const Id p_fn_u32 = m.type_pointer(spv::ScFunction, t_u32);
+        const Id fits = m.emit(spv::OpULessThan, t_bool, {count, cu(gs->max_vertices)});
+        where_exec(band(e, lane(fits)), [&] {
+            for (auto& [t, comps] : outs) comps.fill(cf(0.0f));
+            for (const GsCopyOut& c : gs->copy) {
+                if (c.constant) {
+                    outs[c.target][c.comp] = cf(std::bit_cast<float>(c.value));
+                    continue;
+                }
+                const Id element = ibin(spv::OpIAdd, cu(c.value * gs->max_vertices), count);
+                outs[c.target][c.comp] = m.emit(spv::OpBitcast, t_f32, {m.load(t_u32, m.access_chain(p_fn_u32, gsvs_array, {element}))});
+            }
+            for (const auto& [vs, t] : vars) {
+                const std::array<Id, 4>& comps = outs[t];
+                const Id v4 = m.emit(spv::OpCompositeConstruct, t_v4f, {comps[0], comps[1], comps[2], comps[3]});
+                for (const Id var : vs) m.store(var, v4);
+            }
+            m.emit_void(spv::OpEmitVertex, {});
+        });
+        // The counter steps where the invocation emits.
+        const Val next = word(ibin(spv::OpIAdd, count, cu(1)));
+        reg[kKeyGsCount] = e.constant ? (e.set ? next : reg.at(kKeyGsCount)) : word(m.emit(spv::OpSelect, t_u32, {e.id, next.id, count}));
+        gs_emits.push_back({e, 0});
+        note += " emit (slot from the counter)";
+    }
+
     // ---- TessLift::window: the patch's window as stage I/O ------------------------------
     // Inputs [0, in_end): control point a / ls_stride, as the LS wrote it;
     // outputs [in_end, out_end): the hull's control point (a - in_end) /
@@ -3705,7 +5362,310 @@ private:
         });
     }
 
+    // ---- GDS counters and wave ranks (compute) ----------------------------------------
+    // The lanes of GCN's wave that the lift runs together: a subgroup
+    // operation reads every invocation of it, which holds only where the
+    // lift's control flow is uniform - everywhere but inside a loop
+    // invocations leave at different iterations (regions run unconditionally
+    // and ifs take one arm in every lane).
+    std::size_t gds_lane_ops = 0, wave_ranks = 0, ranks_folded = 0, first_lane_reads = 0;
+    void subgroup_caps() {
+        if (!subgroup_ops_in(opt)) reject("a subgroup operation in a stage the device runs none in");
+        m.capability(spv::CapGroupNonUniform);
+        m.capability(spv::CapGroupNonUniformBallot);
+    }
+    // An operation that needs every invocation together (a subgroup
+    // operation, s_barrier): inside loops invocations may leave at different
+    // iterations, each such loop must keep them together - every exit taken
+    // on a bit every lane holds alike (close_loop checks the exits after it).
+    bool require_converged(const std::string& what) {
+        for (Loop* l : open_loops) {
+            if (l->mask < 0) continue;  // a uniform loop: its invocations stay together
+            if (l->divergent_exit) {
+                reject(what + " inside the loop at " + hex_offset(l->header) + ", which invocations leave at different iterations");
+                return false;
+            }
+            if (l->converged_op.empty()) l->converged_op = what + " at " + hex_offset(cur);
+        }
+        return true;
+    }
+    // Whether no instruction reachable after instruction `index` reads VGPR
+    // `key` (any operand that may name it; a write does not end it - under a
+    // varying EXEC the old value survives in the lanes it is clear for).
+    bool vgpr_unread_after(std::size_t index, int key) const {
+        std::vector<bool> seen(prog.insts.size(), false);
+        std::vector<std::size_t> work, next;
+        successors(index, next);
+        work.assign(next.begin(), next.end());
+        while (!work.empty()) {
+            const std::size_t i = work.back();
+            work.pop_back();
+            if (i >= prog.insts.size() || seen[i]) continue;
+            seen[i] = true;
+            std::set<int> r;
+            vector_reads(prog.insts[i], r);
+            if (r.count(key)) return false;
+            successors(i, next);
+            work.insert(work.end(), next.begin(), next.end());
+        }
+        return true;
+    }
+    // The VGPRs an instruction may read (a superset).
+    static void vector_reads(const Inst& in, std::set<int>& r) {
+        const auto code = [&](std::uint16_t c, int n) {
+            if (c < 256) return;
+            for (int k = 0; k < n; ++k) r.insert(c + k);
+        };
+        const auto vg = [&](int first, int n) {
+            for (int k = 0; k < n; ++k) r.insert(256 + first + k);
+        };
+        switch (in.enc) {
+        case Enc::VOP1: case Enc::VOP2: case Enc::VOPC: case Enc::VOP3: {
+            // A 64-bit operation (its mnemonic says so) reads register pairs.
+            const char* mn = mnemonic(in);
+            const int n = mn && std::strstr(mn, "64") ? 2 : 1;
+            code(in.src0, n);
+            if (in.enc != Enc::VOP1) code(in.src1, n);
+            if (in.enc == Enc::VOP3) code(in.src2, n);
+            if ((in.enc == Enc::VOP2 && (in.op == 6 || in.op == 31)) || (in.enc == Enc::VOP3 && (in.op == 0x106 || in.op == 0x11f))) vg(in.dst, 1);
+            break;
+        }
+        case Enc::VINTRP: vg(in.src0 >= 256 ? in.src0 - 256 : in.src0, 1); break;
+        case Enc::MIMG: vg(in.vaddr, 16); vg(in.vdata, 4); break;
+        case Enc::MUBUF: case Enc::MTBUF: vg(in.vaddr, 2); vg(in.vdata, 4); break;
+        case Enc::DS: vg(in.vaddr, 1); code(in.src0, 2); code(in.src1, 2); break;
+        case Enc::EXP:
+            for (int k = 0; k < 4; ++k) vg(in.vsrc[k], 1);
+            break;
+        default: break;
+        }
+    }
+    // ds_append / ds_consume in GDS (translate.cpp gds_counter, the
+    // reference's TranslateOptions::gds_counters): the counter is the word
+    // the dispatch binds for the GDS dword at M0[15:0] + offset
+    // (StageParams::gds_counter, from gds_base), by its device address, not
+    // walked through the page table; none bound, nothing counts.
+    // GCN adds or takes the wave's EXEC lanes in one step and hands every
+    // lane the counter from before (its base); the shader adds the lane's
+    // rank among EXEC's lanes (v_mbcnt) for its slot - HLSL's
+    // IncrementCounter / DecrementCounter, lowered to a wave. The lift makes
+    // each invocation whose EXEC bit is set step the counter itself (as a
+    // D3D11 append buffer's counter does): the counter ends the same, and an
+    // invocation's own step is its slot, so base + rank comes out as it -
+    // the same slots, given out in another order, as GCN's waves themselves
+    // take no fixed order. The base is kept apart (Val::wave_part) until it
+    // meets its rank (combine_wave_parts), any other read of it rejects; a
+    // value nothing reads leaves the VGPR alone. With
+    // TranslateOptions::gds_subgroup (the default) the stepping invocations
+    // step it once a subgroup - one atomic for their count, each its own
+    // slot from the base and its rank among them, as GCN once a wave - which
+    // holds for whichever invocations run it together, inside loops
+    // invocations leave at different iterations too; without it, an atomic
+    // an invocation.
+    void gds_counter(const Inst& in) {
+        const char* name = mnemonic(in) ? mnemonic(in) : "a GDS counter";
+        if (!opt.gds_counters || !gds_member) {
+            reject(std::string(name) + " in GDS where the reference counts in LDS (its GDS counters off)");
+            return;
+        }
+        const bool append = in.op == 62;
+        const std::uint32_t off = in.offset0 | (static_cast<std::uint32_t>(in.offset1) << 8);
+        const Id m0 = as_u(value(kKeyM0));
+        if (!res.rejections.empty()) return;
+        const Id addr = ibin(spv::OpIAdd, ibin(spv::OpBitwiseAnd, m0, cu(0xffff)), cu(off));
+        const Id base = params_head(2);  // StageParams::gds_base
+        const Id slot = ibin(spv::OpISub, shift(spv::OpShiftRightLogical, addr, cu(2)), base);
+        const Id inside = m.emit(spv::OpULessThan, t_bool, {slot, cu(kGdsCounters)});
+        const Id at = shift(spv::OpShiftLeftLogical, m.emit(spv::OpSelect, t_u32, {inside, slot, cu(0)}), cu(1));
+        const auto counter_word = [&](Id k) {
+            return m.load(t_u32, m.access_chain(p_uni_u32, ubo_var, {cu(gds_member), shift(spv::OpShiftRightLogical, k, cu(2)), ibin(spv::OpBitwiseAnd, k, cu(3))}));
+        };
+        const Id lo = counter_word(at), hi = counter_word(ibin(spv::OpIAdd, at, cu(1)));
+        const Id bound = m.emit(spv::OpLogicalAnd, t_bool, {inside, m.emit(spv::OpINotEqual, t_bool, {ibin(spv::OpBitwiseOr, lo, hi), cu(0)})});
+        const Val e = exec_lane();
+        const Val run = e.constant ? (e.set ? lane(bound) : lane_const(false)) : lane(m.emit(spv::OpLogicalAnd, t_bool, {e.id, bound}));
+        const Id step = cu(append ? 1u : 0xffffffffu);
+        ++res.wave.gds_steps;
+        const std::size_t index = static_cast<std::size_t>(&in - prog.insts.data());
+        const auto add = [&](Id amount) {
+            return m.emit(spv::OpAtomicIAdd, t_u32, {host_dword(make_u64(lo, hi)), cu(spv::ScopeDevice), cu(spv::MsNone), amount});
+        };
+        // TranslateOptions::gds_subgroup: inside the guard only the stepping
+        // invocations run; one of them adds their count, every one takes the
+        // base it got plus (append) or minus (consume) its rank among them -
+        // GCN's step a wave, a subgroup at a time. Each run of invocations
+        // that steps together (a subgroup, or the part of it a branch let in)
+        // gets a range of its own, so the slots stay unique and dense whatever
+        // the subgroup's size, and in another order across them as before.
+        const auto subgroup_step = [&](bool want_own) -> Id {
+            subgroup_caps();
+            const auto count = [&](std::uint32_t op) {
+                const Id ballot = m.emit(spv::OpGroupNonUniformBallot, t_v4u, {cu(spv::ScopeSubgroup), m.const_bool(true)});
+                return m.emit(spv::OpGroupNonUniformBallotBitCount, t_u32, {cu(spv::ScopeSubgroup), op, ballot});  // the operation a literal
+            };
+            const Id n = count(spv::GroupOperationReduce);
+            const Id first = m.emit(spv::OpGroupNonUniformElect, t_bool, {cu(spv::ScopeSubgroup)});
+            const Id got = where_exec_value(lane(first), [&] { return add(append ? n : ibin(spv::OpISub, cu(0), n)); });
+            if (!want_own) return got;
+            const Id rank = count(spv::GroupOperationExclusiveScan);
+            const Id base = m.emit(spv::OpGroupNonUniformBroadcastFirst, t_u32, {cu(spv::ScopeSubgroup), got});
+            return ibin(append ? spv::OpIAdd : spv::OpISub, base, rank);
+        };
+        // A stage without subgroup operations (gcn::subgroup_ops_in) steps an
+        // invocation at a time.
+        const bool per_subgroup = opt.gds_subgroup && subgroup_ops_in(opt);
+        const char* const how = per_subgroup ? " per subgroup" : " per invocation";
+        if (vgpr_unread_after(index, 256 + in.dst)) {
+            where_exec_value(run, [&] { return per_subgroup ? subgroup_step(false) : add(step); });
+            ++gds_lane_ops;
+            note += std::string(" ") + (append ? "+1" : "-1") + how + " (value unread)";
+            return;
+        }
+        const Id own = where_exec_value(run, [&] { return per_subgroup ? subgroup_step(true) : add(step); });
+        Val b = word(own);
+        b.wave_part = append ? 1 : 2;
+        b.part_mask = e.constant ? 0 : e.id;
+        b.part_mask_constant = e.constant;
+        b.part_mask_set = e.set;
+        inst_uniform = false;
+        write_v(in.dst, b);
+        ++gds_lane_ops;
+        note += std::string(" ") + (append ? "+1" : "-1") + how + " (its own slot)";
+    }
+    // The append idiom's two parts added together (v_add_i32 base, rank;
+    // v_sub_i32 / v_subrev_i32 base - rank for a consume): the invocation's
+    // own slot. Both over the same mask, used where EXEC lies within it; the
+    // operands come back as plain words (the slot and 0). False with a
+    // rejection for any other combination.
+    std::size_t wave_slots = 0;
+    bool combine_wave_parts(std::uint32_t op, Val& x, Val& y) {
+        const Val* base = x.wave_part == 1 || x.wave_part == 2 ? &x : y.wave_part == 1 || y.wave_part == 2 ? &y : nullptr;
+        const Val* rank = x.wave_part == 3 ? &x : y.wave_part == 3 ? &y : nullptr;
+        const bool consume = base && base->wave_part == 2;
+        const bool shape = base && rank && base != rank &&
+                           (consume ? (op == 38 && base == &x) || (op == 39 && base == &y) : op == 37);
+        if (!shape) {
+            reject_wave_part(x.wave_part ? x : y);
+            return false;
+        }
+        if (!same_lane(part_mask_val(*base), part_mask_val(*rank)) || !implies(exec_lane(), part_mask_val(*base))) {
+            reject("a ds_append/ds_consume base and a rank over another mask, or added where EXEC lies outside it");
+            return false;
+        }
+        // base + rank + S1 -> slot + S1; base - (rank + S1) -> slot - S1.
+        const Val slot = word(base->id), rest = word(rank->id);
+        if (base == &x) {
+            x = slot;
+            y = rest;
+        } else {
+            y = slot;
+            x = rest;
+        }
+        inst_uniform = false;
+        ++wave_slots;
+        note += " slot";
+        return true;
+    }
+    // A dword of the params block's member 3 (compute: { cb_valid, lds_bytes, gds_base, pad }).
+    Id params_head(std::uint32_t k) {
+        EntryScope entry(m);
+        return m.load(t_u32, m.access_chain(p_uni_u32, ubo_var, {cu(3), cu(k)}));
+    }
+    // v_mbcnt_lo_u32_b32 / v_mbcnt_hi_u32_b32 of a lane mask (translate.cpp
+    // vop2): the mask's bits of the lanes below this one, counted, plus S1 -
+    // the invocation's rank among the mask's lanes. In a workgroup of 32
+    // invocations or fewer no lane is 32 or above: the high half counts
+    // nothing and the result is S1. The rank of the append idiom is kept as
+    // a part of it (Val::wave_part, combine_wave_parts), its word S1's,
+    // beside the invocation's own slot. Any other rank is the reference's:
+    // the ballot of each
+    // invocation's bit (its bits of lanes no invocation runs are clear: masks
+    // of EXEC and comparisons), the lane SubgroupLocalInvocationId (HLSL's
+    // WavePrefixCountBits), with every invocation together.
+    void mbcnt(const Inst& in, bool hi, std::uint16_t mask_code, std::uint16_t s1_code) {
+        const Val s1 = read(s1_code, in);
+        if (hi && workgroup_threads() <= 32 && !s1.wave_part) {
+            write_v(in.dst, s1);
+            ++ranks_folded;
+            note += " (no lane 32+)";
+            return;
+        }
+        int key = -1;
+        if (mask_code == kExecLo || mask_code == kExecHi) key = kKeyExec;
+        else if (mask_code == kVccLo || mask_code == kVccHi) key = kKeyVcc;
+        else if (mask_code < 104) key = lanes.count(mask_code) ? mask_code : lanes.count(mask_code - 1) ? mask_code - 1 : -1;
+        if (key < 0) {
+            reject(std::string(mnemonic(in)) + " of a word, not a lane mask: the lane's index in the wave, which a subgroup of another width numbers differently");
+            return;
+        }
+        const bool high_word = mask_code == kExecHi || mask_code == kVccHi || (key >= 0 && key < 104 && mask_code == key + 1);
+        if (high_word != hi) {
+            reject(std::string(mnemonic(in)) + " of a mask's other half");
+            return;
+        }
+        const Val mask = key == kKeyExec ? exec_lane() : read_lane(key == kKeyVcc ? kVccLo : static_cast<std::uint16_t>(key));
+        if (mask.kind != Kind::Lane) return;
+        if (!mask.helpers_clear) {
+            reject(std::string(mnemonic(in)) + " of a mask whose bits of lanes no invocation runs may be set");
+            return;
+        }
+        // The idiom's rank: the high half alone (a workgroup past 32
+        // invocations), then the low half over the same mask on it - or, in
+        // a workgroup of 32 or fewer, the low half on anything (the high half
+        // counts nothing there). Its word is S1's: the rank itself is folded
+        // into the invocation's slot, and S1 rides along (base + rank + S1 is
+        // the slot + S1).
+        const bool idiom = hi ? !s1.wave_part
+                              : (!s1.wave_part && workgroup_threads() <= 32) || (s1.wave_part == 4 && same_lane(part_mask_val(s1), mask));
+        if (idiom) {
+            Val r = word(s1.wave_part ? s1.id : as_u(s1));
+            r.wave_part = hi ? 4 : 3;
+            r.part_mask = mask.constant ? 0 : mask.id;
+            r.part_mask_constant = mask.constant;
+            r.part_mask_set = mask.set;
+            inst_uniform = false;
+            Val w = r;
+            write_v(in.dst, w);
+            ++wave_ranks;
+            note += hi ? " (rank's high half)" : " (rank)";
+            return;
+        }
+        if (s1.wave_part) {
+            reject_wave_part(s1);
+            return;
+        }
+        if (!require_converged(std::string(mnemonic(in)) + " (the other lanes' bits)")) return;
+        subgroup_caps();
+        if (!in_subgroup_lane) {
+            EntryScope entry(m);
+            in_subgroup_lane = builtin(p_in_u32, spv::BiSubgroupLocalInvocationId);
+        }
+        Id lane_id;
+        {
+            EntryScope entry(m);
+            lane_id = m.load(t_u32, in_subgroup_lane);
+        }
+        const Id ballot = m.emit(spv::OpGroupNonUniformBallot, t_v4u, {cu(spv::ScopeSubgroup), mask.constant ? m.const_bool(mask.set) : mask.id});
+        const Id lt32 = m.emit(spv::OpULessThan, t_bool, {lane_id, cu(32)});
+        const Id below = hi ? m.emit(spv::OpSelect, t_u32, {lt32, cu(0), ibin(spv::OpISub, shift(spv::OpShiftLeftLogical, cu(1), ibin(spv::OpISub, lane_id, cu(32))), cu(1))})
+                            : m.emit(spv::OpSelect, t_u32, {lt32, ibin(spv::OpISub, shift(spv::OpShiftLeftLogical, cu(1), lane_id), cu(1)), cu(0xffffffffu)});
+        const Id count = m.emit(spv::OpBitCount, t_u32, {ibin(spv::OpBitwiseAnd, extract(t_u32, ballot, hi ? 1 : 0), below)});
+        inst_uniform = false;
+        write_v(in.dst, word(ibin(spv::OpIAdd, count, as_u(s1))));
+        ++subgroup_ranks;
+        ++res.wave.lane_ranks;
+    }
+    std::size_t subgroup_ranks = 0;
+
     void ds(const Inst& in) {
+        if (compute()) {
+            if ((in.op == 61 || in.op == 62) && in.gds) {
+                gds_counter(in);
+                return;
+            }
+            reject(std::string(mnemonic(in) ? mnemonic(in) : "unknown") + (in.op == 53 ? " (a lane shuffle) in a compute shader is not lifted" : " is not lifted"));
+            return;
+        }
         if (tess && in.op != 53) {
             tess_lds(in);
             return;
@@ -3818,7 +5778,7 @@ private:
             // TessLift: a scalar integer operation of constants is a constant (Val::sym).
             std::vector<Val> sym_ops;
             std::uint32_t probe = 0;
-            if (tess && scalar_int_op(in, 0, 0, probe)) {
+            if (sym_on() && scalar_int_op(in, 0, 0, probe)) {
                 if (in.enc == Enc::SOP2) {
                     sym_ops.push_back(peek(in.src0, in));
                     sym_ops.push_back(peek(in.src1, in));
@@ -3828,7 +5788,7 @@ private:
             }
             if (in.enc == Enc::SOP2) sop2(in);
             else sopk(in);
-            if (tess && res.rejections.empty() && (in.enc == Enc::SOP2 ? !sym_ops.empty() : in.op == 15 || in.op == 16)) sym_scalar(in, sym_ops);
+            if (sym_on() && res.rejections.empty() && (in.enc == Enc::SOP2 ? !sym_ops.empty() : in.op == 15 || in.op == 16)) sym_scalar(in, sym_ops);
             break;
         }
         case Enc::SOPC: sopc(in); break;
@@ -3854,7 +5814,7 @@ private:
     // ---- scalar liveness after a region ---------------------------------------------
     // Scalar state an instruction reads and redefines, for the instructions the
     // lifter accepts. False for anything else (treated as reading everything).
-    static bool scalar_rw(const Inst& in, std::set<int>& r, std::set<int>& w) {
+    bool scalar_rw(const Inst& in, std::set<int>& r, std::set<int>& w) const {
         const auto key = [](std::uint16_t c) -> int {
             if (c < 104) return c;
             if (c >= 112 && c < 124) return 200 + c - 112;
@@ -3910,13 +5870,18 @@ private:
             if (in.op == 15 || in.op == 16) { rd(in.dst); wr(in.dst); if (in.op == 15) w.insert(kKeyScc); return true; }
             return in.op == 19 || in.op == 21;
         case Enc::SOPP:
-            if (in.op == 1 || in.op == 8) r.insert(kKeyExec);
+            if ((in.op == 1 && !compute()) || in.op == 8) r.insert(kKeyExec);  // a dispatch's s_endpgm exports and discards nothing
             if (in.op == 4 || in.op == 5) r.insert(kKeyScc);
             if (in.op == 6 || in.op == 7) r.insert(kKeyVcc);
             return in.op == 0 || in.op == 1 || in.op == 2 || (in.op >= 4 && in.op <= 8) || in.op == 10 || in.op == 12 ||
                    (in.op >= 13 && in.op <= 22 && in.op != 18);
         case Enc::SMRD: {
             const int count = in.op < 8 ? (1 << in.op) : (in.op < 13 ? (1 << (in.op - 8)) : 0);
+            if (compute() && in.op == 30) {  // s_memtime
+                wr_pair(in.sdst);
+                return true;
+            }
+            if (compute() && in.op == 31) return true;  // s_dcache_inv
             if (!count) return false;
             rd_pair(in.src0);
             if (!in.imm_flag && !in.has_literal) rd(static_cast<std::uint16_t>(in.imm));
@@ -3924,6 +5889,11 @@ private:
             return true;
         }
         case Enc::VOP1: case Enc::VOP2: case Enc::VOPC: case Enc::VOP3:
+            if (compute() && ((in.enc == Enc::VOP1 && in.op == 2) || (in.enc == Enc::VOP3 && in.op == 0x182))) {  // v_readfirstlane_b32: an SGPR
+                rd(in.src0);
+                wr(in.dst);
+                return true;
+            }
             if ((in.enc == Enc::VOP2 && (in.op == 1 || in.op == 2)) || (in.enc == Enc::VOP3 && (in.op == 0x101 || in.op == 0x102))) {
                 // v_readlane_b32 / v_writelane_b32: the lane operand is a scalar code, and the cell is state of its own
                 const std::uint16_t lane_code = in.enc == Enc::VOP3 ? in.src1 : static_cast<std::uint16_t>(in.src1 - 256);
@@ -3962,11 +5932,20 @@ private:
             for (int k = 0; k < 4; ++k) rd(static_cast<std::uint16_t>(in.ssamp + k));
             return true;
         case Enc::MTBUF:
+            if (compute()) {  // every typed access reads its V# as data, and soffset
+                rd_pair(in.srsrc);
+                rd_pair(static_cast<std::uint16_t>(in.srsrc + 2));
+                rd(in.soffset);
+                return true;
+            }
             if (in.op >= 4) return false;
             rd_pair(in.srsrc);  // the V# the reference traced to its binding
             return true;
-        case Enc::MUBUF:  // buffer stores (a vertex shader's, a hull's factor stores): the V# and offset are read
-            if (in.op < 24 || in.op > 31) return false;
+        case Enc::MUBUF:  // buffer stores (a vertex shader's, a hull's factor stores; a GS's ring loads): the V# and offset are read
+            if (compute() ? !(in.op <= 15 || (in.op >= 24 && in.op <= 31) || in.op == 50 || in.op == 112 || in.op == 113)
+                          : (in.op < 24 || in.op > 31) && !(gs_geom() && in.op == 12)) {
+                return false;
+            }
             rd_pair(in.srsrc);
             rd_pair(static_cast<std::uint16_t>(in.srsrc + 2));
             rd(in.soffset);
@@ -3975,6 +5954,10 @@ private:
             return true;
         case Enc::DS:
             if (in.op == 13 || in.op == 14 || in.op == 54 || in.op == 55) {  // the LDS accesses a tessellation lift takes: M0 bounds them
+                r.insert(kKeyM0);
+                return true;
+            }
+            if (compute() && (in.op == 61 || in.op == 62) && in.gds) {  // a GDS counter: M0 names its range
                 r.insert(kKeyM0);
                 return true;
             }
@@ -4109,6 +6092,65 @@ private:
     // An if on a scalar condition: a selection whose then arm runs where the
     // branch falls through. Every lane takes the same arm, so the arms are
     // plain structured control flow.
+    // A compute region as a selection (Region::branched): taken where the
+    // invocation's EXEC bit is set as the region begins, its join the
+    // region's end, where the registers it wrote become phis with their
+    // values from before it (close_arm, merge_arms). It is the same program:
+    // the region's writes are masked by that bit (so a skipping invocation
+    // keeps its old values either way), its scalar state is dead after it
+    // (close_region), and nothing in it needs the other invocations
+    // (branch_region). What it saves is the work GCN's waves save by skipping
+    // a region no lane needs.
+    std::size_t selected_regions = 0, region_merge_phis = 0;
+    bool branch_region(const Region& r) const {
+        if (!compute() || r.kill || r.disabled) return false;
+        for (std::size_t i = index_of(r.start); i < prog.insts.size() && prog.insts[i].offset < r.end; ++i) {
+            const Inst& in = prog.insts[i];
+            // Wave-wide operations, which GCN runs for the wave whatever EXEC
+            // holds: a barrier, a lane's rank, lane reads and writes.
+            if (in.enc == Enc::SOPP && in.op == 10) return false;
+            if (in.enc == Enc::VOP2 && (in.op == 1 || in.op == 2 || in.op == 35 || in.op == 36)) return false;
+            if (in.enc == Enc::VOP1 && in.op == 2) return false;
+            if (in.enc == Enc::VOP3 && (in.op == 0x101 || in.op == 0x102 || in.op == 0x123 || in.op == 0x124 || in.op == 0x182)) return false;
+            // A way out of a loop the region sits in (its back edge or an exit).
+            for (const Loop* l : open_loops) {
+                if (in.offset == l->latch || (loop_exits.count(in.offset) && innermost_loop(in.offset) == l)) return false;
+            }
+        }
+        return true;
+    }
+    void open_region_arm(Region& r, std::uint64_t seq) {
+        region_ifs.push_back({});
+        Construct& c = region_ifs.back();
+        c.branch = r.branch;
+        c.op = 8;  // s_cbranch_execz
+        c.else_start = c.join = r.end;
+        Arm a;
+        a.c = &c;
+        a.seq = seq;
+        a.region = true;
+        a.merge = m.fresh();
+        a.then_label = m.fresh();
+        a.else_label = m.fresh();
+        a.reg0 = reg;
+        a.lanes0 = lanes;
+        a.to_float0 = to_float;
+        a.to_word0 = to_word;
+        a.scc0 = scc_mask;
+        a.scc_uniform0 = scc_uniform;
+        a.scc_valid0 = scc_valid;
+        a.poisoned0 = poisoned;
+        a.in_mask0 = in_mask;
+        exact_open_arm();
+        const Val e = exec_lane();
+        const Id cond = e.constant ? m.const_bool(e.set) : e.id;
+        m.emit_void(spv::OpSelectionMerge, {a.merge, 0u});
+        m.emit_void(spv::OpBranchConditional, {cond, a.then_label, a.else_label});
+        cur_label = m.label(a.then_label);
+        arms.push_back(std::move(a));
+        r.selected = true;
+        ++selected_regions;
+    }
     void open_arm(Construct& c, std::uint64_t seq) {
         Arm a;
         a.c = &c;
@@ -4215,7 +6257,7 @@ private:
                 merged_lanes[k].helpers_clear = t->second.helpers_clear && e->second.helpers_clear;
                 if (t->second.content != e->second.content) merged_lanes[k] = new_content(merged_lanes[k]);
             } else {
-                phis.push_back({k, Kind::Lane, t->second.id, e->second.id, uniform(t->second) && uniform(e->second)});
+                phis.push_back({k, Kind::Lane, t->second.id, e->second.id, !a.region && uniform(t->second) && uniform(e->second)});
             }
         }
         std::set<int> keys;
@@ -4233,10 +6275,14 @@ private:
                 merged[k] = descriptor(t) ? t : e;
                 continue;
             }
-            phis.push_back({k, t.kind, t.id, t.kind == Kind::Float ? as_f(e) : as_u(e), uniform(t) && uniform(e)});
+            if (t.wave_part || e.wave_part) {
+                reject(key_name(k) + " holds a part of the append idiom on one arm of the if at " + hex_offset(a.c->branch) + " and joins");
+                return;
+            }
+            phis.push_back({k, t.kind, t.id, t.kind == Kind::Float ? as_f(e) : as_u(e), !a.region && uniform(t) && uniform(e)});
         }
         const bool scc_same = a.scc_valid1 && scc_valid && a.scc_uniform1 == scc_uniform && same(a.scc1v, scc_mask);
-        const bool scc_phi = !scc_same && a.scc_valid1 && scc_valid && a.scc_uniform1 && scc_uniform;
+        const bool scc_phi = !scc_same && !a.region && a.scc_valid1 && scc_valid && a.scc_uniform1 && scc_uniform;
         const Id else_end = cur_label;
         m.emit_void(spv::OpBranch, {a.merge});
         cur_label = m.label(a.merge);
@@ -4262,6 +6308,10 @@ private:
         lanes = std::move(merged_lanes);
         to_float = a.to_float0;
         to_word = a.to_word0;
+        if (a.region) {
+            region_merge_phis += phis.size();
+            return;  // close_region has said what the region is
+        }
         static const char* const kBranch[4] = {"s_cbranch_scc0", "s_cbranch_scc1", "s_cbranch_vccz", "s_cbranch_vccnz"};
         res.proof.push_back("if at " + hex_offset(a.c->branch) + " (" + kBranch[a.c->op - 4] + "): " + if_condition_proof(a) +
                             ", the same in every lane; " + (a.c->else_jump ? "then and else arms" : "a then arm") +
@@ -4294,6 +6344,10 @@ private:
         }
         to_float = a.to_float0;
         to_word = a.to_word0;
+        if (a.region) {
+            reject("the branched region at " + hex_offset(a.c->branch) + " leaves a loop");  // branch_region keeps loop exits out
+            return;
+        }
         static const char* const kBranch[4] = {"s_cbranch_scc0", "s_cbranch_scc1", "s_cbranch_vccz", "s_cbranch_vccnz"};
         res.proof.push_back("if at " + hex_offset(a.c->branch) + " (" + kBranch[a.c->op - 4] + "): " + if_condition_proof(a) +
                             ", the same in every lane; its " + (else_dead ? "else" : "then") + " arm leaves the loop, so the join at " +
@@ -4406,6 +6460,200 @@ private:
         return false;
     }
 
+    // ---- regions as branches --------------------------------------------------------
+    // GCN skips an s_cbranch_execz region in a wave none of whose lanes has
+    // its EXEC bit set; the lift ran it for every pixel and kept the old
+    // values where the bit is clear (select), so a light out of range of a
+    // whole wave, or YEBIS's taps where nothing is out of focus, cost every
+    // pixel all of their instructions. On the Radeon 8060S in Kyo's room
+    // (2026-10-15) the main light pass's lift ran 741 vector instructions to
+    // the console's 445, and the reference translation, which branches on an
+    // empty EXEC, ran that pass in 0.66 ms to the lift's 0.85 and YEBIS's
+    // 7d668276+157a299c in 0.12 to 0.33. A region whose every instruction
+    // gives a pixel the same values taken or skipped where its bit is clear
+    // is now a branch on the pixel's EXEC bit: the then block holds the region
+    // as before, the skip block the values at the branch, and the merge a phi
+    // for each value they leave different - for a pixel whose bit is clear,
+    // what the select kept. The driver then skips the then block in a wave
+    // none of whose pixels takes it, as GCN does. Not for a region that reads
+    // other pixels or the quad (an implicit-LOD sample, a LOD query, LDS and
+    // its swizzles, v_readlane / v_writelane), writes memory or exports, holds
+    // an if, a loop or a kill region, or widens EXEC to whole quads; nor one
+    // inside a loop or an if. A region inside a branched one may branch too.
+    // BBHOST_LIFT_BRANCH=0: every region runs for every pixel, as before.
+    static bool lift_branch_on() {
+        static const bool on = [] {
+            const char* e = std::getenv("BBHOST_LIFT_BRANCH");
+            return !(e && e[0] == '0');
+        }();
+        return on;
+    }
+    bool region_branchable(const Region& r) const {
+        if (r.kill || r.disabled || r.exec_before.constant || r.exec_before.kind != Kind::Lane) return false;
+        for (const Inst& in : prog.insts) {
+            if (in.offset < r.start || in.offset >= r.end) continue;
+            const char* n = mnemonic(in);
+            if (!n) return false;
+            if (in.enc == Enc::EXP || in.enc == Enc::DS) return false;
+            if (in.enc == Enc::SOPP) {
+                if (is_branch(in) && in.op != 8) return false;  // an if, a kill region, a loop (s_cbranch_execz: a region within)
+                if (in.op == 1 || in.op == 10 || (in.op >= 16 && in.op <= 18)) return false;  // s_endpgm, s_barrier, s_sendmsg(halt), s_trap
+            }
+            const std::string s(n);
+            if (s.find("store") != std::string::npos || s.find("atomic") != std::string::npos) return false;
+            if (s.rfind("image_get_lod", 0) == 0) return false;
+            if (s.rfind("image_sample", 0) == 0 || s.rfind("image_gather", 0) == 0) {
+                // Its LOD given (_l, _lz) or its gradients (_d, _cd): nothing
+                // from the rest of the quad.
+                bool explicit_lod = false;
+                for (std::size_t at = s.find('_', 6); at != std::string::npos;) {
+                    const std::size_t next = s.find('_', at + 1);
+                    const std::string part = s.substr(at + 1, next == std::string::npos ? std::string::npos : next - at - 1);
+                    explicit_lod |= part == "l" || part == "lz" || part == "d" || part == "cd";
+                    at = next;
+                }
+                if (!explicit_lod) return false;
+            }
+            if (s == "v_readlane_b32" || s == "v_writelane_b32" || s == "v_readfirstlane_b32" || s.rfind("s_wqm", 0) == 0) return false;
+        }
+        return true;
+    }
+    void region_branch_open(Region& r) {
+        r.branched = true;
+        r.rb_merge = m.fresh();
+        r.rb_skip = m.fresh();
+        const Id then_label = m.fresh();
+        r.rb_reg0 = reg;
+        r.rb_lanes0 = lanes;
+        r.rb_to_float0 = to_float;
+        r.rb_to_word0 = to_word;
+        r.rb_scc0 = scc_mask;
+        r.rb_scc_uniform0 = scc_uniform;
+        r.rb_scc_valid0 = scc_valid;
+        r.rb_poisoned0 = poisoned;
+        r.rb_in_mask0 = in_mask;
+        m.emit_void(spv::OpSelectionMerge, {r.rb_merge, 0u});
+        m.emit_void(spv::OpBranchConditional, {r.exec_before.id, then_label, r.rb_skip});
+        cur_label = m.label(then_label);
+    }
+    // After close_region's checks, which see the region's end as the then
+    // block leaves it.
+    void region_branch_close(Region& r) {
+        const auto same = [](const Val& x, const Val& y) {
+            return x.kind == y.kind && x.constant == y.constant && (x.constant ? (x.kind == Kind::Lane ? x.set == y.set : x.bits == y.bits) : x.id == y.id);
+        };
+        const std::map<int, Val> reg1 = reg, lanes1 = lanes;
+        const std::set<int> poisoned1 = poisoned, in_mask1 = in_mask;
+        const Val scc1 = scc_mask;
+        const bool scc_uniform1 = scc_uniform, scc_valid1 = scc_valid;
+        m.emit_void(spv::OpBranch, {r.rb_merge});
+        const Id then_end = cur_label;
+        // The skip block: the values at the branch (any conversion a phi
+        // needs is made here).
+        cur_label = m.label(r.rb_skip);
+        reg = r.rb_reg0;
+        lanes = r.rb_lanes0;
+        to_float = r.rb_to_float0;
+        to_word = r.rb_to_word0;
+        const auto at = [&](const std::map<int, Val>& arm, int key) {
+            if (const auto it = arm.find(key); it != arm.end()) return it->second;
+            if (const auto it = r.rb_reg0.find(key); it != r.rb_reg0.end()) return it->second;
+            return initial_value(key);
+        };
+        struct Phi {
+            int key;
+            Kind kind;
+            Id then_value, skip_value;
+        };
+        std::vector<Phi> phis;
+        std::set<int> lane_keys;
+        for (const auto& [k, v] : lanes1) lane_keys.insert(k);
+        for (const auto& [k, v] : lanes) lane_keys.insert(k);
+        std::map<int, Val> merged_lanes;
+        std::set<int> lost = poisoned1;
+        lost.insert(poisoned.begin(), poisoned.end());
+        for (int k : lane_keys) {
+            const auto t = lanes1.find(k);
+            const auto e = lanes.find(k);
+            if (t == lanes1.end() || e == lanes.end()) {
+                // A mask made inside the region only: unknown after it.
+                if (k != kKeyVcc && k != kKeyExec) {
+                    lost.insert(k);
+                    lost.insert(k + 1);
+                }
+                continue;
+            }
+            if (same(t->second, e->second)) {
+                merged_lanes[k] = t->second;
+                merged_lanes[k].wave_exact = t->second.wave_exact && e->second.wave_exact;
+                merged_lanes[k].helpers_clear = t->second.helpers_clear && e->second.helpers_clear;
+                merged_lanes[k].helper_inexact = t->second.helper_inexact || e->second.helper_inexact;
+                if (t->second.content != e->second.content) merged_lanes[k] = new_content(merged_lanes[k]);
+            } else {
+                phis.push_back({k, Kind::Lane, t->second.id, e->second.id});
+            }
+        }
+        std::set<int> keys;
+        for (const auto& [k, v] : reg1) keys.insert(k);
+        for (const auto& [k, v] : reg) keys.insert(k);
+        std::map<int, Val> merged;
+        std::map<int, bool> inexact;
+        for (int k : keys) {
+            if (lane_keys.count(k) || (k > 0 && k < 104 && lane_keys.count(k - 1)) || lost.count(k)) continue;  // a lane mask's words, or lost
+            const Val t = at(reg1, k), e = at(reg, k);
+            if (same(t, e)) {
+                merged[k] = t;
+                continue;
+            }
+            if (descriptor(t) || descriptor(e)) {  // a descriptor word on either path: still never data
+                merged[k] = descriptor(t) ? t : e;
+                continue;
+            }
+            inexact[k] = t.helper_inexact || e.helper_inexact;
+            phis.push_back({k, t.kind, t.id, t.kind == Kind::Float ? as_f(e) : as_u(e)});
+        }
+        m.emit_void(spv::OpBranch, {r.rb_merge});
+        const Id skip_end = cur_label;
+        cur_label = m.label(r.rb_merge);
+        for (const Phi& p : phis) {
+            // Never uniform: the branch is the pixel's own bit.
+            const Id type = p.kind == Kind::Lane ? t_bool : p.kind == Kind::Float ? t_f32 : t_u32;
+            const Id id = m.emit(spv::OpPhi, type, {p.then_value, then_end, p.skip_value, skip_end});
+            if (p.kind == Kind::Lane) {
+                Val v = new_content(lane(id));
+                v.helper_inexact = lanes1.at(p.key).helper_inexact || r.rb_lanes0.at(p.key).helper_inexact;
+                merged_lanes[p.key] = v;
+            } else {
+                Val v = p.kind == Kind::Float ? flt(id) : word(id);
+                v.helper_inexact = inexact[p.key];
+                merged[p.key] = v;
+            }
+        }
+        reg = std::move(merged);
+        lanes = std::move(merged_lanes);
+        to_float = r.rb_to_float0;
+        to_word = r.rb_to_word0;
+        poisoned = std::move(lost);
+        in_mask = in_mask1;
+        for (auto it = in_mask.begin(); it != in_mask.end();) it = r.rb_in_mask0.count(*it) ? std::next(it) : in_mask.erase(it);
+        // SCC the region wrote is dead after it (close_region showed it): the
+        // value at the branch dominates the merge.
+        if (scc_valid1 && r.rb_scc_valid0 && scc_uniform1 == r.rb_scc_uniform0 && same(scc1, r.rb_scc0)) {
+            scc_mask = r.rb_scc0;
+            scc_uniform = r.rb_scc_uniform0;
+            scc_valid = true;
+        } else {
+            scc_mask = r.rb_scc0;
+            scc_uniform = r.rb_scc_uniform0;
+            scc_valid = false;
+        }
+        ++branched_regions;
+        res.proof.push_back("region " + hex_offset(r.start) + "-" + hex_offset(r.end) + " branches on the pixel's EXEC bit at " +
+                            hex_offset(r.branch) + ": nothing in it reads another pixel or writes memory, so a pixel whose bit is clear "
+                            "gets what the select kept; " + std::to_string(phis.size()) + " phis");
+    }
+    std::size_t branched_regions = 0;
+
     void close_region(Region& r, std::size_t next_index) {
         r.closed = true;
         // Within a loop's mask after the region only where so on both paths: a
@@ -4493,7 +6741,10 @@ private:
         for (int k : r.scalar_writes) names += (names.empty() ? "" : ", ") + key_name(k);
         std::string how;
         if (!r.kill) {
-            how = ": writes masked by EXEC at " + hex_offset(r.branch) + ", and EXEC set inside only within it";
+            how = ": writes masked by EXEC at " + hex_offset(r.branch) + ", and EXEC set inside only within it" +
+                  (r.selected ? std::string("; a selection on the invocation's EXEC bit there, skipped where it is clear as GCN's wave skips "
+                                            "the region where no lane's is")
+                              : std::string());
         } else if (r.quad_exact) {
             how = ": s_cbranch_scc0 at " + hex_offset(r.branch) + " tests the mask the region ANDs into EXEC and widens to whole quads; " +
                   exec_after + "; s_endpgm kills exactly the guard's clear pixels";
@@ -4587,13 +6838,19 @@ private:
         // quads GCN runs it in), and that region's start.
         Id quad_live = 0;
         std::uint32_t quad_region = 0;
+        // compute: an s_barrier or a subgroup operation inside, which needs
+        // every invocation that entered the loop in each iteration (what and
+        // where), and whether an exit lets invocations leave at different
+        // iterations - the two cannot both hold (close_loop).
+        std::string converged_op;
+        bool divergent_exit = false;
     };
     std::vector<Loop> loops;  // by header
     std::vector<Loop*> open_loops;
     std::set<std::uint32_t> loop_exits;  // branches that leave their innermost loop for its exit
     std::set<Id> assumed;                // lane masks set wherever the lift now is (a divergent loop's body)
     bool block_dead = false;             // the current block ended by leaving a loop
-    const LoopPhis lane_phi_hints, inexact_hints;
+    const LoopPhis lane_phi_hints, inexact_hints, nonuniform_hints;
     std::size_t loops_lifted = 0, divergent_loops = 0;
 
     bool loop_branch(std::uint32_t offset) const {
@@ -4647,6 +6904,14 @@ private:
                        " is written with lanes beyond it: the lanes that left would join the loop again");
                 return false;
             }
+            if (l->mask == kKeyExec) {
+                // A loop on EXEC: its body sets EXEC anywhere (its regions
+                // save and restore it), always within the lanes still in the
+                // loop; the exit test is where the loop mask narrows
+                // (loop_exit), not each write.
+                in_mask.insert(key);
+                return true;
+            }
             // Inside a region only by the exit idiom (s_andn2_b64 L, L, exec right
             // before one of the loop's divergent exits): the lanes leaving there.
             const bool exit_idiom = open_regions.size() > l->regions0 && l->mask_exits.count(cur + 4) != 0;
@@ -4669,6 +6934,7 @@ private:
     // header, neither written since: the same 64 bits, where an equal constant
     // need not be (-1 also has the lanes no pixel runs in, which never leave).
     bool mask_copied_from_exec(const Loop& l) const {
+        if (l.mask == kKeyExec) return true;  // a loop on EXEC: the mask is EXEC
         for (std::size_t i = l.header_index; i-- > 0;) {
             const Inst& p = prog.insts[i];
             if (block_starts.count(prog.insts[i + 1].offset) || is_branch(p)) return false;
@@ -4807,6 +7073,26 @@ private:
                 }
                 l.mask_exits.insert(br.offset);
             }
+            // compute(): a loop on EXEC - the compiler's form of a loop whose
+            // lanes leave one by one, s_and_b64 exec, exec, <condition> (or
+            // another narrowing) and an s_cbranch_execz to the exit once no lane
+            // is left - at the loop's top level. Its loop mask is EXEC itself
+            // (Loop::mask kKeyExec): a lane leaves when its EXEC bit clears.
+            for (std::size_t i = l.header_index; compute() && i < l.latch_index; ++i) {
+                const Inst& br = prog.insts[i];
+                if (!(br.enc == Enc::SOPP && br.op == 8 && loop_exits.count(br.offset) && innermost_loop(br.offset) == &l)) continue;
+                const auto inside = [&](std::uint32_t x0, std::uint32_t x1) { return x0 >= l.header && x0 < br.offset && br.offset < x1; };
+                if (std::any_of(constructs.begin(), constructs.end(), [&](const Construct& c) { return inside(c.branch, c.join); })) continue;
+                if (l.mask >= 0 && l.mask != kKeyExec) {
+                    cur = br.offset;
+                    reject("the loop at " + hex_offset(l.header) + " leaves on EXEC and on the mask " + key_name(l.mask));
+                }
+                if (l.mask < 0) {
+                    l.mask = kKeyExec;
+                    l.mask_exit = br.offset;
+                }
+                l.mask_exits.insert(br.offset);
+            }
             const auto fits = [&](std::uint32_t x0, std::uint32_t x1) {
                 return x1 <= l.header || x0 >= l.exit || (x0 >= l.header && x1 <= l.latch) || (x0 < l.header && x1 >= l.exit);
             };
@@ -4936,7 +7222,11 @@ private:
         const auto add_word = [&](int k) {
             const Val v = value(k);
             const bool f = v.kind == Kind::Float;
-            words.push_back({k, f ? Kind::Float : Kind::Word, f ? v.id : as_u(v), k < 256 && uniform(v), inexact_at_header(k, v)});
+            // compute: a VGPR every lane enters the loop holding alike is
+            // taken to stay alike (checked at the back edge, another attempt
+            // if not) - a loop counter from a constant, a bound from user data.
+            const bool uni = (k < 256 || (compute() && !nonuniform_hints.count({l.header, k}))) && uniform(v);
+            words.push_back({k, f ? Kind::Float : Kind::Word, f ? v.id : as_u(v), uni, inexact_at_header(k, v)});
         };
         for (int k : vgprs) add_word(k);
         const auto e = lanes.find(kKeyExec);
@@ -4944,7 +7234,7 @@ private:
         for (int k : l.writes) {
             // EXEC, SCC and a divergent loop's mask are handled below. (A uniform
             // loop has no mask: s0 and s1 are registers like any other.)
-            if (k == kKeyScc || k == kKeyExec || (l.mask >= 0 && (k == l.mask || k == l.mask + 1))) continue;
+            if (k == kKeyScc || k == kKeyExec || (l.mask >= 0 && l.mask < 104 && (k == l.mask || k == l.mask + 1))) continue;
             const bool lane_key = k == kKeyVcc || lanes.count(k);
             const bool lane_high = k > 0 && k < 104 && lanes.count(k - 1);
             if (lane_high) continue;
@@ -5017,6 +7307,8 @@ private:
                 {
                     EntryScope entry(m);
                     helper = m.load(t_bool, in_helper);
+                    // A pixel the clip prologue demoted is a helper from the start (clip_cut).
+                    if (clip_cut) helper = m.emit(spv::OpLogicalOr, t_bool, {helper, clip_cut});
                 }
                 const Id covered = m.emit(spv::OpLogicalNot, t_bool, {helper});
                 const Id kept = g.constant ? (g.set ? covered : m.const_bool(false)) : m.emit(spv::OpLogicalAnd, t_bool, {g.id, covered});
@@ -5092,6 +7384,7 @@ private:
         }
         Id leave = 0;  // where the branch is taken; 0 with `always`
         bool always = false, per_pixel = false;
+        Val tested;  // per_pixel: the loop mask the exit tests, set wherever the lift stays in the loop
         if (in.op == 2) {
             always = true;
         } else if (in.op == 4 || in.op == 5) {
@@ -5110,6 +7403,7 @@ private:
                 }
             } else if (l.mask_exits.count(in.offset) && !scc.constant) {
                 per_pixel = true;
+                tested = scc;
                 if (!divergent_exit(l, scc)) return;
                 leave = bnot(scc).id;
                 if (l.quad_live) leave = m.emit(spv::OpLogicalOr, t_bool, {leave, m.emit(spv::OpLogicalNot, t_bool, {l.quad_live})});
@@ -5157,6 +7451,20 @@ private:
                 if (!draw_wide_exit(l, bit, in)) return;
                 leave = on_set ? bit.id : bnot(bit).id;
             }
+        } else if (in.op == 8 && l.mask == kKeyExec && l.mask_exits.count(in.offset)) {
+            // A loop on EXEC's exit test: GCN leaves once EXEC is clear in
+            // every lane; an invocation whose own EXEC bit is clear has left -
+            // everything it would write from here on is masked off, and EXEC
+            // stays within the lanes still in the loop (note_in_mask).
+            tested = exec_lane();
+            if (tested.constant) {
+                if (tested.set) return;  // never taken by an invocation still in the loop
+                reject("the loop on EXEC at " + hex_offset(l.header) + " tests an EXEC clear for every invocation");
+                return;
+            }
+            per_pixel = true;
+            if (!divergent_exit(l, tested)) return;
+            leave = bnot(tested).id;
         } else {
             reject(std::string(mnemonic(in)) + " leaves the loop at " + hex_offset(l.header) +
                    ": only s_branch, s_cbranch_scc0/scc1 and s_cbranch_vccz/vccnz are lifted as loop exits");
@@ -5206,10 +7514,16 @@ private:
         }
         l.exits.push_back(std::move(x));
         if (per_pixel) {
-            const Val mk = known(scc_mask);
+            const Val mk = tested;
             l.assumed.push_back(mk.id);
             if (const auto it = conjuncts.find(mk.id); it != conjuncts.end()) l.assumed.insert(l.assumed.end(), it->second.begin(), it->second.end());
             for (const Id a : l.assumed) assumed.insert(a);
+            // A loop on EXEC: past the test the loop's lanes are EXEC's, and
+            // no other mask is known to lie within them.
+            if (l.mask == kKeyExec) in_mask = {kKeyExec};
+            // Taken on a bit every lane holds alike, every invocation leaves at
+            // the same iteration: the loop keeps its invocations together.
+            if (!uniform(tested)) l.divergent_exit = true;
         }
     }
     // A uniform loop inside a region runs for every pixel, also in the waves
@@ -5217,7 +7531,7 @@ private:
     // too, from values every wave of the draw holds alike (user data, scalar
     // loads, constants) - the count of any wave that enters the region.
     bool draw_wide_exit(const Loop& l, const Val& bit, const Inst& in) {
-        if (!l.region || uniform(bit)) return true;
+        if (!l.region || (uniform(bit) && (bit.constant || !wg_ids.count(bit.id)))) return true;
         reject(std::string(mnemonic(in)) + " leaves the loop at " + hex_offset(l.header) + ", inside the region at " + hex_offset(l.region) +
                ", on a bit not computed from values every wave of the draw holds alike: the lift runs it also where GCN skips the region");
         return false;
@@ -5304,8 +7618,12 @@ private:
             }
             const Val v = value(p.key);
             if (p.uniform && !uniform(v)) {
-                reject(key_name(p.key) + " comes back to the header of the loop at " + hex_offset(l.header) + " with a value lanes may not hold alike");
-                return;
+                if (compute() && p.key >= 256) {
+                    more_nonuniform.insert({l.header, p.key});  // another attempt, with this one not alike at the header
+                } else {
+                    reject(key_name(p.key) + " comes back to the header of the loop at " + hex_offset(l.header) + " with a value lanes may not hold alike");
+                    return;
+                }
             }
             helper_lanes_kept(p.key, p.helper_inexact, v);
             // Where it holds GCN's value: at least where the header assumed.
@@ -5432,6 +7750,10 @@ private:
                 merged[k].helper_inexact = inexact;
                 continue;
             }
+            if (std::any_of(vals.begin(), vals.end(), [](const Val& v) { return v.wave_part != 0; })) {
+                reject(key_name(k) + " holds a part of the append idiom on an exit of the loop at " + hex_offset(l.header));
+                return false;
+            }
             if (any_descriptor) {  // a descriptor word on any exit: still never data
                 for (const Val& v : vals) {
                     if (descriptor(v)) merged[k] = v;
@@ -5513,6 +7835,11 @@ private:
         Loop& l = *open_loops.back();
         open_loops.pop_back();
         cur = l.exit;
+        if (!l.converged_op.empty() && l.divergent_exit) {
+            reject(l.converged_op + ", inside the loop at " + hex_offset(l.header) +
+                   ", which invocations leave at different iterations: it needs every invocation that entered the loop");
+            return;
+        }
         for (const Id a : l.assumed) assumed.erase(a);
         if (l.exits.empty()) {
             reject("the loop at " + hex_offset(l.header) + " has no exit");
@@ -5561,7 +7888,11 @@ private:
         for (const auto& [k, v] : l.unchanged) kept += (kept.empty() ? "" : ", ") + key_name(k);
         res.proof.push_back(
             "loop " + hex_offset(l.header) + "-" + hex_offset(l.latch) + ": " +
-            (l.mask >= 0 ? "divergent, the per-lane exit idiom on " + key_name(l.mask) + " at " + mask_exits_text(l) +
+            (l.mask == kKeyExec ? "on EXEC, left at " + mask_exits_text(l) +
+                                      " (s_cbranch_execz: GCN leaves once no lane is left, an invocation once its own EXEC bit is clear - its "
+                                      "writes are masked from there and EXEC stays within the loop's lanes; what the loop writes of scalar "
+                                      "state is dead after it; no subgroup operation inside)"
+             : l.mask >= 0 ? "divergent, the per-lane exit idiom on " + key_name(l.mask) + " at " + mask_exits_text(l) +
                                " (EXEC and the mask keep EXEC at entry at the header and come back set; EXEC lies within the mask wherever "
                                "it writes a VGPR and at the back edge; what the loop writes is dead after it; no implicit-LOD sample inside)" +
                                (l.quad_live ? "; inside the kill region at " + hex_offset(l.quad_region) +
@@ -5589,22 +7920,43 @@ private:
     // stage wrote at the clip location is negative is discarded before anything
     // runs, where the clipper would have cut it out of the triangle; the others
     // run the program as they would have.
+    // With gcn::clip_demote (the default where the device has the feature) the
+    // pixel becomes a helper invocation instead (OpDemoteToHelperInvocation),
+    // as the clipper leaves a pixel it cut out of a quad's triangle: it still
+    // computes the values its quad's derivatives take, where an ended
+    // invocation leaves them undefined - garbage mips along every clip edge on
+    // drivers that end it (AMD's, Intel's). The helper-lane query counts it a
+    // helper from the start (clip_cut), as GCN's coverage would.
     bool clip_discard = false;
+    Id clip_cut = 0;  // the pixel the clip distances cut out (with clip_demote)
     void clip_discard_prologue() {
         const Id var = m.global_variable(p_in_v4f, spv::ScInput);
         m.decorate(var, spv::DecLocation, {opt.ps_clip_location()});
         m.name(var, "clip_distances");
         interface.push_back(var);
-        const Id d = m.load(t_v4f, var);
+        const bool demote = clip_demote();
         Id out = m.const_bool(false);
-        for (std::uint32_t k = 0; k < std::min<std::uint32_t>(opt.ps_clip_count(), 4); ++k) {
-            out = m.emit(spv::OpLogicalOr, t_bool, {out, m.emit(spv::OpFOrdLessThan, t_bool, {extract(t_f32, d, k), cf(0.0f)})});
+        {
+            // In the entry block, ahead of everything the helper query reads.
+            EntryScope entry(m);
+            const Id d = m.load(t_v4f, var);
+            for (std::uint32_t k = 0; k < std::min<std::uint32_t>(opt.ps_clip_count(), 4); ++k) {
+                out = m.emit(spv::OpLogicalOr, t_bool, {out, m.emit(spv::OpFOrdLessThan, t_bool, {extract(t_f32, d, k), cf(0.0f)})});
+            }
         }
         const Id l_kill = m.fresh(), l_on = m.fresh();
         m.emit_void(spv::OpSelectionMerge, {l_on, 0u});
         m.emit_void(spv::OpBranchConditional, {out, l_kill, l_on});
         m.label(l_kill);
-        m.emit_void(spv::OpKill, {});
+        if (demote) {
+            m.capability(spv::CapDemoteToHelperInvocation);
+            m.extension("SPV_EXT_demote_to_helper_invocation");
+            m.emit_void(spv::OpDemoteToHelperInvocation, {});
+            m.emit_void(spv::OpBranch, {l_on});
+            clip_cut = out;
+        } else {
+            m.emit_void(spv::OpKill, {});
+        }
         cur_label = m.label(l_on);
         clip_discard = true;
         ++res.wave.discards;
@@ -5614,7 +7966,15 @@ private:
     void emit() {
         m.capability(spv::CapShader);
         m.capability(spv::CapInt64);
-        m.memory_model(0 /* Logical */, 1 /* GLSL450 */);
+        if (compute() || oob_counting()) {
+            // Guest memory through physical storage buffer pointers, as the
+            // reference reaches it (and the counters, gcn::set_oob_count).
+            m.capability(spv::CapPhysicalStorageBufferAddresses);
+            m.extension("SPV_KHR_physical_storage_buffer");
+            m.memory_model(5348 /* PhysicalStorageBuffer64 */, 1 /* GLSL450 */);
+        } else {
+            m.memory_model(0 /* Logical */, 1 /* GLSL450 */);
+        }
         t_void = m.type_void();
         t_bool = m.type_bool();
         t_u32 = m.type_int(32, false);
@@ -5656,6 +8016,18 @@ private:
         const bool vertex_formats = (opt.stage == Stage::Vertex && opt.vertex_formats_from_params && !opt.vertex_input.empty()) ||
                                     ((tess_ls() || tess_hs()) && !tess->own_params);
         if (vertex_formats) members.push_back(t_bias_arr);
+        if (compute()) {
+            // Member 3 as the uvec4 { cb_valid, lds_bytes, gds_base, pad }, and
+            // member 7 StageParams::gds_counter (eight u64 guest addresses) when
+            // the program counts in GDS, as the reference declares them.
+            members[3] = t_v4u;
+            if (opt.gds_counters && std::any_of(prog.insts.begin(), prog.insts.end(), [](const Inst& in) {
+                    return in.enc == Enc::DS && in.gds && (in.op == 61 || in.op == 62);
+                })) {
+                gds_member = static_cast<std::uint32_t>(members.size());
+                members.push_back(t_bias_arr);
+            }
+        }
         if (ref.bindless) {
             bindless_image_member = static_cast<std::uint32_t>(members.size());
             bindless_sampler_member = bindless_image_member + 1;
@@ -5672,6 +8044,7 @@ private:
         m.member_decorate(t_ubo, 5, spv::DecOffset, {160});
         m.member_decorate(t_ubo, 6, spv::DecOffset, {224});
         if (vertex_formats) m.member_decorate(t_ubo, 7, spv::DecOffset, {static_cast<std::uint32_t>(offsetof(StageParams, vertex_formats))});
+        if (gds_member) m.member_decorate(t_ubo, gds_member, spv::DecOffset, {static_cast<std::uint32_t>(offsetof(StageParams, gds_counter))});
         if (ref.bindless) {
             m.member_decorate(t_ubo, bindless_image_member, spv::DecOffset, {static_cast<std::uint32_t>(offsetof(StageParams, image_index))});
             m.member_decorate(t_ubo, bindless_sampler_member, spv::DecOffset, {static_cast<std::uint32_t>(offsetof(StageParams, sampler_index))});
@@ -5697,6 +8070,10 @@ private:
         };
         for (std::size_t k = 0; k < ref.images.size(); ++k) {
             const ImageBinding& b = ref.images[k];
+            if (b.storage && compute()) {  // as the reference declares a storage image (translate.cpp image_for)
+                m.capability(spv::CapStorageImageReadWithoutFormat);
+                m.capability(spv::CapStorageImageWriteWithoutFormat);
+            }
             if (b.dim == spv::Dim1D) m.capability(b.storage ? spv::CapImage1D : spv::CapSampled1D);
             if (b.dim == spv::DimCube && b.arrayed) m.capability(spv::CapSampledCubeArray);
             const Id t_img = m.type_image(b.kind == 1 ? t_u32 : b.kind == 2 ? t_i32 : t_f32, static_cast<spv::Dim>(b.dim), b.depth,
@@ -5811,10 +8188,25 @@ private:
             }
         }
 
+        if (gs) {
+            // GsLift: the ring vertex, the ES's output and the GS's input (one vertex: a point).
+            const Id t_slots = m.type_array(t_v4u, cu((gs->es_dwords + 3) / 4));
+            if (gs_es()) {
+                es_gs = m.global_variable(m.type_pointer(spv::ScOutput, t_slots), spv::ScOutput);
+            } else {
+                es_gs = m.global_variable(m.type_pointer(spv::ScInput, m.type_array(t_slots, cu(1))), spv::ScInput);
+            }
+            m.decorate(es_gs, spv::DecLocation, {0});
+            m.name(es_gs, "es_gs");
+            interface.push_back(es_gs);
+        }
+        if (compute() || oob_counting()) declare_guest_memory();
         fn_main = m.begin_function(t_void, m.type_function(t_void, {}));
         m.name(fn_main, "main");
         cur_label = m.label();
+        if (oob_counting()) oob_base64 = m.load(t_u64, m.access_chain(p_uni_u64, ubo_var, {cu(1)}));  // StageParams::lds_address
         if (opt.stage == Stage::Pixel && opt.ps_clip_discard) clip_discard_prologue();
+        if (gs_geom()) gs_ring_model();
         lanes[kKeyExec] = lane_const(true);   // every running pixel starts with its bit set
         // ... and GCN's helper lanes with theirs clear, until whole-quad mode.
         // A vertex shader has none (it takes no whole-quad mode, sop1).
@@ -5842,6 +8234,7 @@ private:
                     Region* done = open_regions.back();
                     open_regions.pop_back();
                     close_region(*done, i);
+                    if (res.rejections.empty() && done->branched) region_branch_close(*done);
                 } else {
                     close_arm();
                 }
@@ -5892,9 +8285,16 @@ private:
                 Region& r = regions[next_region++];
                 if (!r.disabled) {
                     r.exec_in = r.exec_before;  // a kill region narrows it with its first instructions
+                    // A branched region's selection closes just after it
+                    // (close_region sees the body's end, then the merge).
+                    const bool branch = branch_region(r);
+                    const std::uint64_t arm_seq = branch ? ++seq : 0;
                     r.seq = ++seq;
                     r.in_mask0 = in_mask;
                     open_regions.push_back(&r);
+                    if (lift_branch_on() && opt.stage == Stage::Pixel && open_loops.empty() && arms.empty() && region_branchable(r))
+                        region_branch_open(r);
+                    if (branch) open_region_arm(r, arm_seq);
                 }
             }
             // A loop begins inside what is open here.
@@ -5905,6 +8305,7 @@ private:
             }
             note.clear();
             inst_uniform = true;
+            inst_wg = false;
             inst_helper_inexact = false;
             reads = {};
             Region* const starting = !open_regions.empty() && open_regions.back()->kill ? open_regions.back() : nullptr;
@@ -5932,6 +8333,7 @@ private:
                 Region* done = open_regions.back();
                 open_regions.pop_back();
                 close_region(*done, prog.insts.size());
+                if (res.rejections.empty() && done->branched) region_branch_close(*done);
             } else if (!arms.empty()) {
                 reject("an if is still open at the end of the program");
             } else if (!open_loops.empty()) {
@@ -5974,6 +8376,25 @@ private:
             }
             return;
         }
+        if (gs_geom()) {
+            // The geometry stage: a point in, the copy shader's strip out.
+            if (gs_emits.empty()) {
+                cur = prog.insts.back().offset;
+                reject("the GS emits no vertex");
+                return;
+            }
+            m.capability(spv::CapGeometry);
+            m.entry_point(spv::EmGeometry, fn_main, "main", interface);
+            m.execution_mode(fn_main, spv::ExInputPoints);
+            m.execution_mode(fn_main, spv::ExInvocations, {1});
+            m.execution_mode(fn_main, gs->out_prim == 1 ? spv::ExOutputLineStrip : spv::ExOutputTriangleStrip);
+            m.execution_mode(fn_main, spv::ExOutputVertices, {gs->max_vertices});
+            if (native_rtz) {
+                m.execution_mode(fn_main, spv::ExDenormPreserve, {16});
+                m.execution_mode(fn_main, spv::ExRoundingModeRTZ, {16});
+            }
+            return;
+        }
         if (vertex_like()) {
             // The pipeline, the pixel shader's inputs and a rect list's geometry
             // shader are laid out from the reference's outputs: the lift must
@@ -6006,6 +8427,16 @@ private:
                 return;
             }
             m.entry_point(spv::EmVertex, fn_main, "main", interface);
+            if (native_rtz) {
+                m.execution_mode(fn_main, spv::ExDenormPreserve, {16});
+                m.execution_mode(fn_main, spv::ExRoundingModeRTZ, {16});
+            }
+            return;
+        }
+        if (compute()) {
+            m.entry_point(spv::EmGLCompute, fn_main, "main", interface);
+            m.execution_mode(fn_main, spv::ExLocalSize, {std::max<std::uint32_t>(1, opt.cs_threads[0]), std::max<std::uint32_t>(1, opt.cs_threads[1]),
+                                                         std::max<std::uint32_t>(1, opt.cs_threads[2])});
             if (native_rtz) {
                 m.execution_mode(fn_main, spv::ExDenormPreserve, {16});
                 m.execution_mode(fn_main, spv::ExRoundingModeRTZ, {16});
@@ -6098,6 +8529,40 @@ private:
                            "(only its v_writelane_b32s reach it, on every path); a VGPR a scalar is parked in is not read as this "
                            "pixel's word until written whole");
         }
+        if (compute()) {
+            char wg[64];
+            std::snprintf(wg, sizeof(wg), "%ux%ux%u", opt.cs_threads[0], opt.cs_threads[1], opt.cs_threads[2]);
+            head.push_back(std::string("a dispatch's compute shader: one invocation a lane of GCN's wave (workgroup ") + wg +
+                           "), the workgroup id and local id where the reference places them; no workgroup memory (LDS)");
+            if (cs_bound_loads || cs_bound_stores || cs_bound_elements) {
+                head.push_back("the lean reference's bindings (ComputeLean): " + std::to_string(cs_bound_loads) +
+                               " scalar and typed loads read from the storage buffer the reference binds at that instruction, " +
+                               std::to_string(cs_bound_stores) +
+                               " buffer stores through its written binding, each dword inside the V#'s range in dwords and where the invocation's "
+                               "EXEC bit is set, " + std::to_string(cs_bound_elements) +
+                               " elements at a VGPR index or offset (typed loads and stores, format loads, atomic adds) in their binding, an index "
+                               "past num_records or a dword past the range read as 0 and not written");
+            }
+            head.push_back("guest memory through the page table at StageParams::l1_table, as the reference reaches it: " +
+                           std::to_string(buffer_loads - cs_bound_loads) + " scalar loads, " + std::to_string(guest_loads) +
+                           " buffer loads (dwords in one page with one walk), " +
+                           std::to_string(guest_stores) + " buffer stores and " + std::to_string(guest_atomics) + " atomics and " +
+                           std::to_string(image_stores) +
+                           " image stores where the invocation's EXEC bit is set; a load every lane makes at one address is one value for "
+                           "them all (no store of the dispatch races with it)");
+            if (gds_lane_ops || wave_ranks || subgroup_ranks || ranks_folded || first_lane_reads) {
+                head.push_back(std::to_string(gds_lane_ops) + " ds_append/ds_consume steps in GDS each invocation's own (the counter ends the "
+                               "same), " + std::to_string(wave_slots) + " of their wave bases added to the lane's rank as the invocation's slot "
+                               "(the same slots, in another order, as GCN's waves land in none); " + std::to_string(wave_ranks) +
+                               " ranks folded so, " + std::to_string(subgroup_ranks) + " kept as subgroup operations with every invocation "
+                               "together, " + std::to_string(ranks_folded) + " high halves 0 (no lane 32 or above); " +
+                               std::to_string(first_lane_reads) + " v_readfirstlane_b32 of values every lane holds alike");
+            }
+            if (barriers) {
+                head.push_back(std::to_string(barriers) + " s_barrier as workgroup control barriers over uniform, workgroup and image memory, "
+                               "with every invocation that entered the loops around them (their exits taken on bits every lane holds alike)");
+            }
+        }
         if (tess) {
             const std::string model = window() ? "the patch window's stage I/O (inputs, outputs, patch constants)" : "the control point's slots";
             head.push_back("LDS as " + model + ": " + std::to_string(lds_reads) + " dword reads, " + std::to_string(lds_writes) +
@@ -6120,6 +8585,25 @@ private:
                        std::to_string(w.spill_lanes) + " spill-lane moves; semantic, kept - " + std::to_string(w.quad_swizzles) +
                        " quad swizzles, " + std::to_string(w.implicit_lod) + " implicit-LOD samples, " + std::to_string(w.lod_queries) +
                        " LOD queries, " + std::to_string(w.helper_queries) + " live-quad queries, " + std::to_string(w.discards) + " discards");
+        if (gs_es()) {
+            head.push_back(std::to_string(es_ring_stores) + " dwords stored into the ESGS ring at constant offsets: the es_gs output (" +
+                           std::to_string(gs->es_dwords) + " dwords a vertex, its ring V# never read as data); nothing exported");
+        }
+        if (gs_geom()) {
+            std::string emits = std::to_string(gs_emits.size()) + " emits and " + std::to_string(gs_cuts) + " cuts, each where EXEC is set, ";
+            if (gsvs_array) {
+                emits += "the GSVS ring an array of " + std::to_string(gsvs_elements) + " words in the invocation (" + std::to_string(gs_ring_stores) +
+                         " stores, " + std::to_string(gs_dynamic_stores) + " of them at a VGPR offset, each at the element its address names, "
+                         "none past the array), every emit reading the slot of the invocation's emit counter (its emits so far, stepped where it "
+                         "emits; none past " + std::to_string(gs->max_vertices) + ")";
+            } else {
+                emits += std::to_string(gs_ring_stores) + " GSVS ring stores at constant offsets into " + std::to_string(gs->max_vertices) +
+                         " slots, every emit's slot its emit counter's (each earlier emit made by all of its invocations or by none) and every "
+                         "dword the copy shader exports the last store into that slot all of them made";
+            }
+            head.push_back(std::to_string(gs_ring_loads) + " ESGS ring loads, each at the vertex's own offset (v0 << 2, never read as data): "
+                           "es_gs[0]; " + emits);
+        }
         res.proof.insert(res.proof.begin(), head.begin(), head.end());
     }
 };
@@ -6128,12 +8612,13 @@ private:
 
 namespace {
 LiftResult lift_stage(Stage stage, const Program& program, const TranslateOptions& options, const TranslateResult& reference,
-                      const TessLift* tess = nullptr) {
+                      const TessLift* tess = nullptr, const GsLift* gs = nullptr) {
     if (options.stage != stage) {
         LiftResult wrong;
         wrong.rejections.push_back(stage == Stage::Pixel         ? "the options are not a pixel shader's"
                                    : stage == Stage::TessEval    ? "the options are not an evaluation stage's"
                                    : stage == Stage::TessControl ? "the options are not a control stage's"
+                                   : stage == Stage::Compute     ? "the options are not a compute shader's"
                                                                  : "the options are not a vertex shader's");
         return wrong;
     }
@@ -6142,14 +8627,15 @@ LiftResult lift_stage(Stage stage, const Program& program, const TranslateOption
     // usual loop-exit idioms need to fold their tests. Likewise a register
     // whose helper lanes come back around a loop less exact than they left
     // is inexact at the header on the next attempt.
-    Lifter::LoopPhis phis, inexact;
+    Lifter::LoopPhis phis, inexact, nonuniform;
     for (int attempt = 0;; ++attempt) {
-        Lifter l(program, options, reference, phis, inexact, tess);
+        Lifter l(program, options, reference, phis, inexact, tess, nonuniform, gs);
         LiftResult r = l.run();
-        const std::size_t before = phis.size() + inexact.size();
+        const std::size_t before = phis.size() + inexact.size() + nonuniform.size();
         phis.insert(l.more_lane_phis.begin(), l.more_lane_phis.end());
         inexact.insert(l.more_inexact.begin(), l.more_inexact.end());
-        if (phis.size() + inexact.size() == before || attempt == 8) return r;
+        nonuniform.insert(l.more_nonuniform.begin(), l.more_nonuniform.end());
+        if (phis.size() + inexact.size() + nonuniform.size() == before || attempt == (stage == Stage::Compute ? 24 : 8)) return r;
     }
 }
 }  // namespace
@@ -6160,6 +8646,65 @@ LiftResult lift_pixel_shader(const Program& program, const TranslateOptions& opt
 
 LiftResult lift_vertex_shader(const Program& program, const TranslateOptions& options, const TranslateResult& reference) {
     return lift_stage(Stage::Vertex, program, options, reference);
+}
+
+namespace {
+std::uint32_t branch_target(const Inst& in) { return in.offset + 4 + static_cast<std::uint32_t>(in.imm) * 4; }
+// A compute program as the lift reads it, the same program (`notes` says how):
+//   * the words after its first s_endpgm, when no branch before it lands
+//     past it (the eboot's own programs carry data there), are left out;
+//   * s_cbranch_execnz T; s_branch E; s_nop ... T: (an early-out over the
+//     rest of the program) is s_cbranch_execz E; s_nop ...: EXEC set jumps to
+//     T past the s_branch and the nops, clear takes the s_branch to E - the
+//     same as skipping [T, E) when EXEC is clear.
+Program compute_program(const Program& in, std::vector<std::string>& notes) {
+    Program p = in;
+    for (std::size_t i = 0; i < p.insts.size(); ++i) {
+        const Inst& end = p.insts[i];
+        if (!(end.enc == Enc::SOPP && end.op == 1)) continue;
+        bool past = false;
+        for (std::size_t k = 0; k < i; ++k) {
+            if (is_branch(p.insts[k]) && branch_target(p.insts[k]) > end.offset) past = true;
+        }
+        if (past || i + 1 == p.insts.size()) break;
+        notes.push_back(std::to_string(p.insts.size() - i - 1) + " words after s_endpgm at " + hex_offset(end.offset) +
+                        " that no branch reaches are not part of the program");
+        p.insts.resize(i + 1);
+        p.end = end.offset + 4;
+        p.errors.erase(std::remove_if(p.errors.begin(), p.errors.end(), [&](const DecodeError& e) { return e.offset > end.offset; }), p.errors.end());
+        break;
+    }
+    std::set<std::uint32_t> targets;
+    for (const Inst& in : p.insts) {
+        if (is_branch(in) || (in.enc == Enc::SOPP && in.op == 9)) targets.insert(branch_target(in));
+    }
+    for (std::size_t i = 0; i + 1 < p.insts.size(); ++i) {
+        Inst& nz = p.insts[i];
+        Inst& jump = p.insts[i + 1];
+        if (!(nz.enc == Enc::SOPP && nz.op == 9 && jump.enc == Enc::SOPP && jump.op == 2)) continue;
+        const std::uint32_t t = branch_target(nz), e = branch_target(jump);
+        if (t <= jump.offset || e < t) continue;
+        bool nops = true;
+        for (std::size_t k = i + 2; k < p.insts.size() && p.insts[k].offset < t; ++k) nops = nops && p.insts[k].enc == Enc::SOPP && p.insts[k].op == 0;
+        const auto landing = targets.lower_bound(nz.offset + 4);
+        if (!nops || (landing != targets.end() && *landing < t)) continue;
+        notes.push_back("s_cbranch_execnz at " + hex_offset(nz.offset) + " over the s_branch to " + hex_offset(e) +
+                        " is an s_cbranch_execz there (the region " + hex_offset(t) + "-" + hex_offset(e) + " skipped where EXEC is clear)");
+        nz.op = 8;
+        nz.imm = static_cast<std::int32_t>((e - nz.offset - 4) / 4);
+        jump.op = 0;
+        jump.imm = 0;
+    }
+    return p;
+}
+}  // namespace
+
+LiftResult lift_compute_shader(const Program& program, const TranslateOptions& options, const TranslateResult& reference) {
+    std::vector<std::string> notes;
+    const Program p = compute_program(program, notes);
+    LiftResult r = lift_stage(Stage::Compute, p, options, reference);
+    if (r.ok()) r.proof.insert(r.proof.end(), notes.begin(), notes.end());
+    return r;
 }
 
 LiftResult lift_ls_shader(const Program& program, const TranslateOptions& options, const TranslateResult& reference, const TessLift& tess) {
@@ -6187,6 +8732,163 @@ LiftResult lift_domain_shader(const Program& program, const TranslateOptions& op
         return wrong;
     }
     return lift_stage(Stage::TessEval, program, options, reference, &tess);
+}
+
+bool parse_gs_copy(const Program& copy, std::uint32_t max_vertices, std::vector<GsCopyOut>& out, std::string& why) {
+    out.clear();
+    const auto fail = [&](const Inst* in, const std::string& w) {
+        why = (in ? hex_offset(in->offset) + ": " : std::string()) + w;
+        out.clear();
+        return false;
+    };
+    if (!copy.errors.empty()) return fail(nullptr, "the copy shader has decode errors");
+    if (!max_vertices) return fail(nullptr, "a GS of no vertices");
+    const std::uint32_t stride = 64 * max_vertices;  // bytes between a vertex's dwords in the GSVS ring
+    std::map<int, std::uint32_t> sgpr;                 // SGPRs holding a known constant
+    struct Reg {
+        bool constant = false;
+        std::uint32_t value = 0;  // the dword loaded, or the constant
+    };
+    std::map<int, Reg> vgpr;
+    int ring = -1, address = -1, stream = -1;  // the GSVS read ring's first SGPR; v0 << 2; s2 >> 24
+    bool stream_test = false;
+    std::uint32_t end_at = 0;  // the stream test's target
+    std::set<std::pair<int, int>> exported;
+    const auto inline_const = [](std::uint16_t code, std::uint32_t& v) {
+        if (code >= 128 && code <= 192) return v = code - 128u, true;
+        if (code >= 193 && code <= 208) return v = static_cast<std::uint32_t>(-static_cast<int>(code - 192)), true;
+        static const float kHalf[8] = {0.5f, -0.5f, 1.0f, -1.0f, 2.0f, -2.0f, 4.0f, -4.0f};
+        if (code >= 240 && code <= 247) return v = std::bit_cast<std::uint32_t>(kHalf[code - 240]), true;
+        return false;
+    };
+    for (const Inst& in : copy.insts) {
+        if (end_at && in.offset >= end_at) {
+            if (in.offset == end_at && in.enc == Enc::SOPP && in.op == 1) break;
+            return fail(&in, "an instruction where the stream test lands other than s_endpgm");
+        }
+        const char* name = mnemonic(in) ? mnemonic(in) : "an unknown instruction";
+        switch (in.enc) {
+        case Enc::SOPP:
+            if (in.op == 0 || in.op == 12) break;  // s_nop, s_waitcnt
+            if (in.op == 1) return fail(&in, "s_endpgm before the stream test's target");
+            if (in.op == 4 && stream_test && !end_at) {  // s_cbranch_scc0 past stream 0's code
+                end_at = in.offset + 4 + static_cast<std::uint32_t>(in.imm) * 4;
+                break;
+            }
+            return fail(&in, std::string(name) + " is not part of a copy shader's shape");
+        case Enc::SOP1:
+            if (in.op == 3 && in.dst == kVccHi) break;  // s_mov_b32 vcc_hi: the compiler's note
+            if (in.op == 3 && in.dst < 104) {
+                std::uint32_t v = 0;
+                if (in.src0 == kLiteral) sgpr[in.dst] = in.literal;
+                else if (inline_const(in.src0, v)) sgpr[in.dst] = v;
+                else return fail(&in, "s_mov_b32 of a register");
+                break;
+            }
+            return fail(&in, std::string(name) + " is not part of a copy shader's shape");
+        case Enc::SOPK:
+            if (in.op == 0 && in.dst < 104) {  // s_movk_i32
+                sgpr[in.dst] = static_cast<std::uint32_t>(in.imm);
+                break;
+            }
+            if (in.op == 9 && in.dst == stream && (in.imm & 0xffff) == 0) {  // s_cmpk_eq_u32 the stream, 0
+                stream_test = true;
+                break;
+            }
+            return fail(&in, std::string(name) + " is not part of a copy shader's shape");
+        case Enc::SOP2:
+            if (in.op == 32 && in.src0 == 2 && in.src1 == 128 + 24 && in.dst < 104) {  // s_lshr_b32 sN, s2, 24: the stream
+                stream = in.dst;
+                sgpr.erase(in.dst);
+                break;
+            }
+            return fail(&in, std::string(name) + " is not part of a copy shader's shape");
+        case Enc::SMRD:
+            if (in.op == 2 && in.imm_flag && in.src0 == 0 && in.imm == 32 && ring < 0) {  // the GSVS read ring from the global table
+                ring = in.sdst;
+                break;
+            }
+            return fail(&in, std::string(name) + " is not the GSVS read ring's V#");
+        case Enc::VOP2:
+            if (in.op == 26 && in.src0 == 130 && in.src1 == 256 && address < 0) {  // v_lshlrev_b32 vN, 2, v0
+                address = in.dst;
+                vgpr.erase(in.dst);
+                break;
+            }
+            return fail(&in, std::string(name) + " is not part of a copy shader's shape");
+        case Enc::VOP1:
+            if (in.op == 1) {  // v_mov_b32 vN, constant
+                std::uint32_t v = 0;
+                if (in.src0 == kLiteral) v = in.literal;
+                else if (!inline_const(in.src0, v)) return fail(&in, "v_mov_b32 of a register");
+                vgpr[in.dst] = {true, v};
+                break;
+            }
+            return fail(&in, std::string(name) + " is not part of a copy shader's shape");
+        case Enc::MUBUF: {
+            if (!end_at) return fail(&in, "a GSVS ring load before the stream test");
+            if (in.op != 12 || !in.offen || in.idxen || in.addr64 || in.lds || in.tfe || in.srsrc != ring || ring < 0 || in.vaddr != address || address < 0)
+                return fail(&in, std::string(name) + " is not a buffer_load_dword of the GSVS ring at the vertex's offset");
+            std::uint32_t so = 0;
+            if (in.soffset < 104) {
+                const auto it = sgpr.find(in.soffset);
+                if (it == sgpr.end()) return fail(&in, "a GSVS ring load at an SGPR offset not known");
+                so = it->second;
+            } else if (!inline_const(in.soffset, so)) {
+                return fail(&in, "a GSVS ring load at an offset not known");
+            }
+            const std::uint32_t at = so + in.offset12;
+            if (at % stride || at / stride >= kGsvsDwords) return fail(&in, "a GSVS ring load at byte " + std::to_string(at) + ": not a vertex's dword");
+            vgpr[in.vdata] = {false, at / stride};
+            break;
+        }
+        case Enc::EXP: {
+            if (!end_at) return fail(&in, "an export before the stream test");
+            if (in.tgt != 12 && (in.tgt < 32 || in.tgt >= 64)) return fail(&in, "an export of target " + std::to_string(in.tgt) + " (pos0 and params are lifted)");
+            if (in.compr) return fail(&in, "a compressed export");
+            for (std::uint8_t c = 0; c < 4; ++c) {
+                if (!exported.insert({in.tgt, c}).second) return fail(&in, "a component exported twice");
+                GsCopyOut o;
+                o.target = in.tgt;
+                o.comp = c;
+                if (!((in.dmask >> c) & 1)) {
+                    o.constant = true;  // as the lift's exports: a disabled component is 0
+                } else {
+                    const auto it = vgpr.find(in.vsrc[c]);
+                    if (it == vgpr.end()) return fail(&in, "an exported v" + std::to_string(in.vsrc[c]) + " that holds neither a GSVS dword nor a constant");
+                    o.constant = it->second.constant;
+                    o.value = it->second.value;
+                }
+                out.push_back(o);
+            }
+            break;
+        }
+        default:
+            return fail(&in, std::string(name) + " is not part of a copy shader's shape");
+        }
+    }
+    if (!end_at) return fail(nullptr, "no stream test (s2 >> 24 against 0) over the exports");
+    if (!exported.count({12, 0})) return fail(nullptr, "no position export");
+    why.clear();
+    return true;
+}
+
+LiftResult lift_es_shader(const Program& program, const TranslateOptions& options, const TranslateResult& reference, const GsLift& gs) {
+    if (options.gs_role != TranslateOptions::GsRole::EsVertex) {
+        LiftResult wrong;
+        wrong.rejections.push_back("the options are not the ES's as a vertex stage");
+        return wrong;
+    }
+    return lift_stage(Stage::Vertex, program, options, reference, nullptr, &gs);
+}
+
+LiftResult lift_gs_shader(const Program& program, const TranslateOptions& options, const TranslateResult& reference, const GsLift& gs) {
+    if (options.gs_role != TranslateOptions::GsRole::Geometry) {
+        LiftResult wrong;
+        wrong.rejections.push_back("the options are not the GS's as a geometry stage");
+        return wrong;
+    }
+    return lift_stage(Stage::Vertex, program, options, reference, nullptr, &gs);
 }
 
 HullLift lift_constant_hull(const Program& program) {

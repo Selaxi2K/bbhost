@@ -1,6 +1,7 @@
 #include "host/options.h"
 #include "host/updater.h"
 #include "host/settings.h"
+#include "host/settings_store.h"
 
 #include "host/bindings.h"
 #include "host/overlay.h"
@@ -58,6 +59,7 @@ enum SettingId {
     kVsync,
     kFrameCap,
     kFpsCounter,
+    kMemoryCounter,
     kFov,
     kCameraDistance,
     kCameraHeight,
@@ -83,6 +85,7 @@ enum SettingId {
     kFog,
     kModelDetail,
     kResolution,
+    kShaders,
     kSkipLogos,
     kDebugMenu,
     kDebugCamera,
@@ -119,11 +122,17 @@ Setting g_set[kSettingCount] = {
     // reads as 60 (host_options_load).
     {"frame_cap", "Frame rate", {"30", "60", "90", "120", "Uncapped"}, 0,
      "30 is the game's own pace; 60, 90 and 120 run its logic at that rate; Uncapped steps it by the frame time "
-     "(the display's refresh rate with V-Sync on, up to 240 off). Applies on the next run.",
+     "(the display's refresh rate with V-Sync on, up to 240 off in the world; the menus as fast as the machine runs them). Applies on the next run.",
      false},
-    // What reaches the screen, counted by the presenter (host/window.cpp).
+    // The game's frames a second, counted as they start (host/window.cpp,
+    // host_fps_frame_start), with how busy the GPU is beside it.
     {"fps_counter", "FPS counter", {"Off", "On"}, 0,
-     "Frames per second actually presented, in the top right corner.", false},
+     "The game's frames per second, in the top right corner.", false},
+    // What bbhost holds of video memory and of the memory Windows counts as
+    // shared GPU memory (host/window.cpp, host_gpu_memory_glance).
+    {"memory_counter", "Memory counter", {"Off", "On"}, 0,
+     "Video memory in use (how much is cache, given back when it runs short) and the game's memory the GPU reads, "
+     "which Windows counts as shared GPU memory.", false},
     // The follow camera's vertical field of view, LockCamParam's camFovY
     // (43 degrees in most areas) widened 5% a step (engine/camera.h).
     {"fov", "Field of view", {"+0%", "+5%", "+10%", "+15%", "+20%", "+25%", "+30%", "+35%", "+40%", "+45%", "+50%"}, 0,
@@ -134,12 +143,12 @@ Setting g_set[kSettingCount] = {
      "How far behind the character the camera sits. 5 is the game's own.", false},
     {"camera_height", "Camera height", {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"}, 5,
      "How high above the character the camera looks. 5 is the game's own.", false},
-    // The follow camera above 30 fps (engine/frame_rate.cpp, read when the game
-    // starts): FPS++ keeps the retune from Kyo's 60 FPS++ list, as every
-    // bbhost before this option did, so it is the default; Original runs the
-    // game's own values, the same camera at every frame rate. Both are
-    // converted to each frame's length; at 30 the camera is the game's.
-    {"camera_tuning", "Camera tuning", {"FPS++ (Kyo)", "Original"}, 0,
+    // The follow camera above 30 fps (engine/frame_rate.cpp camera_original):
+    // the game's own values, the same camera at every frame rate, whatever is
+    // saved here - the menus no longer offer it, and only
+    // BBHOST_CAMERA_TUNING=fps++ runs the retune from Kyo's 60 FPS++ list. So
+    // the default is Original, and a save records the camera that runs.
+    {"camera_tuning", "Camera tuning", {"FPS++ (Kyo)", "Original"}, 1,
      "Requires a restart. Above 30 fps: FPS++ is Kyo's retuned camera; Original is the game's own, as at 30.",
      true},
     // On, as in DS3: a click only reaches the menus while one is open
@@ -217,16 +226,28 @@ Setting g_set[kSettingCount] = {
     // The render resolution. res_width and res_height are two int32s the eboot
     // never writes, so this is a data patch and every pass scales together -
     // see engine/graphics_patch.cpp. The game's pick list shows six entries
-    // and scrolls through more; the ultrawide ones and
-    // the Steam Deck's 16:10 go after the 16:9 ones so a saved entry keeps its
-    // place, and the other shapes are engine/live_resolution.cpp's. 960x600
-    // and 1024x640 are the Deck's screen at 75% and 80%: it holds 60 fps there
-    // (pixel-bound at 1280x800, ~45), and the presenter upscales by FSR 1.
-    {"resolution", "Resolution", {"1280x720", "1600x900", "1920x1080", "2560x1440", "3200x1800",
-                                  "3840x2160", "2560x1080", "3440x1440", "5120x2160", "3840x1080",
-                                  "5120x1440", "1280x800", "960x600", "1024x640"}, 2,
+    // and scrolls through more. In order of size within each shape - 16:9,
+    // then 16:10, 4:3, 21:9 and 32:9 - and saved by name, not by place, so a
+    // saved entry survives the order changing (engine/option_menu.cpp's
+    // kResolutions and host/launcher.cpp's labels follow this list). The
+    // other shapes are engine/live_resolution.cpp's. 960x600 and 1024x640 are
+    // the Deck's screen at 75% and 80%: it holds 60 fps there (pixel-bound at
+    // 1280x800, ~45), and the presenter upscales by FSR 1.
+    {"resolution", "Resolution", {"640x360", "960x540", "1280x720", "1440x810", "1600x900",
+                                  "1920x1080", "2560x1440", "2880x1620", "3200x1800", "3840x2160",
+                                  "960x600", "1024x640", "1280x800", "1920x1200", "2560x1600",
+                                  "1280x960", "1440x1080", "2560x1080", "3440x1440", "5120x2160",
+                                  "3840x1080", "5120x1440"}, 5,
      "What the game renders at. 1920x1080 is what it shipped with; wide and 16:10 screens are filled, the HUD kept 16:9. "
      "The largest sizes can need a restart: the memory for them is set aside when the game starts.",
+     true},
+    // The shaders' form on the GPU (host/translation_cache.h): HLSL is the
+    // lifted shaders printed as HLSL and compiled by DXC on this machine,
+    // taken from the cache while the rest compile behind the game; Lifted is
+    // the lifter's own SPIR-V alone. The same pictures either way.
+    {"shaders", "Shaders", {"HLSL", "Lifted"}, 0,
+     "Requires a restart. HLSL: the game's shaders as HLSL, compiled by DXC on this PC in the background and used from the next start. "
+     "Lifted: the translator's own SPIR-V only.",
      true},
     {"skip_logos", "Skip company logos", {"Off", "On"}, 0,
      "The three logos before the title screen, and the warning that the last session did not end with Exit Game.", true},
@@ -257,6 +278,7 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kVsync},
     {Row::Option, nullptr, kFrameCap},
     {Row::Option, nullptr, kFpsCounter},
+    {Row::Option, nullptr, kMemoryCounter},
     {Row::Option, nullptr, kFov},
     {Row::Option, nullptr, kCameraDistance},
     {Row::Option, nullptr, kCameraHeight},
@@ -283,6 +305,7 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kFog},
     {Row::Option, nullptr, kModelDetail},
     {Row::Option, nullptr, kResolution},
+    {Row::Option, nullptr, kShaders},
     {Row::Header, "PC ENHANCEMENTS"},
     {Row::Option, nullptr, kChangeAppearance},
     {Row::Option, nullptr, kRebirth},
@@ -693,25 +716,27 @@ void save() {
     host_log("options: saved %s", path.c_str());
 }
 
-// Bumped on every change, for readers that act on a setting live and would
-// rather not look it up by name on every frame (host_opt_serial).
-std::atomic<std::uint64_t> g_serial{1};
-
 // The settings object (host/settings.h): every field from the table, scaled
-// the way its consumer wants it, rebuilt whenever a setting changes.
-std::mutex g_settings_mu;
-HostSettings g_settings;
+// the way its consumer wants it, published again whenever a setting changes
+// (its serial is host_opt_serial) and told to the listeners. Made on first
+// use, so a listener may register from anywhere at any time, and never
+// destroyed: threads still reading it while the process exits read memory
+// that is still there.
+HostSettingsStore& settings_store() {
+    static HostSettingsStore& store = *new HostSettingsStore;
+    return store;
+}
 
 bool on_of(int id) { return reads_on(g_set[id], g_set[id].index); }
 int index_of(int id) { return g_set[id].index; }
 
 void rebuild_settings() {
     HostSettings h;
-    h.serial = g_serial.load(std::memory_order_acquire);
     h.fullscreen = index_of(kWindowMode) == 1;
     h.vsync = index_of(kVsync) == 0;
     h.frame_cap = fps_from_label(g_set[kFrameCap].values[static_cast<std::size_t>(index_of(kFrameCap))]);
     h.fps_counter = on_of(kFpsCounter);
+    h.memory_counter = on_of(kMemoryCounter);
     {
         // BBHOST_RES=WxH still wins, so an A/B run started with one behaves
         // the way its command line says.
@@ -770,8 +795,7 @@ void rebuild_settings() {
     h.change_appearance = on_of(kChangeAppearance);
     h.rebirth = on_of(kRebirth);
     h.five_players = on_of(kFivePlayers);
-    std::lock_guard<std::mutex> lk(g_settings_mu);
-    g_settings = h;
+    settings_store().publish(h);
 }
 
 void set_index(int id, int index, bool from_file) {
@@ -786,7 +810,6 @@ void set_index(int id, int index, bool from_file) {
         if (index == g_res_prev) g_res_prev = -1;  // back where it started: nothing to ask
     }
     s.index = index;
-    g_serial.fetch_add(1, std::memory_order_release);
     rebuild_settings();
     if (!from_file) {
         g_dirty = true;
@@ -858,8 +881,9 @@ void host_options_load() {
     seed(kResolution, config().resolution);
     seed(kWindowMode, config().window_mode);
     seed(kModelDetail, config().model_detail);
+    seed(kShaders, config().shaders);
     for (const int id : {static_cast<int>(kSkipLogos), static_cast<int>(kFrameCap), static_cast<int>(kResolution), static_cast<int>(kWindowMode),
-                         static_cast<int>(kModelDetail), static_cast<int>(kChangeAppearance),
+                         static_cast<int>(kModelDetail), static_cast<int>(kShaders), static_cast<int>(kChangeAppearance),
                          static_cast<int>(kRebirth), static_cast<int>(kFivePlayers)})
         g_default_index[static_cast<std::size_t>(id)] = g_set[id].index;
     const std::string path = options_path();
@@ -1349,9 +1373,10 @@ void options_panel_frame(float display_w, float display_h) {
 }
 }  // namespace
 
-HostSettings host_settings() {
-    std::lock_guard<std::mutex> lk(g_settings_mu);
-    return g_settings;
+HostSettings host_settings() { return settings_store().now(); }
+const HostSettings& host_settings_ref() { return settings_store().now(); }
+void host_settings_listen(HostSettingsListener fn) {
+    if (!settings_store().listen(fn)) host_log("options: no room for another settings listener; one consumer will not follow changes");
 }
 
 namespace {
@@ -1377,7 +1402,7 @@ int setting_id(const char* key) {
 
 }  // namespace
 
-std::uint64_t host_opt_serial() { return g_serial.load(std::memory_order_acquire); }
+std::uint64_t host_opt_serial() { return settings_store().now().serial; }
 
 bool host_opt_default_get(const char* key) {
     const int id = setting_id(key);

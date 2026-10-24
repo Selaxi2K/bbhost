@@ -7,6 +7,7 @@
 #include "host/options.h"
 #include "net/account.h"
 #include "host/plugin_ui.h"
+#include "host/shader_compile.h"
 #include "host/updater.h"
 #include "log.h"
 
@@ -17,11 +18,14 @@
 #include <SDL3/SDL.h>
 
 #include <cctype>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <atomic>
 #include <mutex>
+#include <thread>
 #include <string>
 #include <vector>
 
@@ -180,6 +184,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     bool check_updates = cfg.update_check == 1;
 #endif
     bool show_every_start = cfg.setup_always;
+    bool tooling = cfg.tooling;
     // The F10 screen's start-up settings, through the same calls it uses.
     host_options_load();
     bool fullscreen = host_opt_index("window_mode") == 1;
@@ -187,10 +192,13 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     bool debug_camera = host_opt_get("debug_camera");
     int frame_cap = host_opt_frame_cap();
     int resolution = host_opt_resolution_index();
-    static const char* const kResolutions[] = {"1280x720",         "1600x900",         "1920x1080",        "2560x1440",
-                                               "3200x1800",        "3840x2160",        "2560x1080 (21:9)", "3440x1440 (21:9)",
-                                               "5120x2160 (21:9)", "3840x1080 (32:9)", "5120x1440 (32:9)", "1280x800 (16:10)",
-                                               "960x600 (16:10, upscaled)", "1024x640 (16:10, upscaled)"};
+    // In the setting's order (host/options.cpp): by size within each shape.
+    static const char* const kResolutions[] = {"640x360",           "960x540",           "1280x720",          "1440x810",
+                                               "1600x900",          "1920x1080",         "2560x1440",         "2880x1620",
+                                               "3200x1800",         "3840x2160",         "960x600 (16:10, upscaled)",
+                                               "1024x640 (16:10, upscaled)",             "1280x800 (16:10)",  "1920x1200 (16:10)",
+                                               "2560x1600 (16:10)", "1280x960 (4:3)",    "1440x1080 (4:3)",   "2560x1080 (21:9)",
+                                               "3440x1440 (21:9)",  "5120x2160 (21:9)",  "3840x1080 (32:9)",  "5120x1440 (32:9)"};
     // The game's frame rate (engine/frame_rate.h): 0 is uncapped.
     static const int kCaps[] = {30, 60, 90, 120, 0};
     constexpr int kCapCount = static_cast<int>(sizeof(kCaps) / sizeof(kCaps[0]));
@@ -200,6 +208,26 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     }
     // The follow camera's tuning above 30 fps: the setting's index, 0 FPS++, 1 Original.
     int camera_tuning = host_opt_index("camera_tuning") == 1 ? 1 : 0;
+    // The Shaders tab: the Shaders setting (0 HLSL, 1 Lifted), the caches'
+    // state and "Compile shaders now" (host/shader_compile.h). This machine's
+    // Vulkan devices are listed once, off the window's thread.
+    int shaders = host_opt_index("shaders") == 1 ? 1 : 0;
+    ShaderCompileJob compile_job;
+    std::mutex devices_mu;
+    std::vector<std::string> devices;
+    std::atomic<bool> devices_ready{false};
+    std::thread devices_thread([&] {
+        std::vector<std::string> d = shader_vulkan_devices();
+        std::lock_guard<std::mutex> lk(devices_mu);
+        devices = std::move(d);
+        devices_ready.store(true);
+    });
+    ShaderCacheState cache_state;
+    std::chrono::steady_clock::time_point cache_state_at{};
+    bool cache_state_devices = false, compile_was_running = false;
+    // The main tab's "Compile shaders now" starts the compile and shows the
+    // Shaders tab, where its progress is.
+    bool select_shaders_tab = false;
     // The PC enhancements, through the same calls: each is read when the
     // game starts (main.cpp, config_set_enhancements).
     struct Enhancement {
@@ -235,9 +263,18 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     std::vector<PatchRow> patch_rows;
     for (PatchListing& p : patch_manifests_list(cfg.mods.empty() ? cfg.data + "/mods" : cfg.mods)) {
         PatchRow r;
-        r.on = r.was = !patch_manifest_off(p.name);
+        r.on = r.was = patch_manifest_on(p.name, p.enabled);
         r.p = std::move(p);
         patch_rows.push_back(std::move(r));
+    }
+    // Two of a group on (a bbhost.toml edited by hand): the one the loader
+    // applies, the last in the list's order, stays on.
+    for (PatchRow& r : patch_rows) {
+        if (r.p.group.empty() || !r.on) continue;
+        for (const PatchRow& o : patch_rows) {
+            if (&o == &r || o.p.group != r.p.group || !o.on || !o.p.option.empty()) continue;
+            if (std::make_pair(o.p.order, o.p.name) > std::make_pair(r.p.order, r.p.name)) r.on = false;
+        }
     }
     auto patch_switch = [&](PatchRow& r) -> bool* {
         const std::string& o = r.p.option;
@@ -301,6 +338,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         e.push_back({"update", "check", check_updates ? "true" : "false"});
         if (!f[kToken].str().empty()) e.push_back({"update", "token_file", toml_string(saved_path(f[kToken].str()))});
         e.push_back({"startup", "setup_window", show_every_start ? "true" : "false"});
+        e.push_back({"debug", "tooling", tooling ? "true" : "false"});
         // What this bbhost's file looks like (core/config.h): a value saved
         // from here is a choice.
         e.push_back({"bbhost", "config_version", std::to_string(kUserConfigVersion)});
@@ -324,6 +362,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         host_opt_set("debug_camera", debug_camera);
         host_opt_set_frame_cap(kCaps[cap_choice]);
         host_opt_set_index("camera_tuning", camera_tuning);
+        host_opt_set_index("shaders", shaders);
         host_opt_set_resolution_index(resolution);
         for (const Enhancement& x : enhancements) host_opt_set(x.key, x.on);
         host_options_save_now();
@@ -379,6 +418,34 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         // The tabs above the buttons: the game's settings, and the plugins.
         const float footer = ImGui::GetFrameHeightWithSpacing() * 4.2f;
         bool game_tab = false;
+        // The compile's progress and the caches' state, which the Shaders tab
+        // shows and the main tab's recommendation reads: the state again every
+        // few seconds, and when a compile ends.
+        const ShaderCompileJob::View cv = compile_job.view();
+        {
+            const auto now = std::chrono::steady_clock::now();
+            if (now - cache_state_at > std::chrono::seconds(3) || (compile_was_running && !cv.running) ||
+                (devices_ready.load() && !cache_state_devices)) {
+                std::lock_guard<std::mutex> lk(devices_mu);
+                cache_state = shader_cache_state(f[kData].str(), devices);
+                cache_state_at = now;
+                cache_state_devices = devices_ready.load();
+            }
+            compile_was_running = cv.running;
+        }
+        // Caches that are not this bbhost's or this driver's: Compile shaders
+        // now is recommended (never started by itself) until a compile has run
+        // in this window.
+        const ShaderCompileAdvice advice = shader_compile_advice(cache_state, host_steam_deck(), std::thread::hardware_concurrency());
+        const bool recommend_compile = advice.recommend && !cv.running && !cv.finished && !cv.cancelled && cv.error.empty();
+        const ImVec4 good(0.55f, 0.85f, 0.55f, 1.0f), warn(0.95f, 0.75f, 0.35f, 1.0f);
+        auto start_compile = [&] {
+            // The child reads the saved settings: save first.
+            if (save()) {
+                std::string err;
+                compile_job.start(err);
+            }
+        };
         if (ImGui::BeginTabBar("##tabs")) {
             if (ImGui::BeginTabItem("Game")) {
                 game_tab = true;
@@ -424,28 +491,43 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                 ImGui::TextDisabled("A patch made for another eboot is never applied.");
                 ImGui::Spacing();
                 if (patch_rows.empty()) ImGui::TextDisabled("No patches found.");
+                // Whether a row's switch can be changed here.
+                auto switchable = [&](const PatchRow& r) {
+                    const bool other_eboot = eboot.ok && !r.p.eboot.empty() && r.p.eboot != eboot.sha;
+                    const bool unknown_option = !r.p.option.empty() && !patch_manifest_option_known(r.p.option);
+                    return r.p.error.empty() && !other_eboot && !unknown_option && (!r.p.option.empty() || bare_key(r.p.name));
+                };
                 for (std::size_t i = 0; i < patch_rows.size(); ++i) {
                     PatchRow& r = patch_rows[i];
                     const bool other_eboot = eboot.ok && !r.p.eboot.empty() && r.p.eboot != eboot.sha;
                     const bool unknown_option = !r.p.option.empty() && !patch_manifest_option_known(r.p.option);
-                    const bool fixed = !r.p.error.empty() || !r.p.enabled || other_eboot || unknown_option ||
-                                       (r.p.option.empty() && !bare_key(r.p.name));
+                    const bool fixed = !switchable(r);
                     bool* on = patch_switch(r);
                     bool off = false;
                     ImGui::PushID(static_cast<int>(i));
                     ImGui::BeginDisabled(fixed);
-                    ImGui::Checkbox(r.p.name.c_str(), fixed ? &off : on);
+                    // Variants of one patch (a group) are one at a time: turning
+                    // one on turns the others off.
+                    if (ImGui::Checkbox(r.p.name.c_str(), fixed ? &off : on) && !fixed && *on && !r.p.group.empty()) {
+                        for (PatchRow& o : patch_rows) {
+                            if (&o != &r && o.p.group == r.p.group && switchable(o)) *patch_switch(o) = false;
+                        }
+                    }
                     ImGui::EndDisabled();
                     ImGui::PopID();
                     ImGui::Indent();
                     ImGui::PushTextWrapPos(0.0f);
                     if (!r.p.description.empty()) ImGui::TextDisabled("%s", r.p.description.c_str());
-                    const std::string why = !r.p.error.empty()        ? "Not read: " + r.p.error + "."
-                                            : !r.p.enabled            ? "Turned off in its own file ([patch] enabled = false)."
-                                            : other_eboot             ? "Made for another eboot: not applied."
-                                            : unknown_option          ? "Follows " + r.p.option + ", which this bbhost does not know: not applied."
-                                            : r.p.option.empty() && !bare_key(r.p.name) ? "Its name cannot be a bbhost.toml key, so it is always on."
-                                                                                       : patch_note(r);
+                    std::string why = !r.p.error.empty()        ? "Not read: " + r.p.error + "."
+                                      : other_eboot             ? "Made for another eboot: not applied."
+                                      : unknown_option          ? "Follows " + r.p.option + ", which this bbhost does not know: not applied."
+                                      : r.p.option.empty() && !bare_key(r.p.name) ? "Its name cannot be a bbhost.toml key, so it is always on."
+                                                                                 : patch_note(r);
+                    if (!fixed && !r.p.enabled) why = "Off unless turned on here. " + why;
+                    if (!fixed && !r.p.group.empty()) why = "One of the " + r.p.group + " variants: one is on at a time. " + why;
+                    if (!fixed && r.p.gameplay)
+                        why = "Changes the game: while it is on, your online rules say so, and the server keeps your bloodstains, "
+                              "messages and statistics apart from vanilla players'. " + why;
                     const std::string where = generic(fs::path(r.p.path).lexically_normal().string());
                     ImGui::TextDisabled("%s %s", why.c_str(), where.c_str());
                     ImGui::PopTextWrapPos();
@@ -453,18 +535,134 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                     ImGui::Spacing();
                 }
                 if (!patch_rows.empty()) {
-                    auto set_all = [&](bool v) {
+                    // All off, or each patch as its own file has it (a patch that
+                    // says enabled = false off, the rest on); one that follows a
+                    // setting keeps that setting's own default.
+                    auto set_all = [&](bool defaults) {
                         for (PatchRow& r : patch_rows) {
-                            const bool other_eboot = eboot.ok && !r.p.eboot.empty() && r.p.eboot != eboot.sha;
-                            if (!r.p.error.empty() || !r.p.enabled || other_eboot) continue;
-                            if (!r.p.option.empty() && !patch_manifest_option_known(r.p.option)) continue;
-                            if (r.p.option.empty() && !bare_key(r.p.name)) continue;
-                            *patch_switch(r) = v;
+                            if (!switchable(r) || (defaults && !r.p.option.empty())) continue;
+                            *patch_switch(r) = defaults && r.p.enabled;
                         }
                     };
                     if (ImGui::Button("All off (the game's code as it shipped)")) set_all(false);
                     ImGui::SameLine();
-                    if (ImGui::Button("All on##patches")) set_all(true);
+                    if (ImGui::Button("Defaults##patches")) set_all(true);
+                }
+                ImGui::EndChild();
+                ImGui::EndTabItem();
+            }
+            const ImGuiTabItemFlags sflags = select_shaders_tab ? ImGuiTabItemFlags_SetSelected : 0;
+            select_shaders_tab = false;
+            if (ImGui::BeginTabItem("Shaders", nullptr, sflags)) {
+                ImGui::BeginChild("##shaders", ImVec2(0, ImGui::GetContentRegionAvail().y - footer));
+                if (recommend_compile) {
+                    ImGui::TextColored(warn, "Recommended: compile the shaders now.");
+                    ImGui::PushTextWrapPos(0.0f);
+                    ImGui::TextUnformatted((advice.why + ". Compiling now takes " + advice.time +
+                                            "; otherwise the game compiles them while you play.")
+                                               .c_str());
+                    ImGui::PopTextWrapPos();
+                    ImGui::BeginDisabled(!app0_ok || !eboot.ok);
+                    if (ImGui::Button("Compile shaders now##advice")) start_compile();
+                    ImGui::EndDisabled();
+                    ImGui::Separator();
+                    ImGui::Spacing();
+                }
+                ImGui::TextWrapped("bbhost turns the game's shaders into HLSL on this PC and compiles them with DXC. The game does this "
+                                   "itself: a start uses what is ready and compiles the rest in the background for the next start, so "
+                                   "you can play straight away. Compiling now does all of it up front.");
+                ImGui::Spacing();
+                ImGui::SetNextItemWidth(200 * scale);
+                static const char* const kShaderModes[] = {"HLSL", "Lifted"};
+                ImGui::BeginDisabled(cv.running);
+                ImGui::Combo("Shaders", &shaders, kShaderModes, 2);
+                ImGui::EndDisabled();
+                ImGui::PushTextWrapPos(0.0f);
+                ImGui::TextDisabled("HLSL: compiled by DXC on this PC. Lifted: the translator's own SPIR-V only. Saved with Save or Play; "
+                                    "the game reads it at its start.");
+                ImGui::PopTextWrapPos();
+                ImGui::SeparatorText("The caches");
+                ImGui::TextDisabled("%s", cache_state.dir.c_str());
+                if (!cache_state.have_caches) {
+                    ImGui::TextColored(warn, "No shader caches yet: the first start compiles everything.");
+                } else {
+                    if (cache_state.translator_current) ImGui::TextColored(good, "Made by this bbhost's shader translator.");
+                    else ImGui::TextColored(warn, "Made by another bbhost version: the next start compiles everything again.");
+                    if (cache_state.device_current == 1) ImGui::TextColored(good, "Made for this graphics driver.");
+                    else if (cache_state.device_current == 0) ImGui::TextColored(warn, "Made for another GPU or driver version: the driver compiles its part again.");
+                    else ImGui::TextDisabled("Checking the graphics driver...");
+                    ImGui::PushTextWrapPos(0.0f);
+                    ImGui::TextDisabled("Translations, lifts and DXC's modules %.0f MiB; the driver's pipelines %.0f MiB; what was drawn: %.1f + %.1f MiB.",
+                                        cache_state.translation_bytes / 1048576.0, cache_state.pipeline_bytes / 1048576.0,
+                                        cache_state.stage_manifest_bytes / 1048576.0, cache_state.pipeline_manifest_bytes / 1048576.0);
+                    ImGui::PopTextWrapPos();
+                }
+                if (!cache_state.last.empty()) {
+                    // shader-compile.txt's "key value" lines, as sentences.
+                    std::string result, when, version, stages, hlsl, seconds, device, pipelines;
+                    std::vector<std::string> failed, lift;
+                    for (const std::string& l : cache_state.last) {
+                        const std::size_t sp = l.find(' ');
+                        const std::string k = l.substr(0, sp), v = sp == std::string::npos ? "" : l.substr(sp + 1);
+                        if (k == "result") result = v;
+                        else if (k == "when") when = v;
+                        else if (k == "bbhost") version = v;
+                        else if (k == "stages") stages = v;
+                        else if (k == "hlsl") hlsl = v;
+                        else if (k == "seconds") seconds = v;
+                        else if (k == "device") device = v.substr(v.find(' ') == std::string::npos ? 0 : v.find(' ') + 1);
+                        else if (k == "failed") failed.push_back(v);
+                        else if (k == "pipelines") pipelines = v;
+                        else if (k == "lift") lift.push_back(v);
+                    }
+                    ImGui::Text("The last compile: %s, %s (%s s), bbhost %s", result == "done" ? "finished" : result.c_str(), when.c_str(),
+                                seconds.c_str(), version.c_str());
+                    ImGui::Indent();
+                    ImGui::PushTextWrapPos(0.0f);
+                    ImGui::TextDisabled("On %s: shaders %s; %s.", device.c_str(), stages.c_str(), hlsl.c_str());
+                    if (!pipelines.empty() && pipelines.rfind("0 of 0", 0) != 0) ImGui::TextDisabled("Pipelines %s.", pipelines.c_str());
+                    for (const std::string& r : failed) {
+                        if (r.find("LDS use outside a compute shader") != std::string::npos)
+                            ImGui::TextDisabled("Not compiled alone (%s): vertex shaders that write LDS, which only run inside another stage (tessellation); they are compiled when the game draws them.",
+                                                r.substr(r.rfind(' ') + 1).c_str());
+                        else
+                            ImGui::TextDisabled("Failed: %s", r.c_str());
+                    }
+                    for (const std::string& r : lift) ImGui::TextDisabled("Kept the lift: %s", r.c_str());
+                    ImGui::PopTextWrapPos();
+                    ImGui::Unindent();
+                }
+                ImGui::SeparatorText("Compile now");
+                if (!cv.running) {
+                    ImGui::BeginDisabled(!app0_ok || !eboot.ok);
+                    if (ImGui::Button("Compile shaders now")) start_compile();
+                    ImGui::EndDisabled();
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("Every shader the game uses, with this PC's graphics driver. It can be cancelled.");
+                } else {
+                    if (ImGui::Button("Cancel")) compile_job.cancel();
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("%s", cv.phase.c_str());
+                }
+                if (cv.running || cv.finished || cv.cancelled || !cv.error.empty()) {
+                    const float frac = cv.total ? static_cast<float>(cv.done) / static_cast<float>(cv.total) : 0.0f;
+                    char over[96];
+                    std::snprintf(over, sizeof(over), "%llu of %llu", static_cast<unsigned long long>(cv.done),
+                                  static_cast<unsigned long long>(cv.total));
+                    ImGui::ProgressBar(frac, ImVec2(-1, 0), over);
+                    if (cv.eta >= 0 && cv.running)
+                        ImGui::Text("%.0f s so far, about %.0f s left", cv.seconds, cv.eta);
+                    else
+                        ImGui::Text("%.0f s", cv.seconds);
+                    ImGui::Text("%llu took DXC's module, %llu kept the lift; %llu failed", static_cast<unsigned long long>(cv.hlsl),
+                                static_cast<unsigned long long>(cv.lift), static_cast<unsigned long long>(cv.failed));
+                    if (cv.recipes_total)
+                        ImGui::Text("Pipelines from your earlier sessions and the shipped list: %llu of %llu",
+                                    static_cast<unsigned long long>(cv.recipes_done), static_cast<unsigned long long>(cv.recipes_total));
+                    if (cv.finished) ImGui::TextColored(good, "Done: the next start takes these from the caches.");
+                    if (cv.cancelled) ImGui::TextColored(warn, "Cancelled: what was compiled is kept; the game compiles the rest.");
+                    if (!cv.error.empty()) ImGui::TextColored(warn, "%s", cv.error.c_str());
+                    for (const std::string& r : cv.reasons) ImGui::BulletText("%s", r.c_str());
                 }
                 ImGui::EndChild();
                 ImGui::EndTabItem();
@@ -499,6 +697,19 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         };
 
         if (game_tab) {
+        if (recommend_compile) {
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextColored(warn, "%s.", advice.why.c_str());
+            ImGui::SameLine();
+            ImGui::BeginDisabled(!app0_ok || !eboot.ok);
+            if (ImGui::SmallButton("Compile shaders now##main")) {
+                start_compile();
+                select_shaders_tab = true;
+            }
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::TextDisabled("%s; optional.", advice.time.c_str());
+        }
         ImGui::SeparatorText("Game files");
         path_row("Game folder (the one that contains dvdroot_ps4)", kApp0, true, "C:/Games/Bloodborne/CUSA00900");
         status_line(app0_ok, "has dvdroot_ps4",
@@ -631,10 +842,18 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         static_assert(sizeof(kCapLabels) / sizeof(kCapLabels[0]) == sizeof(kCaps) / sizeof(kCaps[0]), "a label for every rate");
         ImGui::Combo("Frame rate", &cap_choice, kCapLabels, kCapCount);
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("The game's own speed. Uncapped steps it by the frame time: the display's refresh rate with V-Sync on, up to 240 fps off.");
+            ImGui::SetTooltip("The game's own speed. Uncapped steps it by the frame time: the display's refresh rate with V-Sync on, up to 240 fps off in the world.");
         ImGui::SetNextItemWidth(200 * scale);
         ImGui::Combo("Render resolution", &resolution, kResolutions, static_cast<int>(sizeof(kResolutions) / sizeof(kResolutions[0])));
         ImGui::TextDisabled("F10 in the game has every other setting.");
+
+        ImGui::SeparatorText("Diagnostics");
+        ImGui::Checkbox("Tooling and logging", &tooling);
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextDisabled("The periodic reports in the log, the stall detector, the GPU busy meter (GPU %% beside the FPS counter) "
+                            "and the recent-draw history. Off gives the game that headroom; the log keeps the start, warnings and "
+                            "errors. Leave it on when reporting a problem.");
+        ImGui::PopTextWrapPos();
 
         ImGui::SeparatorText("Updates");
         ImGui::Checkbox("Check for a newer bbhost at start", &check_updates);
@@ -650,7 +869,8 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         ImGui::Checkbox("Show this window every time bbhost starts", &show_every_start);
         ImGui::TextDisabled("Or start bbhost with --setup to open it once.");
         ImGui::Spacing();
-        const bool can_play = app0_ok && eboot.ok;
+        const bool compiling = compile_job.running();
+        const bool can_play = app0_ok && eboot.ok && !compiling;
         ImGui::BeginDisabled(!can_play);
         const bool play = ImGui::Button("Play", ImVec2(140 * scale, 0)) || (test && !std::strcmp(test, "play") && ++frames > 30);
         ImGui::EndDisabled();
@@ -680,7 +900,10 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                 done = true;
             }
         }
-        if (!can_play) {
+        if (compiling) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("Play waits for the compile (Shaders tab).");
+        } else if (!can_play) {
             ImGui::SameLine();
             ImGui::TextDisabled("Play needs the game folder and the 1.09 eboot.");
         }
@@ -703,6 +926,10 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         SDL_RenderPresent(ren);
     }
 
+    // Closing the window while a compile runs: it is told to stop and write
+    // what it has; the destructor waits for it.
+    compile_job.cancel();
+    if (devices_thread.joinable()) devices_thread.join();
     if (plugin_seen) plugin_ui_mark_seen(plugin_ui);
     ImGui_ImplSDLRenderer3_Shutdown();
     ImGui_ImplSDL3_Shutdown();

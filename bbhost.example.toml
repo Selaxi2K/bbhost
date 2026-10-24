@@ -38,7 +38,8 @@ auth_server = "https://thehuntersdream.com"
 # site's map, deaths and profiles come from it. The game's own is 300 (and
 # what is left at quitting is lost); 0 keeps that. An upload is a few KB and
 # goes out on a worker thread (measured: 0.7-3.6 KB, the game never waits).
-playlog_upload_seconds = 5
+# The server keeps every upload as a file and asks for 30 s or more.
+playlog_upload_seconds = 30
 # How often, in milliseconds, the game logs the player's position into it
 # (the live map plays these back as walking). The game's own is 1500; 0 keeps it.
 playlog_sample_ms = 500
@@ -65,17 +66,58 @@ height = 1080
 # The default of F10's Frame rate: 30 (the game's own), 60, 90, 120, or 0 for
 # uncapped; what F10 saves wins over it.
 fps_cap = 30
-# The defaults of three F10 settings, by an entry's name; what F10 or the
+# Above 30 fps, the effects (the lamps' and candles' flicker among them) and
+# the wind on grass and trees step in whole 1/30 s, 30 times a second as at
+# 30, with what the effects count in updates held on the frames between.
+# smooth (the default): as 30, with what the effects move by time moved by
+# each frame's own time in the effects converted for it. 30: whole 1/30 s
+# steps alone. 60: the effects in whole 1/60 s and the wind by the frame's
+# time; frame: both by the frame's time. BBHOST_SFX_STEP=30, smooth, 60 or
+# frame overrides this. Requires a restart.
+# effect_steps = "smooth"
+# The effects' emission clock: 60 (the default) makes their particles and
+# children as the game's effects do at 60 updates a second, at every frame
+# rate (30 included); 30 keeps the game's one emission an update, 30 a second
+# at 30 - the PS4's density. BBHOST_SFX_EMISSION=60 or 30 overrides this.
+# Requires a restart.
+# effect_emission = "60"
+# The defaults of four F10 settings, by an entry's name; what F10 or the
 # game's PC Graphics menu saves wins over them (the Steam Deck kit's toml sets
 # "1280x800" and "Fullscreen").
 # resolution = "1920x1080"
 # window_mode = "Windowed"
 # model_detail = "Normal"   # Full, Normal, Low, Lowest: the game's LOD bias
+# shaders = "HLSL"          # HLSL (compiled by DXC on this PC, in the background) or Lifted (the translator's SPIR-V only)
 # OBS's game capture hooks Vulkan programs through a layer that loads into
 # every one of them once OBS is installed. On an AMD card bbhost keeps it out
 # (it hung the GPU there); "on" lets it in, "off" keeps it out on any card.
 # OBS's Window Capture records bbhost without it. (Windows only.)
 # obs_capture = "auto"
+
+[gpu]
+# The game's memory the GPU reaches: imported whole at the start (false, the
+# default on a graphics card of its own and under Linux), or a 16 MB window at
+# a time as something first needs it (true, the default on an integrated GPU
+# under Windows): far less memory pinned for the driver and a start a few
+# seconds sooner, at a little more work while new windows come in. The Steam
+# Deck kit's toml sets true (its shared memory stays under the driver's
+# budget). BBHOST_IMPORT_WINDOWS=0 or 1 overrides this setting.
+# import_windows = false
+# Memory bbhost keeps in play beyond what it draws with, for integrated GPUs
+# (where no video memory reserve trims it) and any GPU you want leaner:
+# - staging_return: the upload staging held from a load on (up to 768 MB) goes
+#   back down to 256 MB in play, 64 MB every two seconds from 30 s after the
+#   latest load (a death or a lamp starts the count again).
+# - cache_budget_mb: past this many MB of video memory held, textures are made
+#   when first drawn rather than ahead, unused ones go and the image heap
+#   drains sooner (0: no budget).
+# - heap_lean: the image heap keeps no spare block in play and drains sooner.
+# All three on by default on an integrated GPU under Windows (a 2048 MB budget
+# there), off elsewhere; BBHOST_STAGING_RETURN, BBHOST_CACHE_BUDGET_MB and
+# BBHOST_HEAP_LEAN override them.
+# staging_return = false
+# cache_budget_mb = 0
+# heap_lean = false
 
 [startup]
 # Bloodborne 1.09: skip FromSoftware, Japan Studio and SCE logos, and the

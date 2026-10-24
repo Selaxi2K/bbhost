@@ -15,6 +15,28 @@
 namespace gcn {
 
 namespace {
+std::atomic<std::uint32_t> g_subgroup_stages{0x7fffffffu};  // set_subgroup_stages: every stage until the host says
+}  // namespace
+namespace {
+std::atomic<bool> g_clip_demote{false};  // set_clip_demote
+}  // namespace
+void set_clip_demote(bool on) { g_clip_demote.store(on, std::memory_order_relaxed); }
+bool clip_demote() { return g_clip_demote.load(std::memory_order_relaxed); }
+void set_subgroup_stages(std::uint32_t vk_stages) { g_subgroup_stages.store(vk_stages, std::memory_order_relaxed); }
+std::uint32_t subgroup_stages() { return g_subgroup_stages.load(std::memory_order_relaxed); }
+std::uint32_t vk_stage_of(const TranslateOptions& o) {
+    if (o.gs_role == TranslateOptions::GsRole::Geometry) return 0x8;  // VK_SHADER_STAGE_GEOMETRY_BIT
+    switch (o.stage) {
+    case Stage::Vertex: return 0x1;       // VK_SHADER_STAGE_VERTEX_BIT
+    case Stage::TessControl: return 0x2;  // TESSELLATION_CONTROL
+    case Stage::TessEval: return 0x4;     // TESSELLATION_EVALUATION
+    case Stage::Pixel: return 0x10;       // FRAGMENT
+    case Stage::Compute: return 0x20;     // COMPUTE
+    }
+    return 0x20;
+}
+
+namespace {
 std::atomic<bool> g_runtime_sample_offsets{false};
 }  // namespace
 void set_runtime_sample_offsets(bool on) { g_runtime_sample_offsets.store(on, std::memory_order_relaxed); }
@@ -28,6 +50,21 @@ bool tbuffer_dst_sel() {
     return on;
 }
 
+namespace {
+std::atomic<bool> g_index_bounds{false};  // set_index_bounds
+std::atomic<bool> g_image_store_bounds{true};  // set_image_store_bounds
+std::atomic<bool> g_oob_count{false};     // set_oob_count
+std::atomic<bool> g_oob_control{false};   // set_oob_control
+}  // namespace
+void set_index_bounds(bool on) { g_index_bounds.store(on, std::memory_order_relaxed); }
+bool index_bounds() { return g_index_bounds.load(std::memory_order_relaxed); }
+void set_image_store_bounds(bool on) { g_image_store_bounds.store(on, std::memory_order_relaxed); }
+bool image_store_bounds() { return g_image_store_bounds.load(std::memory_order_relaxed); }
+void set_oob_count(bool on) { g_oob_count.store(on, std::memory_order_relaxed); }
+bool oob_count() { return g_oob_count.load(std::memory_order_relaxed); }
+void set_oob_control(bool on) { g_oob_control.store(on, std::memory_order_relaxed); }
+bool oob_control() { return g_oob_control.load(std::memory_order_relaxed); }
+
 std::string translation_switches() {
     // The variables as given rather than what each decides: two spellings of
     // one setting only cost a second entry.
@@ -36,9 +73,9 @@ std::string translation_switches() {
         return std::string(name) + "=" + (e ? e : "") + ";";
     };
     std::string s = std::string("offsets=") + (runtime_sample_offsets() ? "1" : "0") + ";half_rtz=" + (native_half_rtz() ? "1" : "0") +
-                    ";export_rtz=" + (export_rtz_on() ? "1" : "0") + ";legacy_mul=" + (legacy_mul_min_form() ? "min" : "select") + ";";
+                    ";export_rtz=" + (export_rtz_on() ? "1" : "0") + ";legacy_mul=" + (legacy_mul_plain() ? "plain" : legacy_mul_min_form() ? "min" : "select") + ";";
     for (const char* name : {"BBHOST_DST_SEL_BRANCH", "BBHOST_LOOP_BLOCKS", "BBHOST_LOOP_REACH", "BBHOST_SPILL_CELLS", "BBHOST_COPY_DEFS", "BBHOST_CB_RANGED", "BBHOST_BOUND_STORES",
-                             "BBHOST_TBUFFER_DST_SEL"}) {
+                             "BBHOST_TBUFFER_DST_SEL", "BBHOST_LIFT_BRANCH"}) {
         s += env(name);
     }
     return s;
@@ -82,6 +119,16 @@ bool bound_stores_on() {
     }();
     return on;
 }
+// BBHOST_CS_BOUND_ELEMENTS: a compute shader's lean translation (cb_ssbo,
+// cb_no_fallback) reads and writes buffer elements at a VGPR index or offset
+// through bindings too (Translator::bound_compute_access); 0 walks them.
+bool cs_bound_elements_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_CS_BOUND_ELEMENTS");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
 constexpr std::uint32_t kLdsWordsMax = 16384;  // GCN's 64 KiB per workgroup
 
 // COMPUTE_PGM_RSRC2.LDS_SIZE: bits 15..23, in units of 128 dwords. Declaring
@@ -121,6 +168,9 @@ struct Translator {
     // TranslateOptions::tess_role: LDS is the buffer at StageParams::lds_address.
     bool lds_in_buffer = false;
     Id lds_base64 = 0;
+    // gcn::set_oob_count: the counters' device address (StageParams::lds_address),
+    // loaded at the entry of a stage that counts; 0 otherwise.
+    Id oob_base64 = 0;
     // TranslateOptions::tess_lds_bound: how many bytes from lds_base64 the
     // stage may touch - the patch's window, or StageParams::lds_bytes - and
     // whether member 3 of the params block is the uvec4 that holds the latter.
@@ -307,7 +357,10 @@ struct Translator {
     bool block_terminated = false;
     std::set<std::string> reported;
 
-    Translator(const Program& p, const TranslateOptions& o) : prog(p), opt(o) {}
+    Translator(const Program& p, const TranslateOptions& o) : prog(p), opt(o), subgroups(subgroup_ops_in(o)) {}
+    // The stage may run subgroup operations (gcn::subgroup_ops_in); without
+    // them each invocation is a wave of its own.
+    const bool subgroups;
 
     void error(const std::string& what) {
         char buf[32];
@@ -405,10 +458,22 @@ struct Translator {
     }
     // Ballot of a per-lane bool -> (lo, hi).
     void ballot(Id cond, Id& lo, Id& hi) {
+        if (!subgroups) {  // a wave of one: lane 0's bit
+            lo = m.emit(spv::OpSelect, t_u32, {cond, c_one_u, c_zero_u});
+            hi = c_zero_u;
+            return;
+        }
         const Id b = m.emit(spv::OpGroupNonUniformBallot, t_v4u, {cu(spv::ScopeSubgroup), cond});
         lo = m.emit(spv::OpCompositeExtract, t_u32, {b, 0});
         hi = m.emit(spv::OpCompositeExtract, t_u32, {b, 1});
     }
+    // The subgroup operations a wave of one makes its own value (shuffle,
+    // broadcast) or the invocation itself (election).
+    Id shuffle(Id v, Id src_lane) {
+        return subgroups ? m.emit(spv::OpGroupNonUniformShuffle, t_u32, {cu(spv::ScopeSubgroup), v, src_lane}) : v;
+    }
+    Id broadcast_first(Id v) { return subgroups ? m.emit(spv::OpGroupNonUniformBroadcastFirst, t_u32, {cu(spv::ScopeSubgroup), v}) : v; }
+    Id elect() { return subgroups ? m.emit(spv::OpGroupNonUniformElect, t_bool, {cu(spv::ScopeSubgroup)}) : m.const_bool(true); }
     Id exec_bit() { return ldb(v_exec_bit); }
     Id vcc_bit() { return ldb(v_vcc_bit); }
     void refresh_exec_bit() { m.store(v_exec_bit, mask_bit(ld(v_exec_lo), ld(v_exec_hi))); }
@@ -677,7 +742,106 @@ struct Translator {
     // 64-bit scalar ops on (lo,hi) pairs via u64.
     Id pair64(Id lo, Id hi) { return make_u64(lo, hi); }
 
-    // Physical storage buffer access.
+    // Physical storage buffer access. host_ptr: a dword at a device address
+    // the host handed over (a GDS counter's word, StageParams::gds_counter),
+    // with no walk of the page table.
+    Id host_ptr(Id host_u64) {
+        const Id block = m.emit(spv::OpConvertUToPtr, p_psb_block, {host_u64});
+        return m.access_chain(p_psb_u32, block, {c_zero_u});
+    }
+    // gcn::set_oob_count: one more of `kind` for this program where `cond`
+    // holds in a lane EXEC holds.
+    void oob_note(Id cond, std::uint32_t kind) {
+        if (!oob_base64) return;
+        if_then(band(cond, exec_cond()), [&] {
+            const std::uint64_t at = (static_cast<std::uint64_t>(res.oob_slot) * kOobKinds + kind) * 4;
+            m.emit(spv::OpAtomicIAdd, t_u32, {host_ptr(m.emit(spv::OpIAdd, t_u64, {oob_base64, m.const_u64(at)})), cu(spv::ScopeDevice),
+                                              cu(spv::MsNone), c_one_u});
+        });
+    }
+    // gcn::set_oob_control: of the accesses past a halved limit, one in 256 -
+    // those whose `key` (a coordinate or an index) hashes to 0 in its top eight
+    // bits - so the control's adds stay a small part of the draws' time; `cond`
+    // as it is otherwise.
+    Id oob_sampled(Id cond, Id key) {
+        if (!oob_control()) return cond;
+        return band(cond, ieq(shr(imul(key, cu(0x9e3779b1u)), cu(24)), c_zero_u));
+    }
+    // gcn::set_oob_count: an image access at integer coordinates (`coords`,
+    // signed, the layer last where `arrayed`) against the view the host binds
+    // for `img` - a load (OpImageFetch at `level`, 0 for none) or a store
+    // (OpImageWrite, level 0 of the view; `level` the image_store_mip's).
+    // The size counts where the level is one the view has (the size is read at
+    // level 0 elsewhere, and the level counts instead). The control halves
+    // every limit. Then the view against the T# in.srsrc names (its width and
+    // height, a 3D image's depth, at its BASE_LEVEL plus the level read): where
+    // the two disagree about a lane (kOobViewSmaller, kOobViewLarger).
+    void oob_image(const ImageVar& img, std::uint32_t dim, bool arrayed, const std::vector<Id>& coords, Id level, bool store, const Inst& in) {
+        if (!oob_base64 || coords.empty()) return;
+        m.capability(spv::CapImageQuery);
+        const Id image = load_image(img);
+        const std::size_t n = coords.size();
+        const Id size_type = n == 1 ? t_i32 : n == 2 ? t_v2i : n == 3 ? t_v3i : t_v4i;
+        const auto limit = [&](Id v) { return oob_control() ? shr(v, c_one_u) : v; };
+        const Id key = ui(coords[0]);
+        const auto past = [&](Id v, Id lim) { return oob_sampled(m.emit(spv::OpLogicalNot, t_bool, {ult(v, limit(lim))}), key); };
+        Id size, level_in = 0;
+        if (store) {
+            size = m.emit(spv::OpImageQuerySize, size_type, {image});
+            if (level) oob_note(ine(ui(level), c_zero_u), kOobImageStoreLevel);
+        } else {
+            Id at = c_zero_u;
+            if (level) {
+                const Id levels = ui(m.emit(spv::OpImageQueryLevels, t_i32, {image}));
+                level_in = ult(ui(level), levels);
+                oob_note(past(ui(level), levels), kOobImageLoadLevel);
+                at = sel(level_in, ui(level), c_zero_u);
+            }
+            size = m.emit(spv::OpImageQuerySizeLod, size_type, {image, i(at)});
+        }
+        const std::size_t axes = arrayed ? n - 1 : n;
+        Id outside = 0;
+        for (std::size_t k = 0; k < axes; ++k) {
+            const Id s = ui(n == 1 ? size : extract(t_i32, size, static_cast<std::uint32_t>(k)));
+            const Id bad = past(ui(coords[k]), s);
+            outside = outside ? bor(outside, bad) : bad;
+        }
+        if (outside) oob_note(level_in ? band(outside, level_in) : outside, store ? kOobImageStoreSize : kOobImageLoadSize);
+        if (arrayed) {
+            const Id layers = ui(extract(t_i32, size, static_cast<std::uint32_t>(n - 1)));
+            oob_note(past(ui(coords[n - 1]), layers), store ? kOobImageStoreLayer : kOobImageLoadLayer);
+        }
+        // The game's image: the T#'s size at the level the access reads
+        // (BASE_LEVEL + the load's level; a store's, level 0 of the view).
+        const Id w2 = read_s(in.srsrc + 2, in), w3 = read_s(in.srsrc + 3, in);
+        Id rel = c_zero_u;
+        if (level && !store) rel = sel(level_in, ui(level), c_zero_u);
+        const Id at_level = iadd(iand(shr(w3, cu(12)), cu(0xf)), rel);
+        const auto shrink = [&](Id full) {
+            const Id v = shr(full, at_level);
+            return sel(ine(v, c_zero_u), v, c_one_u);
+        };
+        std::vector<Id> tsize = {shrink(iadd(iand(w2, cu(0x3fff)), c_one_u)), shrink(iadd(iand(shr(w2, cu(14)), cu(0x3fff)), c_one_u))};
+        if (dim == spv::Dim3D && !in.r128) tsize.push_back(shrink(iadd(iand(read_s(in.srsrc + 4, in), cu(0x1fff)), c_one_u)));
+        const std::size_t taxes = std::min<std::size_t>(dim == spv::Dim1D ? 1 : dim == spv::Dim3D ? tsize.size() : 2, axes);
+        Id in_t = 0, in_v = 0;
+        for (std::size_t k = 0; k < taxes; ++k) {
+            const Id c = ui(coords[k]);
+            const Id t = ult(c, limit(tsize[k]));
+            const Id v = ult(c, ui(n == 1 ? size : extract(t_i32, size, static_cast<std::uint32_t>(k))));
+            in_t = in_t ? band(in_t, t) : t;
+            in_v = in_v ? band(in_v, v) : v;
+        }
+        if (in_t) {
+            Id smaller = band(in_t, m.emit(spv::OpLogicalNot, t_bool, {in_v})), larger = band(m.emit(spv::OpLogicalNot, t_bool, {in_t}), in_v);
+            if (level_in) {
+                smaller = band(smaller, level_in);
+                larger = band(larger, level_in);
+            }
+            oob_note(oob_sampled(smaller, key), kOobViewSmaller);
+            oob_note(oob_sampled(larger, key), kOobViewLarger);
+        }
+    }
     Id guest_ptr(Id guest_u64) {
         const Id host = m.emit(spv::OpFunctionCall, t_u64, {fn_xlate, guest_u64});
         const Id block = m.emit(spv::OpConvertUToPtr, p_psb_block, {host});
@@ -854,7 +1018,7 @@ struct Translator {
         buffer_sites.push_back({reg, index, sym_key(sym_of(reg)), sym_key(sym_of(reg + 1)), def_seq++, cur_block});
         const Id first = shr(offset_bytes, cu(2));
         const auto bound_reads = [&] {
-            const Id bias = params_u32(4, index);
+            const Id bias = cb_bias(index);
             const Id range_dw = params_u32(5, index);
             std::vector<Id> vals;
             for (int k = 0; k < n; ++k) {
@@ -930,7 +1094,7 @@ struct Translator {
         std::vector<Id> vals;
         for (int k = 0; k < n; ++k) vals.push_back(ld(vgpr_var(in.vdata + k)));
         exec_guard([&] {
-            const Id bias = params_u32(4, index);
+            const Id bias = cb_bias(index);
             const Id range_dw = params_u32(5, index);
             for (int k = 0; k < n; ++k) {
                 const Id at = iadd(first, cu(static_cast<std::uint32_t>(k)));
@@ -946,6 +1110,9 @@ struct Translator {
         return m.load(t_u32, m.access_chain(p_uni_u32, ubo_var,
                                             {cu(member), cu(static_cast<std::uint32_t>(index / 4)), cu(static_cast<std::uint32_t>(index % 4))}));
     }
+    // buffers[index]'s dword bias inside its binding (StageParams::cb_bias_dw):
+    // 0 where the host binds every buffer at its base (TranslateOptions::cb_bias_zero).
+    Id cb_bias(std::size_t index) { return opt.cb_bias_zero ? c_zero_u : params_u32(4, index); }
     Id buffer_bound(std::size_t index) {
         const Id valid_bits = m.load(t_u32, params_head_v4 ? m.access_chain(p_uni_u32, ubo_var, {cu(3), c_zero_u})
                                                            : m.access_chain(p_uni_u32, ubo_var, {cu(3)}));
@@ -958,7 +1125,7 @@ struct Translator {
         res.buffer_at[cur_offset] = static_cast<std::uint32_t>(index);
         buffer_sites.push_back({reg, index, sym_key(sym_of(reg)), sym_key(sym_of(reg + 1)), def_seq++, cur_block});
         if (opt.cb_no_fallback) {
-            const Id bias = params_u32(4, index);
+            const Id bias = cb_bias(index);
             std::vector<Id> vals;
             for (int k = 0; k < n; ++k) {
                 const Id at = iadd(bias, iadd(first_dw, cu(static_cast<std::uint32_t>(k))));
@@ -973,7 +1140,7 @@ struct Translator {
         m.emit_void(spv::OpSelectionMerge, {l_merge, 0u});
         m.emit_void(spv::OpBranchConditional, {valid, l_bound, l_walk});
         m.label(l_bound);
-        const Id bias = params_u32(4, index);
+        const Id bias = cb_bias(index);
         for (int k = 0; k < n; ++k) {
             const Id at = iadd(bias, iadd(first_dw, cu(static_cast<std::uint32_t>(k))));
             m.store(vars[static_cast<std::size_t>(k)], m.load(t_u32, m.access_chain(p_ssbo_u32, buffer_vars[index], {c_zero_u, at})));
@@ -1086,6 +1253,24 @@ struct Translator {
             if (p.str() == key) return;
         }
         res.store_buffers.push_back(path);
+    }
+
+    // A load that walks the page table through the V# (4 registers) or the
+    // 64-bit pointer (2) in s[reg]: its base on TranslateResult::read_buffers.
+    void note_read(std::uint16_t reg, bool pointer, std::uint32_t end_dw) {
+        ResourcePath path;
+        if (!sym_path(reg, 2, path)) {
+            ++res.untraced_reads;
+            return;
+        }
+        const std::string key = path.str();
+        for (TranslateResult::BufferRead& r : res.read_buffers) {
+            if (r.pointer == pointer && r.path.str() == key) {
+                r.max_dw = std::max(r.max_dw, end_dw);
+                return;
+            }
+        }
+        res.read_buffers.push_back({path, pointer, end_dw});
     }
 
     // ---- images
@@ -1238,6 +1423,19 @@ struct Translator {
         in_location_vars[location] = var;
         return var;
     }
+    // A pixel shader input's value: its Input variable, loaded, or GCN's
+    // default constant where the input map gives the default
+    // (TranslateOptions::kPsInputDefault), which has no variable.
+    Id in_value(int attr) {
+        const std::uint8_t entry = static_cast<std::size_t>(attr) < opt.ps_input_map.size() ? opt.ps_input_map[attr] : static_cast<std::uint8_t>(attr);
+        if (TranslateOptions::ps_input_is_default(entry)) return ps_input_default(entry & 3);
+        return m.load(t_v4f, in_param(attr));
+    }
+    // SPI_PS_INPUT_CNTL.DEFAULT_VAL v: (0,0,0,0), (0,0,0,1), (1,1,1,0), (1,1,1,1).
+    Id ps_input_default(std::uint32_t v) {
+        const Id rgb = cf(v >= 2 ? 1.0f : 0.0f), a = cf((v & 1) ? 1.0f : 0.0f);
+        return m.const_composite(t_v4f, {rgb, rgb, rgb, a});
+    }
     Id out_param(int n) {
         auto it = out_params.find(n);
         if (it != out_params.end()) return it->second;
@@ -1320,6 +1518,9 @@ struct Translator {
         // and a select before. NMin, so a NaN beside a zero still gives zero
         // (FMin may answer the NaN, as NVIDIA's did). BBHOST_LEGACY_MUL=select:
         // the old form.
+        // x * x: one operand is zero only when both are, so the zero rule never
+        // decides; the plain multiply is the same value (lift.cpp mul_legacy).
+        if (legacy_mul_plain() || a == b) return fmul(a, b);
         if (legacy_mul_min_form()) return fsel(feq(fmin_(fabs_(a), fabs_(b)), cf(0.0f)), cf(0.0f), fmul(a, b));
         const Id zero = bor(feq(a, cf(0.0f)), feq(b, cf(0.0f)));
         return fsel(zero, cf(0.0f), fmul(a, b));
@@ -1356,7 +1557,7 @@ struct Translator {
                 v = ld(spill_cell(in.src0 - 256, cell_lane));  // a spilled scalar: the cell its v_writelane_b32 filled
             } else {
                 const Id lane_sel = iand(s1, cu(63));
-                v = m.emit(spv::OpGroupNonUniformShuffle, t_u32, {cu(spv::ScopeSubgroup), s0, lane_sel});
+                v = shuffle(s0, lane_sel);
             }
             write_s(in.dst, v);
             if (cell) note_copy(in.dst, cell_def(in.src0 - 256, cell_lane));
@@ -1506,10 +1707,13 @@ struct Translator {
     Id rcp(Id x) { return fdiv(cf(1.0f), x); }
     Id rsq(Id x) { return m.ext_inst(t_f32, spv::GlslInverseSqrt, {x}); }
     Id clamp_inf(Id v) {
-        // v_rsq_clamp / v_rcp_clamp: +-inf -> +-FLT_MAX
+        // v_rsq_clamp / v_rcp_clamp: +-inf -> +-FLT_MAX, the sign moved onto
+        // FLT_MAX's bits (one v_and_or_b32; FSign(v) * FLT_MAX was two
+        // compares and two selects on AMD's compiler).
         const Id inf = m.emit(spv::OpIsInf, t_bool, {v});
-        const Id big = m.ext_inst(t_f32, spv::GlslFSign, {v});
-        return fsel(inf, fmul(big, cf(3.4028235e38f)), v);
+        const Id sign = m.emit(spv::OpBitwiseAnd, t_u32, {m.emit(spv::OpBitcast, t_u32, {v}), cu(0x80000000u)});
+        const Id big = m.emit(spv::OpBitcast, t_f32, {m.emit(spv::OpBitwiseOr, t_u32, {sign, cu(0x7f7fffffu)})});
+        return fsel(inf, big, v);
     }
 
     bool vop1(std::uint32_t op, const Inst& in, Id s0, const Mods& md) {
@@ -1520,7 +1724,7 @@ struct Translator {
         case 0: return true;  // v_nop
         case 1: return done_u(s0);
         case 2: {  // v_readfirstlane_b32
-            const Id v = m.emit(spv::OpGroupNonUniformBroadcastFirst, t_u32, {cu(spv::ScopeSubgroup), s0});
+            const Id v = broadcast_first(s0);
             write_s(in.dst, v);
             return true;
         }
@@ -2276,6 +2480,7 @@ struct Translator {
                               : res.buffers.size() >= kMaxBuffers  ? " past the buffer limit"
                                                                    : " excluded";
             note_walk(std::string(pointer ? "s_load" : "s_buffer_load") + why);
+            note_read(in.src0, pointer, known ? known_off + static_cast<std::uint32_t>(count) : 0);
         }
         const std::vector<Id> loaded = ranged      ? load_buffer_ranged(in, cb_path, cb_key, offset, count, base)
                                        : as_buffer ? load_buffer_run(cb_path, cb_key, pointer, in.src0, known_off, count, addr)
@@ -2313,7 +2518,7 @@ struct Translator {
         Id addr;   // u64 guest address of the element
         Id stride;
     };
-    BufferAddr buffer_address(const Inst& in) {
+    BufferAddr buffer_address(const Inst& in, bool walk = true) {
         const Id w0 = read_s(in.srsrc, in), w1 = read_s(in.srsrc + 1, in);
         const Id base = make_u64(w0, iand(w1, cu(0xff)));
         const Id stride = iand(shr(w1, cu(16)), cu(0x3fff));
@@ -2323,6 +2528,12 @@ struct Translator {
         if (in.idxen) {
             const Id index = ld(vgpr_var(va++));
             off = iadd(off, imul(index, stride));
+            // gcn::set_oob_count: a walk by index at or past num_records (a
+            // structured buffer's: its stride not 0).
+            if (walk && oob_base64) {
+                oob_note(band(ine(stride, c_zero_u), m.emit(spv::OpLogicalNot, t_bool, {ult(index, read_s(in.srsrc + 2, in))})),
+                         kOobWalkPastRecords);
+            }
         }
         if (in.offen) {
             off = iadd(off, ld(vgpr_var(va)));
@@ -2331,12 +2542,14 @@ struct Translator {
     }
     void mubuf(const Inst& in) {
         const std::uint32_t op = in.op;
+        if (bound_compute_access(in)) return;
         {
             ResourcePath path;
             std::string key;
             if (op < 112 && !store_bindable(in, path, key)) note_walk(mnemonic(in) + buffer_walk_form(in));
         }
         if ((op >= 4 && op <= 7) || (op >= 24 && op <= 31) || (op >= 48 && op < 112)) note_store(in);
+        if (op <= 3 || (op >= 8 && op <= 15) || (op >= 48 && op < 112)) note_read(in.srsrc, false, 0);
         auto load_n = [&](int n) {
             const BufferAddr ba = buffer_address(in);
             const std::vector<Id> vals = load_u32_run(ba.addr, n);
@@ -2618,6 +2831,7 @@ struct Translator {
         const int nwords = (total + 31) / 32;
         const std::size_t index = buffer_for(path, key, false, static_cast<std::uint32_t>(nwords));
         res.buffers[index].indexed = true;
+        res.buffers[index].bytes = false;  // read by dwords
         Id stride = params_u32(5, index);
         if (opt.cb_no_fallback) {
             Id& spec = cb_stride_spec[index];  // translate.h kCbStrideSpecId
@@ -2625,10 +2839,189 @@ struct Translator {
             stride = sel(ine(spec, c_zero_u), spec, stride);
         }
         const Id stride_dw = shr(stride, cu(2));
-        const Id first = iadd(cu(static_cast<std::uint32_t>(off / 4)), imul(ld(vgpr_var(in.vaddr)), stride_dw));
+        const Id vindex = ld(vgpr_var(in.vaddr));
+        Id first = iadd(cu(static_cast<std::uint32_t>(off / 4)), imul(vindex, stride_dw));
         // The element's guest address feeds only the fallback walk.
-        const Id guest = opt.cb_no_fallback ? m.const_u64(0) : buffer_address(in).addr;
-        comps = format_decode(read_bound(index, in.srsrc, first, nwords, guest), in.dfmt, in.nfmt, 4);
+        const Id guest = opt.cb_no_fallback ? m.const_u64(0) : buffer_address(in, false).addr;
+        // gcn::set_oob_count: an index at or past num_records, and a read past
+        // the binding (its last dword at or past the array's length).
+        if (oob_base64) {
+            const Id records = read_s(static_cast<std::uint16_t>(in.srsrc + 2), in);
+            oob_note(oob_sampled(m.emit(spv::OpLogicalNot, t_bool, {ult(vindex, oob_control() ? shr(records, c_one_u) : records)}), vindex),
+                     kOobPastRecords);
+            const Id length = m.emit(spv::OpArrayLength, t_u32, {buffer_vars[index], 0u});
+            const Id last = iadd(cb_bias(index), iadd(first, cu(static_cast<std::uint32_t>(nwords - 1))));
+            oob_note(m.emit(spv::OpLogicalNot, t_bool, {ult(last, length)}), kOobPastBinding);
+        }
+        if (!index_bounds()) {
+            comps = format_decode(read_bound(index, in.srsrc, first, nwords, guest), in.dfmt, in.nfmt, 4);
+            return true;
+        }
+        // gcn::set_index_bounds: an index at or past num_records reads 0, as on
+        // GCN - the binding's first element read instead (its dwords are in the
+        // binding whatever the records: buffer_for sized it), the words dropped.
+        const Id ok = ult(vindex, read_s(static_cast<std::uint16_t>(in.srsrc + 2), in));
+        first = sel(ok, first, cu(static_cast<std::uint32_t>(off / 4)));
+        std::vector<Id> words = read_bound(index, in.srsrc, first, nwords, guest);
+        for (Id& w : words) w = sel(ok, w, c_zero_u);
+        comps = format_decode(words, in.dfmt, in.nfmt, 4);
+        return true;
+    }
+    // TranslateOptions::cb_ssbo + cb_no_fallback in a compute shader (a
+    // dispatch's lean translation, ComputeLean): an element a buffer
+    // instruction reaches at a VGPR index or offset through a V# traced to
+    // user data or a table - typed loads at a VGPR offset (indexed_buffer_load
+    // takes those at an index alone), typed stores of 32-bit components,
+    // buffer_load_format_* with the V#'s own format, buffer_atomic_add - in
+    // the V#'s storage buffer instead of through the page table. The element's
+    // first dword is (offset12 + soffset) / 4, plus index * stride / 4 with
+    // idxen (the binding indexed: the host binds the V#'s records and passes
+    // the stride in cb_stride), plus the VGPR offset / 4 with offen (with no
+    // index the binding is ranged: the V#'s range, its dwords in cb_stride);
+    // the walk takes these addresses as dword-aligned too. As GCN, an element
+    // whose index is at or past num_records - or, ranged, a dword at or past
+    // the range - reads 0 and is not written, and only lanes EXEC holds write.
+    // A store or atomic's binding is written (in place, never a copy) and its
+    // V# a store buffer. False, with nothing emitted, for any other access.
+    bool bound_compute_access(const Inst& in) {
+        if (opt.stage != Stage::Compute || !opt.cb_ssbo || !opt.cb_no_fallback || !cs_bound_elements_on()) return false;
+        enum Kind { kNone, kTypedLoad, kTypedStore, kFormatLoad, kAtomicAdd };
+        const bool mt = in.enc == Enc::MTBUF;
+        const Kind kind = mt ? (in.op < 4 ? kTypedLoad : in.op < 8 ? kTypedStore : kNone)
+                             : (in.op <= 3 ? kFormatLoad : in.op == 50 ? kAtomicAdd : kNone);
+        if (kind == kNone || (!in.idxen && !in.offen) || (kind == kTypedLoad && !in.offen)) return false;
+        if (in.addr64 || in.lds || in.tfe || in.soffset < 128 || in.soffset > 208) return false;
+        const std::int32_t constant = in.soffset <= 192 ? static_cast<std::int32_t>(in.soffset) - 128 : 192 - static_cast<std::int32_t>(in.soffset);
+        const std::int32_t off = static_cast<std::int32_t>(in.offset12) + constant;
+        if (off < 0 || off % 4) return false;
+        int count = 0, bits[4] = {};
+        if (mt && (!format_layout(in.dfmt, count, bits) || bits[0] != 32)) return false;
+        ResourcePath path;
+        if (!sym_path(in.srsrc, 4, path) || path.user_sgpr < 0 || path.user_sgpr + 1 >= 16) return false;
+        const std::string key = path.str();
+        if (std::find(opt.cb_ssbo_exclude.begin(), opt.cb_ssbo_exclude.end(), key) != opt.cb_ssbo_exclude.end()) return false;
+        if (const auto it = buffer_index.find(key); it != buffer_index.end()) {
+            const BufferBinding& b = res.buffers[it->second];
+            if (b.pointer || (in.idxen ? b.ranged : b.indexed)) return false;  // cb_stride holds the other
+        } else if (res.buffers.size() >= kMaxBuffers) {
+            return false;
+        }
+        const int nwords = mt ? count : kind == kFormatLoad ? 4 : 1;
+        const bool fresh = !buffer_index.count(key);
+        const std::size_t index = buffer_for(path, key, false, static_cast<std::uint32_t>(off / 4 + nwords));
+        (in.idxen ? res.buffers[index].indexed : res.buffers[index].ranged) = true;
+        // A format load at an index reads its element at a byte offset; any
+        // other access at an index, by dwords (BufferBinding::bytes).
+        if (in.idxen) res.buffers[index].bytes = kind == kFormatLoad && (fresh || res.buffers[index].bytes);
+        if (kind == kTypedStore || kind == kAtomicAdd) {
+            res.buffers[index].written = true;
+            note_store(in);
+        }
+        res.buffer_at[cur_offset] = static_cast<std::uint32_t>(index);
+        buffer_sites.push_back({in.srsrc, index, sym_key(sym_of(in.srsrc)), sym_key(sym_of(in.srsrc + 1)), def_seq++, cur_block});
+        int va = in.vaddr;
+        Id first = cu(static_cast<std::uint32_t>(off / 4));
+        Id index_ok = 0, stride = 0, vindex = 0, voffset = 0, records = 0;
+        if (in.idxen) {
+            stride = params_u32(5, index);
+            Id& spec = cb_stride_spec[index];  // translate.h kCbStrideSpecId, as indexed_buffer_load reads it
+            if (!spec) spec = m.spec_const_u32(0, kCbStrideSpecId + static_cast<std::uint32_t>(index));
+            stride = sel(ine(spec, c_zero_u), spec, stride);
+            vindex = ld(vgpr_var(va++));
+            first = iadd(first, imul(vindex, shr(stride, cu(2))));
+            records = read_s(static_cast<std::uint16_t>(in.srsrc + 2), in);
+            index_ok = ult(vindex, records);
+        }
+        if (in.offen) {
+            voffset = ld(vgpr_var(va));
+            first = iadd(first, shr(voffset, cu(2)));
+        }
+        const Id bias = cb_bias(index);
+        const Id range_dw = in.idxen ? 0 : params_u32(5, index);
+        const auto ok_at = [&](Id at) { return in.idxen ? index_ok : ult(at, range_dw); };
+        const auto word_ptr = [&](Id at) { return m.access_chain(p_ssbo_u32, buffer_vars[index], {c_zero_u, iadd(bias, at)}); };
+        // A dword the element holds, 0 out of range (read in range: dword 0 of the element's binding).
+        const auto load_at = [&](Id at) {
+            const Id ok = ok_at(at);
+            return sel(ok, m.load(t_u32, word_ptr(sel(ok, at, c_zero_u))), c_zero_u);
+        };
+        switch (kind) {
+        case kTypedLoad: {
+            std::vector<Id> words;
+            for (int k = 0; k < (count + 0); ++k) words.push_back(load_at(iadd(first, cu(static_cast<std::uint32_t>(k)))));
+            const std::vector<Id> comps = format_decode(words, in.dfmt, in.nfmt, 4);
+            const int n = (in.op & 3) + 1;
+            if (tbuffer_dst_sel()) {
+                write_swizzled(in.vdata, n, comps, read_s(in.srsrc + 3, in), m.const_bool(in.nfmt == 4 || in.nfmt == 5));
+            } else {
+                for (int k = 0; k < n; ++k) write_v(in.vdata + k, k < count ? comps[static_cast<std::size_t>(k)] : c_zero_u);
+            }
+            break;
+        }
+        case kTypedStore: {
+            const int n = (in.op & 3) + 1;
+            std::vector<Id> vals;
+            for (int k = 0; k < n; ++k) vals.push_back(ld(vgpr_var(in.vdata + k)));
+            exec_guard([&] {
+                for (int k = 0; k < n && k < count; ++k) {
+                    const Id at = iadd(first, cu(static_cast<std::uint32_t>(k)));
+                    if_then(ok_at(at), [&] { m.store(word_ptr(at), vals[static_cast<std::size_t>(k)]); });
+                }
+            });
+            break;
+        }
+        case kFormatLoad: {
+            const Id w3 = read_s(in.srsrc + 3, in);
+            const Id dfmt = ubfe(w3, 15, 4), nfmt = ubfe(w3, 12, 3);
+            std::vector<Id> words;
+            if (in.idxen) {
+                // At an index: the element at byte offset12 + soffset + index
+                // * stride (+ the VGPR offset), its four dwords funnel-shifted
+                // out of the five of the binding under them - a stride that is
+                // not whole dwords too (BufferBinding::bytes). A dword past the
+                // V#'s records reads 0 (only the format's own bytes are kept).
+                Id at_byte = iadd(cu(static_cast<std::uint32_t>(off)), imul(vindex, stride));
+                if (in.offen) at_byte = iadd(at_byte, voffset);
+                const Id d0 = shr(at_byte, cu(2));
+                const Id sh = shl(iand(at_byte, cu(3)), cu(3));
+                const Id end_dw = shr(iadd(imul(records, stride), cu(3)), cu(2));
+                std::vector<Id> raw;
+                for (int k = 0; k < 5; ++k) {
+                    const Id at = iadd(d0, cu(static_cast<std::uint32_t>(k)));
+                    const Id ok = band(index_ok, ult(at, end_dw));
+                    raw.push_back(sel(ok, m.load(t_u32, word_ptr(sel(ok, at, c_zero_u))), c_zero_u));
+                }
+                const Id aligned = ieq(sh, c_zero_u);
+                const Id back = isub(cu(32), sh);
+                for (int k = 0; k < 4; ++k) words.push_back(sel(aligned, raw[k], ior(shr(raw[k], sh), shl(raw[k + 1], back))));
+            } else {
+                // The element's dwords by its format (32_32 and 16_16_16_16 two,
+                // 32_32_32 three, 32_32_32_32 four, the rest one); the reads past
+                // them stay on its last, as only its own components are kept.
+                const Id last = sel(bor(ieq(dfmt, cu(11)), ieq(dfmt, cu(12))), c_one_u, sel(ieq(dfmt, cu(13)), cu(2), sel(ieq(dfmt, cu(14)), cu(3), c_zero_u)));
+                for (int k = 0; k < 4; ++k) {
+                    const Id kk = k ? m.ext_inst(t_u32, spv::GlslUMin, {cu(static_cast<std::uint32_t>(k)), last}) : c_zero_u;
+                    words.push_back(load_at(iadd(first, kk)));
+                }
+            }
+            const std::vector<Id> comps = format_decode_dynamic(words, dfmt, nfmt, 4);
+            write_swizzled(in.vdata, static_cast<int>(in.op) + 1, comps, w3, bor(ieq(nfmt, cu(4)), ieq(nfmt, cu(5))));
+            break;
+        }
+        case kAtomicAdd: {
+            const Id val = ld(vgpr_var(in.vdata));
+            const Id result = m.local_variable(p_fn_u32, c_zero_u);
+            exec_guard([&] {
+                if_then(ok_at(first), [&] {
+                    m.store(result, m.emit(spv::OpAtomicIAdd, t_u32, {word_ptr(first), cu(spv::ScopeDevice), cu(spv::MsNone), val}));
+                });
+            });
+            if (in.glc) write_v(in.vdata, ld(result));
+            break;
+        }
+        case kNone:
+            break;
+        }
         return true;
     }
     // A static format's `want` components from the dwords holding one element.
@@ -2673,8 +3066,11 @@ struct Translator {
         const Id kind = iand(d, cu(7));
         const Id count = iand(shr(d, cu(4)), cu(7));
         const Id one = sel(bor(ieq(kind, cu(2)), ieq(kind, cu(4))), c_one_u, u(cf(1.0f)));
+        const Id packing = iand(shr(d, cu(12)), cu(3));  // VertexElement::packed: 1 bytes, 2 halves in the input's dwords
         for (std::uint32_t k = 0; k < el.count && k < 4; ++k) {
-            const Id c = extract(t_u32, raw, k);
+            const Id byte = ubfe(extract(t_u32, raw, 0), 8 * k, 8);
+            const Id half = ubfe(extract(t_u32, raw, k / 2), 16 * (k % 2), 16);
+            const Id c = sel(ieq(packing, c_one_u), byte, sel(ieq(packing, cu(2)), half, extract(t_u32, raw, k)));
             const Id unorm8 = u(fdiv(u2f(c), cf(255.0f)));
             const Id sint16 = ui(m.emit(spv::OpBitFieldSExtract, t_i32, {i(c), c_zero_u, cu(16)}));
             const Id converted = sel(ieq(kind, cu(3)), unorm8, sel(ieq(kind, cu(4)), sint16, c));  // kinds 1 and 2: the raw bits
@@ -2706,12 +3102,13 @@ struct Translator {
                 error("vertex input: unsupported buffer data format " + std::to_string(dfmt));
                 return;
             }
-            const bool packed = dfmt >= 6 && dfmt <= 9;
+            // A packed format, or components the host packed (VertexElement::packed): taken from the input's dwords.
+            const bool packed = (dfmt >= 6 && dfmt <= 9) || (el.packed && el.packed == vertex_packed_bits(dfmt));
             const Id one = nfmt == 4 || nfmt == 5 ? c_one_u : u(cf(1.0f));
             std::vector<Id> comps(4, c_zero_u);
             int bit = 0;
             for (int k = 0; k < count; ++k) {
-                const Id c = packed ? ubfe(extract(t_u32, raw, 0), bit, bits[k]) : extract(t_u32, raw, k);
+                const Id c = packed ? ubfe(extract(t_u32, raw, static_cast<std::uint32_t>(bit / 32)), bit % 32, bits[k]) : extract(t_u32, raw, k);
                 comps[k] = convert_component(c, bits[k], nfmt);
                 bit += bits[k];
             }
@@ -2724,10 +3121,14 @@ struct Translator {
     }
     // Dynamic format (from V#): supports the 32-bit and 16-bit families; others load raw dwords.
     std::vector<Id> format_load_dynamic(Id addr, Id dfmt, Id nfmt, int want) {
-        std::vector<Id> out;
         // Select stride/width by dfmt at runtime: handle 32, 32_32, 32_32_32, 32_32_32_32 (raw floats),
         // 16, 16_16, 16_16_16_16 (float16 or unorm), 8_8_8_8 (unorm) — common vertex/format cases.
-        const std::vector<Id> words = load_u32_any(addr, want);
+        return format_decode_dynamic(load_u32_any(addr, want), dfmt, nfmt, want);
+    }
+    // The components of one element from its first `want` dwords, by the
+    // run-time data and number format (format_load_dynamic's decode).
+    std::vector<Id> format_decode_dynamic(const std::vector<Id>& words, Id dfmt, Id nfmt, int want) {
+        std::vector<Id> out;
         const Id w0 = words[0];
         const Id w1 = want > 1 ? words[1] : w0;
         const Id w2 = want > 2 ? words[2] : w0;
@@ -2818,6 +3219,7 @@ struct Translator {
     }
     void mtbuf(const Inst& in) {
         const int n = (in.op & 3) + 1;
+        if (bound_compute_access(in)) return;
         if (in.op < 4) {
             // A typed load takes its format from the instruction and the
             // identity select, whatever the V#'s DST_SEL says (the Sea Islands
@@ -2827,6 +3229,7 @@ struct Translator {
             std::vector<Id> comps;
             if (!indexed_buffer_load(in, comps)) {
                 note_walk(mnemonic(in) + buffer_walk_form(in) + indexed_reject);
+                note_read(in.srsrc, false, 0);
                 comps = format_load(buffer_address(in).addr, in.dfmt, in.nfmt, 4);
             }
             if (tbuffer_dst_sel()) {
@@ -2996,7 +3399,7 @@ struct Translator {
                 const Id sw = ixor(ior(iand(in_group, and_mask), or_mask), xor_mask);
                 src_lane = ior(iand(l, cu(32)), sw);
             }
-            write_v(in.dst, m.emit(spv::OpGroupNonUniformShuffle, t_u32, {cu(spv::ScopeSubgroup), v, src_lane}));
+            write_v(in.dst, shuffle(v, src_lane));
             break;
         }
         case 61: case 62: {  // ds_consume / ds_append: counter at M0 base + offset
@@ -3017,7 +3420,7 @@ struct Translator {
             const Id below_hi = iand(bhi, sel(lt32, c_zero_u, isub(shl(c_one_u, isub(l, cu(32))), c_one_u)));
             const Id rank = iadd(popcnt(below_lo), popcnt(below_hi));
             const Id result = m.local_variable(p_fn_u32, c_zero_u);
-            Id first = m.emit(spv::OpGroupNonUniformElect, t_bool, {cu(spv::ScopeSubgroup)});
+            Id first = elect();
             // A counter past the buffer's end is left alone (0 comes back).
             if (lds_in_buffer) {
                 if (const Id ok = lds_buffer_at(base).second) first = band(first, ok);
@@ -3028,7 +3431,7 @@ struct Translator {
                 const Id r = m.emit(spv::OpAtomicIAdd, t_u32, {p, cu(spv::ScopeWorkgroup), cu(spv::MsNone), delta});
                 m.store(result, r);
             });
-            const Id broadcast = m.emit(spv::OpGroupNonUniformBroadcastFirst, t_u32, {cu(spv::ScopeSubgroup), ld(result)});
+            const Id broadcast = broadcast_first(ld(result));
             if (opt.gds_counters) {
                 write_v(in.dst, broadcast);  // GCN hands every lane the value from before; the shader adds its rank
             } else {
@@ -3042,8 +3445,10 @@ struct Translator {
     }
 
     // ds_append / ds_consume in GDS (TranslateOptions::gds_counters): the
-    // counter is the guest word the dispatch bound for the GDS dword at
-    // M0[15:0] + offset (M0[31:16] is the range's size). GCN adds or takes a
+    // counter is the word the dispatch bound for the GDS dword at M0[15:0] +
+    // offset (M0[31:16] is the range's size), by its device address - the
+    // host's, not the guest's: the word may live in a device-local copy of
+    // its buffer, which the page table does not reach. GCN adds or takes a
     // wave's active lanes at once and gives every lane the value from before;
     // here each subgroup does that with one atomic in the word, and the
     // shader's own v_mbcnt (over the same subgroup's lanes) makes each lane's
@@ -3067,13 +3472,13 @@ struct Translator {
         const Id hi = m.load(t_u32, m.access_chain(p_uni_u32, ubo_var, {cu(gds_member), shr(at, cu(2)), iand(iadd(at, c_one_u), cu(3))}));
         const Id bound = band(inside, ine(ior(lo, hi), c_zero_u));
         const Id result = m.local_variable(p_fn_u32, c_zero_u);
-        const Id first = m.emit(spv::OpGroupNonUniformElect, t_bool, {cu(spv::ScopeSubgroup)});
+        const Id first = elect();
         if_then(band(first, bound), [&] {
             const Id delta = in.op == 62 ? total : isub(c_zero_u, total);
-            const Id r = m.emit(spv::OpAtomicIAdd, t_u32, {guest_ptr(make_u64(lo, hi)), cu(spv::ScopeDevice), cu(spv::MsNone), delta});
+            const Id r = m.emit(spv::OpAtomicIAdd, t_u32, {host_ptr(make_u64(lo, hi)), cu(spv::ScopeDevice), cu(spv::MsNone), delta});
             m.store(result, r);
         });
-        write_v(in.dst, m.emit(spv::OpGroupNonUniformBroadcastFirst, t_u32, {cu(spv::ScopeSubgroup), ld(result)}));
+        write_v(in.dst, broadcast_first(ld(result)));
     }
 
     // ---- images
@@ -3098,9 +3503,25 @@ struct Translator {
             std::vector<Id> vals;
             for (const Id raw : raws) vals.push_back(img.kind == 1 ? raw : img.kind == 2 ? i(raw) : f(raw));
             const Id texel = img.kind ? m.emit(spv::OpCompositeConstruct, texel_type(img), vals) : vec4f(vals[0], vals[1], vals[2], vals[3]);
+            if (oob_base64) oob_image(img, dim, arrayed, coords, op == 9 ? i(ld(vgpr_var(in.vaddr + ncoord))) : 0, true, in);
+            // gcn::set_image_store_bounds: GCN writes nothing outside the
+            // image, so the lanes outside the view's size and layers skip it.
+            Id inside = 0;
+            if (image_store_bounds()) {
+                m.capability(spv::CapImageQuery);
+                const Id size = m.emit(spv::OpImageQuerySize, ncoord == 1 ? t_i32 : ncoord == 2 ? t_v2i : ncoord == 3 ? t_v3i : t_v4i, {load_image(img)});
+                for (int k = 0; k < ncoord; ++k) {
+                    const Id ok = ult(ui(coords[static_cast<std::size_t>(k)]), ui(ncoord == 1 ? size : extract(t_i32, size, static_cast<std::uint32_t>(k))));
+                    inside = inside ? band(inside, ok) : ok;
+                }
+            }
             exec_guard([&] {
                 const Id image = load_image(img);
-                m.emit_void(spv::OpImageWrite, {image, coord, texel});
+                if (inside) {
+                    if_then(inside, [&] { m.emit_void(spv::OpImageWrite, {image, coord, texel}); });
+                } else {
+                    m.emit_void(spv::OpImageWrite, {image, coord, texel});
+                }
             });
             return;
         }
@@ -3117,6 +3538,7 @@ struct Translator {
                 ops.push_back(spv::IoLod);
                 ops.push_back(i(ld(vgpr_var(in.vaddr + ncoord))));
             }
+            if (oob_base64) oob_image(img, dim, arrayed, coords, op == 1 ? ops.back() : 0, false, in);
             const Id texel = texel_as_v4f(img, m.emit(spv::OpImageFetch, texel_type(img), ops));
             write_texel(in, texel);
             return;
@@ -3342,8 +3764,7 @@ struct Translator {
 
     // ---- interpolation and export
     void vintrp(const Inst& in) {
-        const Id var = in_param(in.attr);
-        const Id v = m.load(t_v4f, var);
+        const Id v = in_value(in.attr);
         write_v(in.dst, u(extract(t_f32, v, in.attr_chan)));
     }
     void exp(const Inst& in) {
@@ -3411,7 +3832,7 @@ struct Translator {
                 return;
             }
             if (opt.debug_ps == 3) {
-                const Id uv = m.load(t_v4f, in_param(1));
+                const Id uv = in_value(1);
                 m.store(var, vec4f(extract(t_f32, uv, 0), extract(t_f32, uv, 1), cf(0.0f), cf(1.0f)));
                 return;
             }
@@ -3615,9 +4036,11 @@ struct Translator {
     void run() {
         m.capability(spv::CapShader);
         m.capability(spv::CapInt64);
-        m.capability(spv::CapGroupNonUniform);
-        m.capability(spv::CapGroupNonUniformBallot);
-        m.capability(spv::CapGroupNonUniformShuffle);
+        if (subgroups) {
+            m.capability(spv::CapGroupNonUniform);
+            m.capability(spv::CapGroupNonUniformBallot);
+            m.capability(spv::CapGroupNonUniformShuffle);
+        }
         m.capability(spv::CapPhysicalStorageBufferAddresses);
         m.extension("SPV_KHR_physical_storage_buffer");
         m.memory_model(5348 /* PhysicalStorageBuffer64 */, 1 /* GLSL450 */);
@@ -3761,7 +4184,7 @@ struct Translator {
         }
 
         // Built-in inputs
-        in_subgroup_lane = builtin_in(p_in_u32, spv::BiSubgroupLocalInvocationId, "lane_id");
+        if (subgroups) in_subgroup_lane = builtin_in(p_in_u32, spv::BiSubgroupLocalInvocationId, "lane_id");
         if (opt.stage == Stage::Vertex) {
             in_vertex_index = builtin_in(p_in_u32, spv::BiVertexIndex, "vertex_index");
             in_instance_index = builtin_in(p_in_u32, spv::BiInstanceIndex, "instance_index");
@@ -3865,10 +4288,19 @@ struct Translator {
             m.emit_void(spv::OpSelectionMerge, {l_on, 0u});
             m.emit_void(spv::OpBranchConditional, {out, l_kill, l_on});
             m.label(l_kill);
-            m.emit_void(spv::OpKill, {});
+            if (clip_demote()) {
+                // The cut-out pixel a helper of its quad, as the clipper leaves
+                // it, not ended: its quad's derivatives need it (gcn::set_clip_demote).
+                m.capability(spv::CapDemoteToHelperInvocation);
+                m.extension("SPV_EXT_demote_to_helper_invocation");
+                m.emit_void(spv::OpDemoteToHelperInvocation, {});
+                m.emit_void(spv::OpBranch, {l_on});
+            } else {
+                m.emit_void(spv::OpKill, {});
+            }
             m.label(l_on);
         }
-        m.store(v_lane, m.load(t_u32, in_subgroup_lane));
+        m.store(v_lane, subgroups ? m.load(t_u32, in_subgroup_lane) : c_zero_u);
         {
             Id lo, hi;
             ballot(m.const_bool(true), lo, hi);
@@ -3894,6 +4326,17 @@ struct Translator {
         }
         sym_user_data();
         Id lds_bytes = 0;
+        // gcn::set_oob_count: a vertex, pixel or compute stage with no LDS in a
+        // buffer finds the counters where a tessellation stage finds its LDS.
+        if (oob_count() && !lds_in_buffer && (opt.stage == Stage::Vertex || opt.stage == Stage::Pixel || opt.stage == Stage::Compute) &&
+            opt.tess_role == TranslateOptions::TessRole::None && opt.gs_role == TranslateOptions::GsRole::None) {
+            oob_base64 = m.load(t_u64, m.access_chain(p_uni_u64, ubo_var, {cu(1)}));  // StageParams::lds_address
+            std::uint32_t h = 2166136261u;  // the program's slot: FNV-1a of its words
+            for (const Inst& in : prog.insts) {
+                for (std::uint32_t k = 0; k < in.size && k < 3; ++k) h = (h ^ in.words[k]) * 16777619u;
+            }
+            res.oob_slot = h % kOobSlots;
+        }
         if (lds_in_buffer) {
             lds_base64 = m.load(t_u64, m.access_chain(p_uni_u64, ubo_var, {cu(1)}));  // StageParams::lds_address
             if (params_head_v4) {

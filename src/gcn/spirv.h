@@ -21,7 +21,7 @@ enum Op : std::uint16_t {
     OpTypeRuntimeArray = 29, OpTypeStruct = 30, OpTypePointer = 32, OpTypeFunction = 33,
     OpConstantTrue = 41, OpConstantFalse = 42, OpConstant = 43, OpConstantComposite = 44,
     OpConstantNull = 46, OpSpecConstant = 50, OpFunction = 54, OpFunctionParameter = 55, OpFunctionEnd = 56,
-    OpFunctionCall = 57, OpVariable = 59, OpLoad = 61, OpStore = 62, OpAccessChain = 65,
+    OpFunctionCall = 57, OpVariable = 59, OpLoad = 61, OpStore = 62, OpAccessChain = 65, OpArrayLength = 68,
     OpDecorate = 71, OpMemberDecorate = 72, OpVectorShuffle = 79, OpCompositeConstruct = 80,
     OpCompositeExtract = 81, OpCompositeInsert = 82, OpSampledImage = 86,
     OpImageSampleImplicitLod = 87, OpImageSampleExplicitLod = 88, OpImageSampleDrefImplicitLod = 89,
@@ -43,7 +43,7 @@ enum Op : std::uint16_t {
     OpShiftRightArithmetic = 195, OpShiftLeftLogical = 196, OpBitwiseOr = 197, OpBitwiseXor = 198,
     OpBitwiseAnd = 199, OpNot = 200, OpBitFieldInsert = 201, OpBitFieldSExtract = 202,
     OpBitFieldUExtract = 203, OpBitReverse = 204, OpBitCount = 205, OpDPdx = 207, OpDPdy = 208,
-    OpControlBarrier = 224, OpMemoryBarrier = 225, OpAtomicLoad = 227, OpAtomicStore = 228,
+    OpEmitVertex = 218, OpEndPrimitive = 219, OpControlBarrier = 224, OpMemoryBarrier = 225, OpAtomicLoad = 227, OpAtomicStore = 228,
     OpAtomicExchange = 229, OpAtomicCompareExchange = 230, OpAtomicIIncrement = 232,
     OpAtomicIDecrement = 233, OpAtomicIAdd = 234, OpAtomicISub = 235, OpAtomicSMin = 236,
     OpAtomicUMin = 237, OpAtomicSMax = 238, OpAtomicUMax = 239, OpAtomicAnd = 240, OpAtomicOr = 241,
@@ -74,7 +74,7 @@ enum Capability : std::uint32_t {
     CapImageCubeArray = 34, CapDemoteToHelperInvocation = 5379, CapPhysicalStorageBufferAddresses = 5347,
     CapTessellation = 3, CapSampledImageArrayDynamicIndexing = 29, CapStorageImageArrayDynamicIndexing = 31,
     CapRuntimeDescriptorArray = 5302, CapDenormPreserve = 4464, CapRoundingModeRTZ = 4468,
-    CapGroupNonUniformQuad = 68,
+    CapGroupNonUniformQuad = 68, CapGeometry = 2,
 };
 
 enum StorageClass : std::uint32_t {
@@ -99,7 +99,7 @@ enum BuiltIn : std::uint32_t {
 };
 
 enum ExecutionModel : std::uint32_t {
-    EmVertex = 0, EmTessellationControl = 1, EmTessellationEvaluation = 2, EmFragment = 4, EmGLCompute = 5,
+    EmVertex = 0, EmTessellationControl = 1, EmTessellationEvaluation = 2, EmGeometry = 3, EmFragment = 4, EmGLCompute = 5,
 };
 enum ExecutionMode : std::uint32_t {
     ExOriginUpperLeft = 7, ExEarlyFragmentTests = 9, ExDepthReplacing = 12, ExLocalSize = 17,
@@ -107,10 +107,14 @@ enum ExecutionMode : std::uint32_t {
     ExSpacingEqual = 1, ExSpacingFractionalEven = 2, ExSpacingFractionalOdd = 3,
     ExVertexOrderCw = 4, ExVertexOrderCcw = 5, ExPointMode = 27,
     ExTriangles = 22, ExQuads = 24, ExIsolines = 25, ExOutputVertices = 26,
+    // Geometry: the input primitive, the output strip type and the invocations a primitive.
+    // (OutputPoints is 27, which ExPointMode above holds: a GS that emits points is not lifted.)
+    ExInvocations = 0, ExInputPoints = 19, ExInputLines = 20, ExOutputLineStrip = 28, ExOutputTriangleStrip = 29,
     // SPIR-V 1.4 float controls: operand the bit width they apply to.
     ExDenormPreserve = 4459, ExRoundingModeRTZ = 4463,
 };
 enum Scope : std::uint32_t { ScopeDevice = 1, ScopeWorkgroup = 2, ScopeSubgroup = 3, ScopeInvocation = 4 };
+enum GroupOperation : std::uint32_t { GroupOperationReduce = 0, GroupOperationInclusiveScan = 1, GroupOperationExclusiveScan = 2 };
 enum MemorySemantics : std::uint32_t {
     MsNone = 0, MsAcquire = 2, MsRelease = 4, MsAcquireRelease = 8, MsUniformMemory = 0x40,
     MsWorkgroupMemory = 0x100, MsImageMemory = 0x800,

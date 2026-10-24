@@ -25,7 +25,7 @@ struct HostConfig {
     std::string p2p_addr;      // online.p2p_addr: the address other players reach this host at (default 127.0.0.1)
     std::string stun_server;   // online.stun_server: "host[:port]" the P2P port asks for its reflexive address; "" = the server's host on 3478, "off" = never
     int p2p_port = 9307;       // online.p2p_port: this host's P2P UDP port; two instances on one machine differ here
-    int playlog_upload_seconds = 5;   // online.playlog_upload_seconds: how often the game sends its play log (the game's own: 300; 0 keeps it)
+    int playlog_upload_seconds = 30;  // online.playlog_upload_seconds / BBHOST_PLAYLOG_UPLOAD_SECONDS: how often the game sends its play log (the game's own: 300; 0 keeps it)
     int playlog_sample_ms = 500;      // online.playlog_sample_ms: how often it logs the player's position (the game's own: 1500; 0 keeps it)
     int sign_timeout_seconds = 30;    // online.sign_timeout_seconds: how long a sign being answered may take (the game's own: 180; 0 keeps it)
     // [update] (host/updater.h): whether to look for a newer release at start
@@ -42,6 +42,7 @@ struct HostConfig {
     std::string resolution;    // video.resolution: the Resolution setting's default entry ("1280x800"); F10's file has the last word
     std::string window_mode;   // video.window_mode: the Window mode setting's default ("Windowed" or "Fullscreen")
     std::string model_detail;  // video.model_detail: the Model detail setting's default ("Full", "Normal", "Low", "Lowest")
+    std::string shaders;       // video.shaders: the Shaders setting's default ("HLSL" or "Lifted")
     int vblank_hz = 0;         // video.vblank_hz: the flip clock's rate; 0 = the display's own
     bool headless = false;     // video.headless / --headless / BBHOST_HEADLESS=1
     bool skip_intro = false;   // startup.skip_intro / BBHOST_SKIP_INTRO=0|1: the three company logos only
@@ -76,6 +77,10 @@ struct HostConfig {
     // is true, a build from source's false (its harnesses never stop there);
     // BBHOST_SETUP_WINDOW=0|1 overrides.
     bool setup_always = false;
+    // debug.tooling / BBHOST_TOOLING=0|1 (the setup window's Game tab): the
+    // periodic reports and the instrumentation behind them (log.h,
+    // host_tooling). Off, a run logs its start, warnings and errors only.
+    bool tooling = true;
 };
 
 // Parse argv (--config, --app0, --data, --eboot, first positional = eboot),
@@ -101,7 +106,14 @@ void config_set_skip_intro(bool on);
 //       and network password boxes as they opened; a file that still has it
 //       is rewritten to "type", the default (BBHOST_IME=auto keeps a
 //       harness's).
-constexpr int kUserConfigVersion = 4;
+//   5 - online.playlog_upload_seconds went from 5 to 30, as the server asks
+//       (every upload is a file it keeps). bbhost.example.toml set the old 5,
+//       so a 5 in a file below this version is that copy, not a choice: the
+//       per-user file is rewritten to 30, and in any other file (a
+//       bbhost.toml beside the exe, --config) it is set aside, the default
+//       standing. Any other value is the player's and stays, and so does a 5
+//       from this version on (BBHOST_PLAYLOG_UPLOAD_SECONDS=5 for a harness).
+constexpr int kUserConfigVersion = 5;
 // The game folder and its update. The PS4 applies an update by putting its
 // files in place of the game's; a dump can keep the update in a folder of its
 // own beside the game's, named after it with "-UPDATE" or "-patch" appended
@@ -162,6 +174,15 @@ std::string config_user_dir();
 std::string config_exe_dir();
 // A raw value from the loaded config file by "section.key" (quotes stripped), "" when absent.
 std::string config_value(const std::string& key);
+// The effects' steps above 30 fps as asked for: BBHOST_SFX_STEP, else [video]
+// effect_steps, else "smooth" (the default). The frame rate code reads 30,
+// smooth, 60 and frame (engine/frame_rate.cpp).
+std::string config_effect_steps();
+// The effects' emission clock as asked for: BBHOST_SFX_EMISSION, else [video]
+// effect_emission, else "60" (the default): "60" for emission events at 60 a
+// second at every frame rate, "30" for the game's one an update
+// (decomp/sfx/node_emit.cpp, engine/frame_rate.cpp).
+std::string config_effect_emission();
 // Changes a loaded value in memory (raw, as config_set_values writes it): a
 // setting changed while running (the plugin menu), so config_value agrees
 // with the file just written. Main thread.

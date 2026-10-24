@@ -22,7 +22,11 @@
 #include <string>
 #include <vector>
 
+#include <unistd.h>
+
 std::uint32_t host_thread_id() { return 1; }
+void host_thread_set_name(const char*) {}
+void host_thread_background() {}
 
 using namespace gpu;
 
@@ -54,7 +58,8 @@ bool same(const gcn::TranslateResult& a, const gcn::TranslateResult& b) {
         a.buffers.size() != b.buffers.size() || a.image_at != b.image_at || a.sampler_at != b.sampler_at || a.buffer_at != b.buffer_at ||
         a.errors != b.errors || a.lds_bytes != b.lds_bytes || a.store_buffers.size() != b.store_buffers.size() ||
         a.untraced_stores != b.untraced_stores || a.unnormalized_samples != b.unnormalized_samples || a.walks != b.walks ||
-        a.vs_params != b.vs_params || a.ps_inputs != b.ps_inputs || a.vs_clip_count != b.vs_clip_count || a.vs_point_size != b.vs_point_size) {
+        a.vs_params != b.vs_params || a.ps_inputs != b.ps_inputs || a.vs_clip_count != b.vs_clip_count || a.vs_point_size != b.vs_point_size ||
+        a.oob_slot != b.oob_slot) {
         return false;
     }
     for (std::size_t i = 0; i < a.images.size(); ++i) {
@@ -123,6 +128,8 @@ void run_start(const std::vector<Case>& cases, const std::vector<gcn::TranslateR
 }  // namespace
 
 int main(int argc, char** argv) {
+    // The cache alone: the HLSL path's entries are hlsl_default_test's.
+    setenv("BBHOST_HLSL", "0", 1);
     std::vector<std::string> bundles;
     for (int a = 1; a < argc; ++a) bundles.emplace_back(argv[a]);
     if (bundles.empty()) {
@@ -216,8 +223,16 @@ int main(int argc, char** argv) {
     for (const Case& c : cases) lift_cases += c.lift_ps;
     std::printf("%zu shaders (of %zu), %zu pixel shaders lifted of %zu\n", cases.size(), all.size(), lifted, lift_cases);
 
-    // 2. A first start fills the file, a second takes everything from it.
-    const std::string path = (std::filesystem::temp_directory_path() / "bbhost-translation-cache-test.bin").generic_string();
+    // 2. A first start fills the file, a second takes everything from it. The
+    // file is this process's own (two test runs at once, from two build
+    // folders, would load what the other saved), and it goes at any exit, a
+    // CHECK's std::exit too.
+    static const std::string path =
+        (std::filesystem::temp_directory_path() / ("bbhost-translation-cache-test-" + std::to_string(getpid()) + ".bin")).generic_string();
+    std::atexit([] {
+        std::error_code gone;
+        std::filesystem::remove(path, gone);
+    });
     std::error_code ec;
     std::filesystem::remove(path, ec);
     const std::uint64_t entries = cases.size() * 2 + lift_cases;
@@ -270,6 +285,40 @@ int main(int argc, char** argv) {
     }
     gcn::set_runtime_sample_offsets(!gcn::runtime_sample_offsets());
 
+    // 3b. The typed loads' index check (gcn::set_index_bounds) is in the key of
+    // the programs that hold such a load (gcn::indexed_typed_load), and of no
+    // other: turned on, those translate again - as the translator makes them
+    // now - and every other program is still taken from the file.
+    {
+        gcn::set_index_bounds(true);
+        reset_cache();
+        translation_cache_load(path);
+        std::size_t indexed = 0, by_kind[3] = {}, changed = 0, changed_kind[3] = {};
+        for (std::size_t i = 0; i < cases.size(); ++i) {
+            const Case& c = cases[i];
+            bool has = false;
+            for (const gcn::Inst& in : c.prog.insts) has = has || gcn::indexed_typed_load(in);
+            const std::uint64_t misses = g_tc.misses.load();
+            const gcn::TranslateResult t = translate_cached(c.prog, c.o);
+            CHECK(same(t, gcn::translate(c.prog, c.o)));
+            CHECK((g_tc.misses.load() != misses) == has);
+            const int kind = c.o.stage == gcn::Stage::Vertex ? 0 : c.o.stage == gcn::Stage::Pixel ? 1 : 2;
+            if (has) {
+                ++indexed;
+                ++by_kind[kind];
+            }
+            // Its module changed: a load the bound path takes (indexed_buffer_load), not a walk.
+            if (t.spirv != fresh[i].spirv) {
+                ++changed;
+                ++changed_kind[kind];
+            }
+        }
+        gcn::set_index_bounds(false);
+        std::printf("index bounds: %zu of %zu programs hold a typed load by index (vertex %zu, pixel %zu, compute %zu): their keys "
+                    "moved, no other's; %zu modules changed (vertex %zu, pixel %zu, compute %zu)\n", indexed, cases.size(), by_kind[0],
+                    by_kind[1], by_kind[2], changed, changed_kind[0], changed_kind[1], changed_kind[2]);
+    }
+
     // 4. A damaged entry is translated again, and left out of the next write.
     {
         std::vector<std::uint8_t> bytes;
@@ -313,7 +362,6 @@ int main(int argc, char** argv) {
         run_start(cases, fresh, lifts);
         CHECK(g_tc.hits.load() == 0 && g_tc.misses.load() == cases.size() * 2);
     }
-    std::filesystem::remove(path, ec);
     if (g_failures) {
         std::fprintf(stderr, "%d failures\n", g_failures);
         return 1;

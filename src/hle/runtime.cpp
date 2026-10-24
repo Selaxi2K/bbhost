@@ -35,6 +35,7 @@
 #include "engine/lua_events.h"
 #include "engine/params.h"
 #include "engine/patch_manifest.h"
+#include "host/plugins.h"
 #include "log.h"
 
 #include <atomic>
@@ -185,6 +186,12 @@ void hle_set_guest_stack(void* base, std::size_t size) {
     g_boot_stack_base = reinterpret_cast<std::uintptr_t>(base);
     g_boot_stack_size = size;
     host_log("guest boot stack %p size=0x%zx", base, size);
+}
+
+bool hle_guest_boot_stack(std::uint64_t* lo, std::uint64_t* hi) {
+    *lo = g_boot_stack_base;
+    *hi = g_boot_stack_base + g_boot_stack_size;
+    return g_boot_stack_size != 0;
 }
 
 void* hle_thread_enter_guest() { return guest_thread_enter(); }
@@ -344,6 +351,9 @@ void hle_patch_guest(ElfImage* image) {
         return;
     }
     patch_manifests_apply(image);  // patches/*.toml: skip-intro, fov-uncap, a mod's own
+    // The session's online rules are final now - the plugins loaded before the
+    // eboot, the manifests just applied: plugins_ruleset says them in the log.
+    plugins_ruleset();
     constexpr std::uint64_t kDlPanicElf = 0x20b55b0;
     const std::uint64_t va = image->mem.slide + kDlPanicElf;
     if (va < image->mem.slide || va + 16 > image->mem.slide + image->mem.size) {
@@ -411,6 +421,9 @@ void hle_patch_guest(ElfImage* image) {
     // The game's functions as our source, in its place (decomp/, docs/decomp.md).
     decomp_add_areas();
     decomp_install(image);
+    // After the list: GX's CreateBuffer tells the registry itself when it is
+    // ours, else it is hooked (engine/gx_resources.h).
+    gx_resources_install_late(image);
     // After the list: the mouse turns our follow camera when it is in place,
     // else the game's by hooks (engine/mouse_camera.h).
     mouse_camera_install(image);

@@ -246,6 +246,8 @@ constexpr std::uint32_t kGfxChromaticAberration = 117003;
 constexpr std::uint32_t kGfxResolution = 117004;
 constexpr std::uint32_t kGfxMotionBlur = 117005;
 constexpr std::uint32_t kGfxShadowDistance = 117006, kGfxAoStrength = 117007, kGfxFog = 117008;
+// HLSL Shaders (the Shaders setting: HLSL or Lifted), read at the next start.
+constexpr std::uint32_t kGfxShaders = 117009;
 constexpr std::uint32_t kFxBloom = 120000, kFxVignette = 120001, kFxSaturation = 120002;
 constexpr std::uint32_t kRowFrameCap = 116005;
 // The section title, StaticText_116020 in the generated movie.
@@ -487,6 +489,10 @@ struct Toggle {
     std::uint32_t id;   // its label and line help, in the port's own block
     std::uint8_t value;
     std::uint8_t last;  // what was pushed, so a poll acts only on a change
+    // The row's On is the setting's first value rather than its "on" - HLSL
+    // Shaders' On is the Shaders setting's HLSL, whose second value, Lifted,
+    // is what host_opt_get reads as on.
+    bool invert = false;
 };
 // PC Settings. The two pointer rows it had moved to PC Controls, beside the
 // rest of the mouse.
@@ -508,11 +514,13 @@ struct Slider {
 };
 
 // PC Graphics: the scene - anti-aliasing, ambient occlusion and its strength
-// (engine/graphics_patch.h), how far shadows reach, how thick the fog is, and
-// the resolution.
+// (engine/graphics_patch.h), the shaders' form (HLSL Shaders, read at the next
+// start: host/translation_cache.h), how far shadows reach, how thick the fog
+// is, and the resolution.
 Toggle g_graphics[] = {
     {"anti_alias", kGfxAntiAlias, 1, 0xff},
     {"ssao", kGfxSsao, 1, 0xff},
+    {"shaders", kGfxShaders, 1, 0xff, true},
 };
 constexpr int kGraphicsCount = static_cast<int>(sizeof(g_graphics) / sizeof(g_graphics[0]));
 // 5 is the area's own occlusion, 0 none, 10 twice as dark.
@@ -556,14 +564,19 @@ std::int32_t g_frame_cap = 30;
 
 // The render resolution, as the index into the setting's own list of names -
 // the row stores an int32 and the host owns what each one means, so the two
-// front ends cannot disagree about the order. Six 16:9 entries, then the
-// ultrawide ones and the Steam Deck's 16:10 (the pick list scrolls past six).
+// front ends cannot disagree about the order. The setting's order (host/
+// options.cpp): by size within each shape, 16:9, 16:10, 4:3, 21:9, 32:9 (the
+// pick list scrolls past six). Each entry's text is its size's message, which
+// keeps its id whatever its place.
 const Choice kResolutions[] = {
-    {0, 117010}, {1, 117011}, {2, 117012}, {3, 117013}, {4, 117014}, {5, 117015},
-    {6, 117030}, {7, 117031}, {8, 117032}, {9, 117033}, {10, 117034}, {11, 117035},
-    {12, 117036}, {13, 117037},
+    {0, 117038},  {1, 117039},  {2, 117010},  {3, 117040},  {4, 117011},  {5, 117012},   // 640x360 .. 1920x1080
+    {6, 117013},  {7, 117041},  {8, 117014},  {9, 117015},                              // 2560x1440 .. 3840x2160
+    {10, 117036}, {11, 117037}, {12, 117035}, {13, 117042}, {14, 117043},               // 16:10
+    {15, 117044}, {16, 117045},                                                         // 4:3
+    {17, 117030}, {18, 117031}, {19, 117032},                                           // 21:9
+    {20, 117033}, {21, 117034},                                                         // 32:9
 };
-std::int32_t g_resolution = 2;
+std::int32_t g_resolution = 5;
 std::int32_t g_last_resolution = -1;
 std::int32_t g_last_frame_cap = -1;
 bool g_seeded = false;
@@ -636,12 +649,12 @@ void seed_deck() {
 // changed it since - so each section seeds its values when it opens, and the
 // poll then pushes only what the player changes.
 void seed(Toggle& t) {
-    t.value = host_opt_get(t.key) ? 1 : 0;
+    t.value = host_opt_get(t.key) != t.invert ? 1 : 0;
     t.last = t.value;
 }
 
 // What the row's Defaults restores: the setting as it ships.
-std::uint8_t default_of(const Toggle& t) { return host_opt_default_get(t.key) ? 1 : 0; }
+std::uint8_t default_of(const Toggle& t) { return host_opt_default_get(t.key) != t.invert ? 1 : 0; }
 
 void seed(Slider& s) {
     const int i = host_opt_index(s.key);
@@ -662,7 +675,7 @@ void push(Slider& s) {
 void push(Toggle& t) {
     if (t.value == t.last) return;
     t.last = t.value;
-    host_opt_set(t.key, t.value != 0);
+    host_opt_set(t.key, (t.value != 0) != t.invert);
     host_log("pc-options: %s %s from the System menu", t.key, t.value ? "on" : "off");
 }
 
@@ -689,11 +702,14 @@ void seed_controls() {
 // above the key guide. The Defaults row has a slot of its own besides these:
 // the donor's label slot (char 100), right after the section's last row.
 constexpr int kSectionSlots = 6, kKeysSlots = 8;
+// PC Graphics has one slot more (its seventh row, HLSL Shaders): the generator
+// adds it as it adds Key Bindings' two, and moves the Defaults label below it.
+constexpr int kGraphicsSlots = 7;
 
 // The port's rows: its toggles plus the frame-cap pick list, and in the
 // graphics section its toggles plus the resolution list.
 constexpr int kRowCount = kToggleCount + 1;
-static_assert(kRowCount <= kSectionSlots && kGraphicsRows <= kSectionSlots && kControlsRows <= kSectionSlots &&
+static_assert(kRowCount <= kSectionSlots && kGraphicsRows <= kGraphicsSlots && kControlsRows <= kSectionSlots &&
                   kCameraRows <= kSectionSlots && kDeckRows <= kSectionSlots && kEnhanceRows <= kSectionSlots &&
                   kEffectsRows <= kSectionSlots && 1 + kBindPerPage <= kKeysSlots,
               "more rows than the section sprite has slots: the extra ones have nowhere to draw. "
@@ -1730,6 +1746,10 @@ bool overlay_has(const char* rel) {
     return false;
 }
 
+// Game list updates so far (option_menu_list_update: every list on screen,
+// every frame): the rows' bytes below can only change while some list updates.
+std::atomic<std::uint64_t> g_list_updates{0};
+
 bool overlay_has_messages() {
     for (const char* lang : kMessageLanguages) {
         const std::string rel = std::string("/dvdroot_ps4/msg/") + lang + "/menu.msgbnd.dcx";
@@ -1775,6 +1795,23 @@ void option_menu_poll() {
         g_frame_cap = host_opt_frame_cap();
         g_last_frame_cap = g_frame_cap;
         return;
+    }
+    // A row's byte is written by the game's list update as the player moves
+    // in a menu, so the rows are looked at while a menu is up - its lists
+    // update every frame - and for two seconds after the last update, which
+    // takes a change made as the menu closed; a game being played without a
+    // menu is not asked every pump whether a row moved.
+    {
+        static std::uint64_t seen = ~0ull;
+        static std::chrono::steady_clock::time_point until{};
+        const auto now = std::chrono::steady_clock::now();
+        const std::uint64_t updates = g_list_updates.load(std::memory_order_relaxed);
+        if (updates != seen) {
+            seen = updates;
+            until = now + std::chrono::seconds(2);
+        } else if (now > until) {
+            return;
+        }
     }
     if (g_resolution != g_last_resolution) {
         g_last_resolution = g_resolution;
@@ -1864,6 +1901,7 @@ void option_menu_list_update(void* comp, bool focused) {
     if (!g_installed) {
         return;
     }
+    g_list_updates.fetch_add(1, std::memory_order_relaxed);  // a menu is up (option_menu_poll)
     confirm_update();
     auto* c = static_cast<std::uint8_t*>(comp);
     defaults_view_update(c, focused);
