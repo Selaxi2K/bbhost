@@ -38,7 +38,8 @@ auth_server = "https://thehuntersdream.com"
 # site's map, deaths and profiles come from it. The game's own is 300 (and
 # what is left at quitting is lost); 0 keeps that. An upload is a few KB and
 # goes out on a worker thread (measured: 0.7-3.6 KB, the game never waits).
-playlog_upload_seconds = 5
+# The server keeps every upload as a file and asks for 30 s or more.
+playlog_upload_seconds = 30
 # How often, in milliseconds, the game logs the player's position into it
 # (the live map plays these back as walking). The game's own is 1500; 0 keeps it.
 playlog_sample_ms = 500

@@ -49,9 +49,10 @@ is the in-game online name. F10 has the same account screen in game.
   Frontier, The Old Hunters' areas) take two invaders, as the chalice
   dungeons do. A PC enhancement, on by default; switch it off for the game
   as it shipped.
-- **Faster play-log uploads**: the game sends its play log every few seconds
+- **Faster play-log uploads**: the game sends its play log every 30 seconds
   instead of every five minutes, so the server's map and profiles stay
-  current (`online.playlog_upload_seconds`).
+  current (`online.playlog_upload_seconds`; the server asks for no less than
+  30).
 - **Shorter summon timeouts**: a summon sign that cannot be answered gives up
   after 30 seconds instead of three minutes (`online.sign_timeout_seconds`).
 - **Modded worlds stay apart**: sessions with gameplay plugins (the

@@ -25,7 +25,7 @@ struct HostConfig {
     std::string p2p_addr;      // online.p2p_addr: the address other players reach this host at (default 127.0.0.1)
     std::string stun_server;   // online.stun_server: "host[:port]" the P2P port asks for its reflexive address; "" = the server's host on 3478, "off" = never
     int p2p_port = 9307;       // online.p2p_port: this host's P2P UDP port; two instances on one machine differ here
-    int playlog_upload_seconds = 5;   // online.playlog_upload_seconds: how often the game sends its play log (the game's own: 300; 0 keeps it)
+    int playlog_upload_seconds = 30;  // online.playlog_upload_seconds / BBHOST_PLAYLOG_UPLOAD_SECONDS: how often the game sends its play log (the game's own: 300; 0 keeps it)
     int playlog_sample_ms = 500;      // online.playlog_sample_ms: how often it logs the player's position (the game's own: 1500; 0 keeps it)
     int sign_timeout_seconds = 30;    // online.sign_timeout_seconds: how long a sign being answered may take (the game's own: 180; 0 keeps it)
     // [update] (host/updater.h): whether to look for a newer release at start
@@ -106,7 +106,14 @@ void config_set_skip_intro(bool on);
 //       and network password boxes as they opened; a file that still has it
 //       is rewritten to "type", the default (BBHOST_IME=auto keeps a
 //       harness's).
-constexpr int kUserConfigVersion = 4;
+//   5 - online.playlog_upload_seconds went from 5 to 30, as the server asks
+//       (every upload is a file it keeps). bbhost.example.toml set the old 5,
+//       so a 5 in a file below this version is that copy, not a choice: the
+//       per-user file is rewritten to 30, and in any other file (a
+//       bbhost.toml beside the exe, --config) it is set aside, the default
+//       standing. Any other value is the player's and stays, and so does a 5
+//       from this version on (BBHOST_PLAYLOG_UPLOAD_SECONDS=5 for a harness).
+constexpr int kUserConfigVersion = 5;
 // The game folder and its update. The PS4 applies an update by putting its
 // files in place of the game's; a dump can keep the update in a folder of its
 // own beside the game's, named after it with "-UPDATE" or "-patch" appended

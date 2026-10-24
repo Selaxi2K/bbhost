@@ -556,6 +556,7 @@ if(UNIX)
   add_test(NAME image_file_test COMMAND image_file_test)
   add_executable(config_test tests/config_test.cpp src/core/config.cpp src/core/sfo.cpp)
   target_include_directories(config_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
+  target_compile_definitions(config_test PRIVATE CONFIG_MUTANTS)  # the play-log migration's mutants
   add_dependencies(config_test bbhost_version)
   add_test(NAME config_test COMMAND config_test)
   # The session's online rules: a gameplay patch manifest makes them say modded.

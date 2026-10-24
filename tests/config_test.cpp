@@ -1,7 +1,8 @@
 // core/config.cpp: a per-user bbhost.toml as older releases left it, loaded
 // by this one - notes after quoted values, the live server's move to https,
-// and servers of the player's own left as they are. And the game folder with
-// its update in a folder of its own beside it, as shadPS4 keeps one.
+// the play log's move from 5 s to 30 (with its mutants), and servers of the
+// player's own left as they are. And the game folder with its update in a
+// folder of its own beside it, as shadPS4 keeps one.
 #include "core/config.h"
 
 #include <cstdint>
@@ -85,7 +86,105 @@ bool is_live_https(const HostConfig& c) {
            c.online_require_account && c.auth_server == "https://thehuntersdream.com";
 }
 
+// The play-log period's move from 5 s to 30 (config_version 5), with checks
+// of their own so its mutants can run quietly.
+int g_pl_fail = 0;
+bool g_pl_quiet = false;
+void pl_check(bool ok, const char* what) {
+    if (!ok) {
+        ++g_pl_fail;
+        if (!g_pl_quiet) std::printf("FAIL: play log: %s\n", what);
+    }
+}
+
+// Loads with the per-user file `user`, a bbhost.toml in the working directory
+// (`local`, none when empty) and a --config file (`profile`, none when empty).
+HostConfig load_layers(const std::string& user, const std::string& local, const std::string& profile) {
+    {
+        std::ofstream out(g_dir / "config" / "bbhost.toml", std::ios::trunc);
+        out << user;
+    }
+    const fs::path local_file = g_dir / "work" / "bbhost.toml", profile_file = g_dir / "profile.toml";
+    std::error_code ec;
+    fs::remove(local_file, ec);
+    if (!local.empty()) std::ofstream(local_file, std::ios::trunc) << local;
+    if (!profile.empty()) std::ofstream(profile_file, std::ios::trunc) << profile;
+    std::string arg_config = "--config=" + profile_file.string();
+    char arg0[] = "config_test";
+    char* argv[] = {arg0, arg_config.data(), nullptr};
+    HostConfig c;
+    std::string err;
+    const bool ok = config_load(profile.empty() ? 1 : 2, argv, &c, &err);
+    pl_check(ok, "the config loads");
+    fs::remove(local_file, ec);
+    return c;
+}
+
+int playlog_migration() {
+    g_pl_fail = 0;
+    const fs::path user = g_dir / "config" / "bbhost.toml";
+    // The old example's 5, copied into the per-user file (no version: an
+    // older bbhost's): rewritten to 30, the rest of the file as it was.
+    HostConfig c = load_layers("[online]\n# How often, in seconds\nplaylog_upload_seconds = 5\nplaylog_sample_ms = 500\n", "", "");
+    pl_check(c.playlog_upload_seconds == 30, "a copied 5 reads as 30");
+    std::string f = read(user);
+    pl_check(f.find("playlog_upload_seconds = 30") != std::string::npos && f.find("playlog_upload_seconds = 5") == std::string::npos,
+             "the per-user file is rewritten to 30");
+    pl_check(f.find("# How often, in seconds") != std::string::npos && f.find("playlog_sample_ms = 500") != std::string::npos,
+             "the rest of the file as it was");
+    // Loaded again, nothing changes: the rewrite (and its log line) was once.
+    c = load_layers(f, "", "");
+    pl_check(c.playlog_upload_seconds == 30 && read(user) == f, "a second start finds nothing to move");
+    // The setup window's save writes the version: what it finds then is 30.
+    pl_check(config_set_values(user.string(), {{"bbhost", "config_version", "5"}}), "the setup window's save");
+    c = load_layers(read(user), "", "");
+    pl_check(c.playlog_upload_seconds == 30, "after the setup window's save: still 30");
+    // Saved by an older setup window (version 4): the same.
+    c = load_layers("[online]\nplaylog_upload_seconds = 5\n\n[bbhost]\nconfig_version = 4\n", "", "");
+    pl_check(c.playlog_upload_seconds == 30 && read(user).find("playlog_upload_seconds = 30") != std::string::npos,
+             "a 5 at config_version 4 is moved too");
+    // From version 5 on a 5 is the player's own.
+    c = load_layers("[online]\nplaylog_upload_seconds = 5\n\n[bbhost]\nconfig_version = 5\n", "", "");
+    pl_check(c.playlog_upload_seconds == 5 && read(user).find("playlog_upload_seconds = 5") != std::string::npos,
+             "a 5 at config_version 5 stays");
+    // Any other value is the player's at any version, the file untouched.
+    for (const char* v : {"10", "60", "0", "300"}) {
+        const std::string text = std::string("[online]\nhost = \"192.168.1.50\"\nscheme = \"http\"\nplaylog_upload_seconds = ") + v + "\n";
+        c = load_layers(text, "", "");
+        pl_check(c.playlog_upload_seconds == std::atoi(v) && read(user) == text, "another value stays, the file untouched");
+    }
+    // No key: the new default.
+    c = load_layers("[online]\nhost = \"192.168.1.50\"\n", "", "");
+    pl_check(c.playlog_upload_seconds == 30, "the default is 30");
+    // The example copied beside the exe or in the working directory: set
+    // aside (the default stands), that file left as it is.
+    c = load_layers("[online]\nhost = \"192.168.1.50\"\n", "[online]\nplaylog_upload_seconds = 5\n", "");
+    pl_check(c.playlog_upload_seconds == 30, "a 5 in a bbhost.toml beside the per-user one is set aside");
+    c = load_layers("[online]\nhost = \"192.168.1.50\"\n", "[online]\nplaylog_upload_seconds = 15\n", "");
+    pl_check(c.playlog_upload_seconds == 15, "a 15 there stays");
+    // ... and in a --config profile, unless the profile says version 5.
+    c = load_layers("[online]\nhost = \"192.168.1.50\"\n", "", "[online]\nplaylog_upload_seconds = 5\n");
+    pl_check(c.playlog_upload_seconds == 30, "a 5 in a --config file is set aside");
+    pl_check(read(g_dir / "profile.toml").find("playlog_upload_seconds = 5") != std::string::npos, "the --config file left as it was");
+    c = load_layers("[online]\nhost = \"192.168.1.50\"\n", "",
+                    "[online]\nplaylog_upload_seconds = 5\n\n[bbhost]\nconfig_version = 5\n");
+    pl_check(c.playlog_upload_seconds == 5, "a 5 in a --config file at version 5 stays");
+    // A harness keeps its own whatever the files say.
+    setenv("BBHOST_PLAYLOG_UPLOAD_SECONDS", "5", 1);
+    c = load_layers("[online]\nplaylog_upload_seconds = 5\n", "", "");
+    pl_check(c.playlog_upload_seconds == 5, "BBHOST_PLAYLOG_UPLOAD_SECONDS=5 wins");
+    setenv("BBHOST_PLAYLOG_UPLOAD_SECONDS", "0", 1);
+    c = load_layers("[online]\nplaylog_upload_seconds = 30\n", "", "");
+    pl_check(c.playlog_upload_seconds == 0, "BBHOST_PLAYLOG_UPLOAD_SECONDS=0 keeps the game's own");
+    unsetenv("BBHOST_PLAYLOG_UPLOAD_SECONDS");
+    std::error_code ec;
+    fs::remove(g_dir / "profile.toml", ec);
+    return g_pl_fail;
+}
+
 }  // namespace
+
+extern int g_config_mutant;  // core/config.cpp, built with CONFIG_MUTANTS here
 
 int main() {
     char tmpl[] = "/tmp/bbhost-config-test-XXXXXX";
@@ -251,6 +350,25 @@ int main() {
         c = load("[paths]\napp0 = \"" + base + "\"\neboot = \"" + base + "/eboot.bin\"\n");
         CHECK(c.eboot == base + "/eboot.bin");  // a path given is kept
     }
+
+    // The play log's 5 s from the old example moved to 30 (config_version
+    // 5), then four mutants of the move, each of which a check must catch.
+    const int pl_fails = playlog_migration();
+    g_fail += pl_fails;
+    static const char* const kPlMutants[] = {"", "a 5 at version 5 moved too", "the per-user file not rewritten",
+                                             "a 5 in another layer not set aside", "BBHOST_PLAYLOG_UPLOAD_SECONDS ignored"};
+    int caught = 0;
+    g_pl_quiet = true;
+    for (int m = 1; m <= 4; ++m) {
+        g_config_mutant = m;
+        const int f = playlog_migration();
+        caught += f > 0;
+        std::printf("  play-log mutant %d (%s): %s\n", m, kPlMutants[m], f ? "caught" : "NOT CAUGHT");
+    }
+    g_config_mutant = 0;
+    g_pl_quiet = false;
+    std::printf("config_test: the play-log move: %d failures; %d of 4 mutants caught\n", pl_fails, caught);
+    if (caught != 4) ++g_fail;
 
     std::error_code ec;
     fs::remove_all(g_dir, ec);
