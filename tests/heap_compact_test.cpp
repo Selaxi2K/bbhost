@@ -92,6 +92,10 @@ void test_begin_and_stop() {
     CHECK(must_stop(false, true, 10000 + kGiveUpMs, 10000));
     CHECK(must_stop(true, true, 10001, 10000));
     CHECK(must_stop(false, false, 10001, 10000));
+    // The world settled by flips as well: kSettleFlips since the latest load ended.
+    CHECK(!flips_settled(1000 + kSettleFlips - 1, 1000));
+    CHECK(flips_settled(1000 + kSettleFlips, 1000));
+    CHECK(kSettleFlips == 900);
     // A turn a second.
     CHECK(!turn_due(1999, 1000));
     CHECK(turn_due(2000, 1000));

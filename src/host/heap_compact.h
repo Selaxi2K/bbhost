@@ -40,6 +40,7 @@ constexpr std::uint64_t kGiveUpMs = 30000;       // a block not empty by then is
 constexpr std::uint64_t kQuietMs = 30000;        // after one block's compaction, before the next
 constexpr std::uint64_t kHotMs = 20000;          // a texture bound this recently is copied, not let go
 constexpr std::uint64_t kAlign = 64 * 1024;      // the alignment a moved image is placed at in the trial (images ask 256 B-64 KiB)
+constexpr std::uint64_t kSettleFlips = 900;      // flips since the latest load as well: 30 s at 30 fps
 constexpr std::size_t kTries = 4;                // blocks looked at, emptiest first
 constexpr std::size_t kMostCopies = kTurnItems * 20;  // images a block may have to copy: 20 turns, well inside kGiveUpMs
 
@@ -69,6 +70,12 @@ enum Why { kChosen, kNone, kRoom, kFull, kPinned, kMany, kSpareShort, kNoFit, kK
 inline bool may_begin(bool on, bool settled, bool loading, bool busy, bool empty_block, std::uint64_t now_ms, std::uint64_t quiet_until_ms) {
     return on && settled && !loading && !busy && !empty_block && now_ms >= quiet_until_ms;
 }
+
+// The world settled by flips as well as by time: kSettleFlips since the
+// latest load ended. On a slow device the 30 s of the settled world are a few
+// frames - lavapipe at 0.3 fps had the area still making its images when one
+// began, and a block was made on the command processor in play.
+inline bool flips_settled(std::uint64_t flip_now, std::uint64_t load_end_flip) { return flip_now - load_end_flip >= kSettleFlips; }
 
 // One under way stops: a load (a loading screen, or the world not settled
 // since one - a death, a lamp) or kGiveUpMs since it began.

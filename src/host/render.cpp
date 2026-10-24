@@ -10791,7 +10791,14 @@ void compact_image_heap_locked() {
     static std::uint64_t last_ms = 0, began_ms = 0, quiet_until_ms = 0;
     static std::int64_t credit = 0;
     const std::uint64_t now = steady_ms();
-    const bool loading = loading_screen_now(), settled = world_settled();
+    // The flip the latest load ended at: the world settles by flips too
+    // (heap_compact::flips_settled), not only by time.
+    static std::uint64_t load_end_flip = 0;
+    static bool was_loading = false;
+    const bool loading = loading_screen_now();
+    if (was_loading && !loading) load_end_flip = hle_video_flip_count();
+    was_loading = loading;
+    const bool settled = world_settled() && heap_compact::flips_settled(hle_video_flip_count(), load_end_flip);
     if (loading) g_hc_skip.clear();  // a load changes what the blocks hold
     // A load stops one under way at once, so the area being entered has the
     // block's room.
