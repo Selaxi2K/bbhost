@@ -143,12 +143,12 @@ Setting g_set[kSettingCount] = {
      "How far behind the character the camera sits. 5 is the game's own.", false},
     {"camera_height", "Camera height", {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"}, 5,
      "How high above the character the camera looks. 5 is the game's own.", false},
-    // The follow camera above 30 fps (engine/frame_rate.cpp, read when the game
-    // starts): FPS++ keeps the retune from Kyo's 60 FPS++ list, as every
-    // bbhost before this option did, so it is the default; Original runs the
-    // game's own values, the same camera at every frame rate. Both are
-    // converted to each frame's length; at 30 the camera is the game's.
-    {"camera_tuning", "Camera tuning", {"FPS++ (Kyo)", "Original"}, 0,
+    // The follow camera above 30 fps (engine/frame_rate.cpp camera_original):
+    // the game's own values, the same camera at every frame rate, whatever is
+    // saved here - the menus no longer offer it, and only
+    // BBHOST_CAMERA_TUNING=fps++ runs the retune from Kyo's 60 FPS++ list. So
+    // the default is Original, and a save records the camera that runs.
+    {"camera_tuning", "Camera tuning", {"FPS++ (Kyo)", "Original"}, 1,
      "Requires a restart. Above 30 fps: FPS++ is Kyo's retuned camera; Original is the game's own, as at 30.",
      true},
     // On, as in DS3: a click only reaches the menus while one is open
