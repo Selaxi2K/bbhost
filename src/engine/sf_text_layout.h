@@ -254,4 +254,40 @@ int restrand(std::uint64_t entry, std::uint64_t snap, Readable readable) {
     return n;
 }
 
+// At a capture's unlock (0x484ffe: the snapshot published, the context's
+// pages naming the next one), entries still on the published snapshot's
+// propagate list were listed after its propagate pass - by another thread -
+// and nothing would ever propagate them. They are moved to the list of the
+// snapshot being built (`next`), linked as addToPropagate links one, and the
+// published list is left empty: the next capture's pass lays out a text
+// among them, and no entry is left linked into a list that dies with its
+// snapshot. All or nothing: when an entry on the list is not one of the
+// context's own (its page names another snapshot) or the list does not lead
+// back to its head within 256 steps, nothing is written. Returns how many
+// entries were moved.
+template <typename Readable>
+int destrand(std::uint64_t published, std::uint64_t next, Readable readable) {
+    constexpr int kMax = 256;
+    if (!published || !next || published == next) return 0;
+    if (!readable(published + kSnapshotPropagate, 16) || !readable(next + kSnapshotPropagate, 16)) return 0;
+    const std::uint64_t head = published + kSnapshotPropagate, live = next + kSnapshotPropagate;
+    std::uint64_t members[kMax];
+    int n = 0;
+    for (std::uint64_t x = rd(head); x != head; x = rd(x)) {
+        if (n == kMax || !is_entry_link(x, next, readable)) return 0;
+        members[n++] = x;
+    }
+    if (n == 0) return 0;
+    for (int i = 0; i < n; ++i) {
+        const std::uint64_t m = members[i], first = rd(live);
+        wr(m, first);
+        wr(m + 8, live);
+        wr(first + 8, m);
+        wr(live, m);
+    }
+    wr(head, head);
+    wr(head + 8, head);
+    return n;
+}
+
 }  // namespace sf_text_layout

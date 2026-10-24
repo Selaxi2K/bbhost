@@ -367,6 +367,51 @@ void test_restrand() {
     CHECK(restrand(p.entry(40), live, kReadable) == 0);
 }
 
+// A capture's unlock with entries listed after its pass on the published
+// snapshot's list: destrand moves them all to the next snapshot's list and
+// leaves the published one empty; a list with a stranger on it is left whole.
+void test_destrand() {
+    Page p = make_page();
+    const std::uint64_t next = p.snapshot;  // the pages name the snapshot being built
+    const std::uint64_t published = alloc(0xa0);
+    list_init(next);
+    list_init(published);
+    CHECK(destrand(published, next, kReadable) == 0);  // nothing listed late
+    const std::uint64_t a = p.entry(50), b = p.entry(51), c = p.entry(52);
+    list_add(published, a);
+    list_add(published, b);
+    list_add(next, c);
+    CHECK(destrand(published, next, kReadable) == 2);
+    bool ok = false;
+    auto m = list_members(next, &ok);
+    CHECK(ok && m.size() == 3);
+    bool has_a = false, has_b = false, has_c = false;
+    for (const std::uint64_t e : m) {
+        has_a = has_a || e == a;
+        has_b = has_b || e == b;
+        has_c = has_c || e == c;
+    }
+    CHECK(has_a && has_b && has_c);
+    m = list_members(published, &ok);
+    CHECK(ok && m.empty());
+    // An entry of another context's page on the list: nothing is written.
+    Page q = make_page();
+    const std::uint64_t published2 = alloc(0xa0);
+    list_init(published2);
+    list_add(published2, p.entry(53));
+    list_add(published2, q.entry(1));
+    std::uint8_t before[0xa0], before_next[16];
+    std::memcpy(before, reinterpret_cast<void*>(published2), sizeof(before));
+    std::memcpy(before_next, reinterpret_cast<void*>(next + kSnapshotPropagate), sizeof(before_next));
+    CHECK(destrand(published2, next, kReadable) == 0);
+    CHECK(std::memcmp(before, reinterpret_cast<void*>(published2), sizeof(before)) == 0);
+    CHECK(std::memcmp(before_next, reinterpret_cast<void*>(next + kSnapshotPropagate), sizeof(before_next)) == 0);
+    m = list_members(next, &ok);
+    CHECK(ok && m.size() == 3);
+    // The same snapshot twice, or none: nothing.
+    CHECK(destrand(next, next, kReadable) == 0 && destrand(0, next, kReadable) == 0);
+}
+
 }  // namespace
 
 int main() {
@@ -377,6 +422,7 @@ int main() {
     test_mark_for_update();
     test_layout_arrives();
     test_restrand();
+    test_destrand();
     if (g_failed) {
         std::printf("sf_text_layout_test: %d failure(s)\n", g_failed);
         return 1;

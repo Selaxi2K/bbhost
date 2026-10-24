@@ -338,8 +338,10 @@ GUEST_ABI std::int64_t display_job_hook(std::uint64_t, std::uint64_t* saved) {
 
 // The capture's window, from its propagate pass to its unlock.
 thread_local Wrapper* t_capturing = nullptr;
+thread_local std::uint64_t t_capture_ctx = 0;
 GUEST_ABI std::int64_t capture_begin_hook(std::uint64_t, std::uint64_t* saved) {
     const std::uint64_t ctx = saved[5];  // rdi: the context
+    t_capture_ctx = ctx;
     if (g_guard) repair_suspects(ctx);
     if (g_check) {
         Wrapper* e = find_movie(ctx - kMovieContext);
@@ -383,12 +385,30 @@ void check_stranded(std::uint64_t ctx) {
     }
 }
 
+std::atomic<std::uint64_t> g_destranded{0}, g_destrand_entries{0};
+
 GUEST_ABI std::int64_t capture_end_hook(std::uint64_t, std::uint64_t*) {
+    const std::uint64_t ctx = t_capture_ctx;
+    t_capture_ctx = 0;
     if (t_capturing) {
         t_capturing->capturing.store(nullptr, std::memory_order_release);
         check_stranded(t_capturing->movie.load(std::memory_order_relaxed) + kMovieContext);
     }
     t_capturing = nullptr;
+    if (g_guard && ctx && readable(ctx + kContextActive, 16)) {
+        // Still under the context's lock: the published snapshot is +0xd8,
+        // the next one +0xd0.
+        const int moved = destrand(rd(ctx + kContextCaptured), rd(ctx + kContextActive), readable);
+        if (moved > 0) {
+            const std::uint64_t k = g_destranded.fetch_add(1, std::memory_order_relaxed) + 1;
+            g_destrand_entries.fetch_add(static_cast<std::uint64_t>(moved), std::memory_order_relaxed);
+            if (log_this(k)) {
+                host_log("sf text: a capture published %d entr%s listed after its propagate pass - moved to the next "
+                         "snapshot's list, so its pass lays them out (%llu such captures so far)",
+                         moved, moved == 1 ? "y" : "ies", static_cast<unsigned long long>(k));
+            }
+        }
+    }
     return 0;  // on to pthread_mutex_unlock
 }
 
@@ -524,6 +544,8 @@ void sf_text_layout_install(ElfImage* image) {
     if (g_guard || g_check) {
         ok = call_hook(image, kCapturePropagateCall, kPropagate, reinterpret_cast<void*>(&capture_begin_hook),
                        "Context::Capture's propagate pass") && ok;
+        ok = call_hook(image, kCaptureUnlockCall, kPthreadMutexUnlockStub, reinterpret_cast<void*>(&capture_end_hook),
+                       "Context::Capture's unlock") && ok;
     }
     if (g_check) {
         ok = hook(image, kAdvanceJob, kAdvanceJobPrologue, sizeof(kAdvanceJobPrologue),
@@ -536,8 +558,6 @@ void sf_text_layout_install(ElfImage* image) {
                   reinterpret_cast<void*>(&create_entry_hook), "Context::CreateEntry") && ok;
         ok = hook(image, kAddToPropagate, kAddToPropagatePrologue, sizeof(kAddToPropagatePrologue),
                   reinterpret_cast<void*>(&add_to_propagate_hook), "Entry addToPropagate") && ok;
-        ok = call_hook(image, kCaptureUnlockCall, kPthreadMutexUnlockStub, reinterpret_cast<void*>(&capture_end_hook),
-                       "Context::Capture's unlock") && ok;
     }
     if (g_capture_us) {
         ok = call_hook(image, kCaptureLockCall, kPthreadMutexLockStub, reinterpret_cast<void*>(&capture_lock_hook),
@@ -561,8 +581,10 @@ void sf_text_layout_report() {
                  "%llu not marked, %d still waiting",
                  static_cast<unsigned long long>(g_skipped.load()), static_cast<unsigned long long>(g_marked.load()),
                  static_cast<unsigned long long>(g_unmarked.load()), g_waiting_n.load());
-        host_log("sf text: %llu time(s) a text's entry was found on a propagate list nothing drains and put back on the "
-                 "live one, with %llu entries in all",
+        host_log("sf text: %llu capture(s) published entries listed after their propagate pass, %llu entries moved to the "
+                 "next snapshot's list; %llu time(s) a text's entry was found later on a list nothing drains and put back, "
+                 "with %llu entries in all",
+                 static_cast<unsigned long long>(g_destranded.load()), static_cast<unsigned long long>(g_destrand_entries.load()),
                  static_cast<unsigned long long>(g_restranded.load()), static_cast<unsigned long long>(g_restrand_entries.load()));
     }
     if (g_capture_us) {
