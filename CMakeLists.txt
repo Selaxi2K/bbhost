@@ -517,6 +517,12 @@ if(UNIX)
   add_executable(stun_test tests/stun_test.cpp src/net/stun.cpp)
   target_include_directories(stun_test PRIVATE src)
   add_test(NAME stun_test COMMAND stun_test)
+  # The event poller's long polls and generations (net/poll_pacing.h).
+  add_executable(poll_pacing_test tests/poll_pacing_test.cpp)
+  target_include_directories(poll_pacing_test PRIVATE src)
+  target_link_libraries(poll_pacing_test PRIVATE pthread)
+  add_test(NAME poll_pacing_test COMMAND poll_pacing_test)
+  set_tests_properties(poll_pacing_test PROPERTIES TIMEOUT 60)  # a turn never handed back hangs its threads
   add_executable(uncapped_limit_test tests/uncapped_limit_test.cpp)
   target_include_directories(uncapped_limit_test PRIVATE src)
   add_test(NAME uncapped_limit_test COMMAND uncapped_limit_test)

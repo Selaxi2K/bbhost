@@ -87,10 +87,14 @@ bool server_signaling_resolve(const std::string& online_id, std::uint32_t* addr,
 // the provisional one and the address is the same.
 Peer peers_provisional(const std::string& online_id, std::uint32_t addr, std::uint16_t port);
 
-// The event poller: every interval it asks /np/events/poll for the next
-// matching2 event for our online id, hands it to the handler, and acks it.
-// The handler runs on the poller thread and must not call guest code; it
-// schedules through dispatch_after.
+// The event poller: it asks /np/events/poll for the next matching2 event for
+// our online id, hands it to the handler, and acks it. The server holds an
+// empty poll until an event comes or its wait ends, and the next poll goes out
+// once the last is answered (net/poll_pacing.h has the pace). The handler
+// runs on the poller thread and must not call guest code; it schedules
+// through dispatch_after. poller_stop never waits: a poll held at that moment
+// is given up within about a second, and what it brought goes to the next
+// poller_start's poller, never to this one's handler.
 void poller_start(std::function<void(const json::Value& event)> handler);
 void poller_stop();
 
