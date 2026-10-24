@@ -26,8 +26,11 @@ And a PC with:
 
 - x86-64 Windows 10/11 or Linux
 - a GPU with a Vulkan 1.3 driver (recent NVIDIA, AMD or Intel; the Steam Deck works)
-- 16 GB of RAM and 8 GB of video memory are recommended; 6 GB NVIDIA cards
-  play at 1080p too
+- 16 GB of RAM and 8 GB of video memory are recommended. Less can do: 6 GB
+  NVIDIA cards play at 1080p, an RTX 4070 held to a 4 GB card's video memory
+  kept 60 fps at 1080p even in the Nightmare of Mensis, and an integrated
+  Radeon 680M runs about 60 fps at 960x540 and 27 at 1080p (at a Central
+  Yharnam lamp)
 
 ## First run
 
@@ -158,6 +161,14 @@ The game's own prints go to the console too. A line it prints over and over
 written once, then as a count every ten seconds while it keeps coming and at
 exit: "the game printed this N more times". `BBHOST_GUEST_PRINTS=all` writes
 every line as it comes.
+
+The setup window's Game tab has **Tooling and logging** (`[debug] tooling`;
+`BBHOST_TOOLING=0` or `1` for one run), on by default: the periodic reports in
+the log, the stall detector, the GPU busy meter beside the FPS counter and the
+history of recent draws. Off gives the game the time they take, and the log
+keeps its start, warnings, errors and the exit summary: in one measured
+session, about 10 lines where it had written about 4,100. Leave it on when
+reporting a problem.
 
 ## Troubleshooting
 
@@ -322,16 +333,22 @@ into buffers and images of its own instead, so its shared column stays small.
 Measured at the same place (Central Yharnam, 1080p) on one laptop: with its
 RTX 3070 Ti Laptop GPU, shadPS4 0.19 showed 2.7 GB dedicated and 0.1 GB
 shared, bbhost 3.0 GB dedicated and 4.8 GB shared. On an integrated GPU
-Windows counts all of it as shared: on the same laptop's Radeon 680M shadPS4
-showed 2.9 GB and bbhost 7.8 GB. To compare the two, read the dedicated
-column on a card of its own, or turn on the Memory counter (F10), which shows
-bbhost's own count under the FPS counter: the video memory in use, how much of
-it is cache that bbhost gives back when memory runs short, and the shared
-memory. With window imports (`import_windows = true` under `[gpu]`, the
-default on an integrated GPU under Windows) only the memory the GPU uses is
-imported: on that laptop the shared column fell by
-about 2.7 GB on the RTX and 2.1 GB on the 680M, at the cost of waits when a
-place is first drawn (the log's `imports waited for`).
+Windows counts all of it as shared: on the same laptop's Radeon 680M, with the
+whole import a card of its own takes, shadPS4 showed 2.9 GB and bbhost 7.8 GB.
+To compare the two, read the dedicated column on a card of its own, or turn
+on the Memory counter (F10), which shows bbhost's own count under the FPS
+counter: the video memory in use, how much of it is cache that bbhost gives
+back when memory runs short, and the shared memory. With window imports
+(`import_windows = true` under `[gpu]`, the default on an integrated GPU
+under Windows) only the memory the GPU uses is imported: on that laptop the
+shared column fell by about 2.7 GB on the RTX and 2.1 GB on the 680M, at the
+cost of waits when a place is first drawn (the log's `imports waited for`).
+With them and the rest of an integrated GPU's defaults under Windows (the
+memory given back in play and the image heap compacted, above), the 680M at
+the first Central Yharnam lamp at 1080p showed 4,594 MiB of shared GPU memory
+against shadPS4 0.19's 2,835 MiB; 2,364 MiB of bbhost's are the game's memory
+imported for the GPU, which Windows also counts in the process's private
+bytes.
 
 **AMD on Linux, no picture.** AMD's kernel driver only imports anonymous
 memory, so bbhost passes the game's memory to the GPU through `/dev/udmabuf`.
@@ -355,11 +372,16 @@ or `left not ready (N queries unavailable)`.
 **Steam Deck.** Start bbhost from Steam (as a non-Steam game), in Game Mode or
 Desktop Mode; otherwise Steam's desktop controls send keys alongside the pad
 and every press acts twice. `tools/steamdeck/STEAMDECK.md` has the setup.
+The kit's `bbhost-steamdeck.toml` imports the game's memory a window at a time
+(`import_windows = true`), which keeps the Deck's host heap at 2.7 GB where the
+whole import takes 4.5 GB; to update, copy every file of the new kit over the
+old one's, that file included.
 
 ## Display and frame rate
 
-The picture keeps its aspect ratio, with ultrawide resolutions (21:9, 32:9)
-available in the settings. The resolution can be changed while playing.
+The picture keeps its aspect ratio. The settings offer 16:9 sizes from
+640x360 to 3840x2160, 16:10 and 4:3 ones and ultrawide resolutions (21:9,
+32:9), and the resolution can be changed while playing.
 bbhost paces the game to the refresh rate of the display its window is on;
 `[video] vblank_hz` overrides a display that reports the wrong rate.
 
@@ -399,7 +421,8 @@ particle's path, a motion's turn, the GPU particles' clock, a ribbon's head
 (its points still inserted once a whole step), the wind sources' gusts - by
 each frame's own time, in the effects whose every part has been converted
 for it; the rest run as at 30. `effect_steps = 30` runs them all on whole
-1/30 s steps, as before; `60` steps the effects in whole 1/60 s instead (60
+1/30 s steps alone, the cadence the game has at 30; `60` steps the effects in
+whole 1/60 s instead (60
 updates a second above 60); `frame` steps them by the frame's time. A
 bbhost.toml that sets `effect_steps` keeps its value; one without it gets
 smooth. `BBHOST_SFX_STEP=30|smooth|60|frame` overrides the setting, and
