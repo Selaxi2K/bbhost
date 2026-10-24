@@ -208,7 +208,7 @@ behaviour. Behind it, a text that still arrives without a layout skips the
 part of its update that needs one until the layout arrives (`sf text:`;
 `BBHOST_SF_TEXT_GUARD=0` turns that off). `BBHOST_SF_TEXT_CHECK=1` also
 counts the menus' changes by whether the thread making them held the menu's
-lock, and names the game code and the menu behind the others.
+lock, and names the game code behind the others.
 
 **Wrong picture.** Wrong colours, a green or black screen, missing parts:
 press F12 in the game while it shows. bbhost writes that frame, every render

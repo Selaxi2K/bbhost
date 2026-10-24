@@ -188,22 +188,23 @@ std::string frames_text(const std::uint64_t* f, int n) {
 
 // The game's code that made changes outside the movie's lock: the first frames
 // up the chain in the game's own code (0x1000000-0x2700000; Scaleform and the
-// libraries are on either side), counted by class. No allocation, for the
-// crash report.
+// libraries are on either side), counted by class. Changes on a context with
+// no wrapper seen are left out: they are a movie's first, made by its
+// creator (the wrapper's constructor runs the movie's first Advance) before
+// any job has it. No allocation, for the crash report.
 constexpr std::uint64_t kGameLo = 0x1000000, kGameHi = 0x2700000;
-constexpr int kSites = 48, kSiteFrames = 4;
+constexpr int kSites = 96, kSiteFrames = 4;
 struct Site {
     std::atomic<std::uint64_t> key;
     std::uint64_t f[kSiteFrames];
     char name[16];
-    char movie[24];
     std::atomic<std::uint64_t> n[8];
 };
 Site g_sites[kSites];
 std::mutex g_sites_mu;
 std::atomic<std::uint64_t> g_sites_full{0};
 
-void count_site(const std::uint64_t* f, int n, int c, const char* thread, const char* movie) {
+void count_site(const std::uint64_t* f, int n, int c, const char* thread) {
     std::uint64_t g[kSiteFrames] = {};
     int k = 0;
     for (int i = 0; i < n && k < kSiteFrames; ++i) {
@@ -212,7 +213,6 @@ void count_site(const std::uint64_t* f, int n, int c, const char* thread, const 
     std::uint64_t key = 1469598103934665603ull;
     for (const std::uint64_t a : g) key = (key ^ a) * 1099511628211ull;
     for (const char* t = thread; *t; ++t) key = (key ^ static_cast<unsigned char>(*t)) * 1099511628211ull;
-    for (const char* t = movie; *t; ++t) key = (key ^ static_cast<unsigned char>(*t)) * 1099511628211ull;
     if (!key) key = 1;
     for (Site& s : g_sites) {
         const std::uint64_t at = s.key.load(std::memory_order_acquire);
@@ -232,7 +232,6 @@ void count_site(const std::uint64_t* f, int n, int c, const char* thread, const 
         if (!at) {
             std::memcpy(s.f, g, sizeof(g));
             std::snprintf(s.name, sizeof(s.name), "%s", thread);
-            std::snprintf(s.movie, sizeof(s.movie), "%s", movie);
             s.n[c].fetch_add(1, std::memory_order_relaxed);
             s.key.store(key, std::memory_order_release);
             return;
@@ -429,25 +428,6 @@ Wrapper* wrapper_of(std::uint64_t ctx, std::uint64_t* w_out) {
     return e;
 }
 
-// The movie's name as its wrapper keeps it (+0x28: the name its creator,
-// sub_235fae0, was given, a UTF-16 string), in ASCII; "?" when unreadable.
-constexpr std::uint64_t kWrapperName = 0x28;
-void movie_name(std::uint64_t w, char* out, std::size_t n) {
-    std::snprintf(out, n, "?");
-    if (!w || !readable(w + kWrapperName, 8)) return;
-    const std::uint64_t p = rd(w + kWrapperName);
-    if (!p || !readable(p, 2)) return;
-    const bool all = readable(p, 2 * n);  // the usual case: one lookup, not one a character
-    std::size_t k = 0;
-    for (; k + 1 < n && (all || readable(p + 2 * k, 2)); ++k) {
-        std::uint16_t c = 0;
-        std::memcpy(&c, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(p + 2 * k)), 2);
-        if (!c) break;
-        out[k] = c >= 0x20 && c < 0x7f ? static_cast<char>(c) : '?';
-    }
-    out[k ? k : 1] = 0;
-}
-
 GUEST_ABI std::int64_t advance_job_hook(std::uint64_t, std::uint64_t* saved) {
     if (Wrapper* e = note_wrapper(saved[5])) e->advance.store(gsync::current_thread(), std::memory_order_release);
     return 0;
@@ -546,10 +526,8 @@ GUEST_ABI std::int64_t hud_update_hook(std::uint64_t, std::uint64_t* saved) {
     }
     if (how == LockRun::kLocked) {
         if (g_lock_runs.fetch_add(1, std::memory_order_relaxed) == 0) {
-            char mn[24];
-            movie_name(w, mn, sizeof(mn));
-            host_log("sf lock: the HUD's update runs under the lock of movie %llx '%s' (wrapper %llx)",
-                     static_cast<unsigned long long>(movie), mn, static_cast<unsigned long long>(w));
+            host_log("sf lock: the HUD's update runs under the lock of movie %llx (wrapper %llx)",
+                     static_cast<unsigned long long>(movie), static_cast<unsigned long long>(w));
         }
     } else if (how == LockRun::kAlreadyHeld) {
         g_lock_already.fetch_add(1, std::memory_order_relaxed);
@@ -712,21 +690,19 @@ void classify(const char* what, std::uint64_t ctx, std::uint64_t entry, std::uin
         tn[sizeof(tn) - 1] = 0;
         if (!tn[0]) std::snprintf(tn, sizeof(tn), "?");
     }
-    char mn[24];
-    movie_name(w, mn, sizeof(mn));
+    if (c == kUnknown) return;
     std::uint64_t f[24];
     const int nf = guest_frames(saved, f, 24);
-    count_site(f, nf, c, tn, mn);
-    if (c == kUnknown || !log_this(n)) return;
+    count_site(f, nf, c, tn);
+    if (!log_this(n)) return;
     const std::uint64_t data = entry ? entry_data(entry, kPageActive, readable) : arg;
     const bool is_text = data && readable(data, 8) && rd(data) == va(kTextDataVtable);
     // Beside NextCapture is Scaleform's design: the render side works on the
     // snapshot on display, not the one being built.
     const bool racing = c == kInCapture || c == kInAdvance || c == kHeldOther;
-    host_log("sf text: %s %s (entry %llx%s, %llx) on %s, movie %llx '%s', wrapper %llx, callers %s; frames %s%s (%llu so "
-             "far)",
+    host_log("sf text: %s %s (entry %llx%s, %llx) on %s, movie %llx, wrapper %llx, callers %s; frames %s%s (%llu so far)",
              what, kClassText[c], static_cast<unsigned long long>(entry), is_text ? ", a text's" : "",
-             static_cast<unsigned long long>(arg), tn, static_cast<unsigned long long>(ctx - kMovieContext), mn,
+             static_cast<unsigned long long>(arg), tn, static_cast<unsigned long long>(ctx - kMovieContext),
              static_cast<unsigned long long>(w), callers_text(saved).c_str(), frames_text(f, nf).c_str(),
              racing ? " - a race" : "", static_cast<unsigned long long>(n));
 }
@@ -902,8 +878,8 @@ void sf_text_layout_report() {
     for (const Site& s : g_sites) {
         if (!s.key.load(std::memory_order_acquire)) break;
         char row[256];
-        int len = std::snprintf(row, sizeof(row), "%-15s %-16s", s.name, s.movie);
-        for (int c = 1; c < kClasses && len >= 0 && len < static_cast<int>(sizeof(row)); ++c) {
+        int len = std::snprintf(row, sizeof(row), "%-15s", s.name);
+        for (int c = 1; c < kUnknown && len >= 0 && len < static_cast<int>(sizeof(row)); ++c) {
             len += std::snprintf(row + len, sizeof(row) - static_cast<std::size_t>(len), " %llu",
                                  static_cast<unsigned long long>(s.n[c].load()));
         }
@@ -918,7 +894,7 @@ void sf_text_layout_report() {
                  kSites);
     }
     if (g_sites[0].key.load()) {
-        host_log("sf text:   (by the game's code: the thread, the movie, then the classes after the first, in order, then "
-                 "the first frames up the stack in the game's own code)");
+        host_log("sf text:   (by the game's code: the thread, then the classes after the first up to the lock free, in "
+                 "order, then the first frames up the stack in the game's own code)");
     }
 }
