@@ -33,7 +33,7 @@ using Bytes = std::vector<std::uint8_t>;
 
 // Bumped whenever a generator or the recipe changes, so installs remake their
 // assets instead of keeping the last generation.
-constexpr int kGeneratorVersion = 11;  // 11: PC Graphics' seventh row, HLSL Shaders; 10: PC Camera back to four rows (the camera tuning row hidden); 9: PC Camera's fifth row, the camera tuning; 8: PC Enhancements' three rows; 7: the PC Enhancements section; 6: event text (group 30) for the altar's rebirth
+constexpr int kGeneratorVersion = 12;  // 12: UTF-16 text end fix; 11: PC Graphics' seventh row, HLSL Shaders; 10: PC Camera back to four rows (the camera tuning row hidden); 9: PC Camera's fifth row, the camera tuning; 8: PC Enhancements' three rows; 7: the PC Enhancements section; 6: event text (group 30) for the altar's rebirth
 
 const char kMessagesTsv[] =
 #include "pc_option_messages.inc"
@@ -836,6 +836,15 @@ std::size_t find(const Bytes& b, const char* what, std::size_t n, std::size_t fr
     return it == b.end() ? std::string::npos : static_cast<std::size_t>(it - b.begin());
 }
 
+// End of a UTF-16LE string: the first 0 code unit at an even offset from `from`.
+// A byte search for "\0\0" also matches across two characters (an ASCII one followed
+// by one whose low byte is 0, such as U+AC00 or U+C800), which cut Korean text short.
+std::size_t utf16_end(const Bytes& b, std::size_t from, std::size_t limit) {
+    std::size_t i = from;
+    while (i + 1 < limit && !(b[i] == 0 && b[i + 1] == 0)) i += 2;
+    return i + 1 < limit ? i : std::string::npos;
+}
+
 struct BndFile {
     std::uint64_t flags;
     std::uint32_t id;
@@ -867,10 +876,8 @@ Bnd4 bnd_read(const Bytes& b) {
         const std::uint32_t name_off = u32(b, e + 0x20);
         if (r.unicode) {
             const std::size_t end = std::min<std::size_t>(b.size(), name_off + 4096);
-            std::size_t z = name_off;
-            while (z + 1 < end && !(b[z] == 0 && b[z + 1] == 0)) ++z;
-            std::size_t stop = z + 1;  // Python keeps up to and including the first byte of the pair
-            if ((stop - name_off) % 2) stop -= 1;  // an even UTF-16 name, which every entry here is
+            std::size_t stop = utf16_end(b, name_off, end);
+            if (stop == std::string::npos) stop = end - ((end - name_off) % 2);
             f.name.assign(b.begin() + name_off, b.begin() + stop);
         } else {
             std::size_t z = name_off;
@@ -937,9 +944,8 @@ Fmg fmg_read(const Bytes& b) {
                 ids[mid] = std::nullopt;
                 continue;
             }
-            std::size_t e = find(b, "\0\0", 2, o);
+            const std::size_t e = utf16_end(b, o, b.size());
             if (e == std::string::npos) throw Fail{"an unterminated FMG string"};
-            if ((e - o) % 2) e += 1;
             ids[mid] = Bytes(b.begin() + o, b.begin() + e);
         }
     }
